@@ -673,12 +673,14 @@ pub struct FakeIPDNS {
     pub ipv4_cidr: Ipv4Net,
     pub ipv6_cidr: Ipv6Net,
     pub cache: FakeIPCache,
-    pub cursor: AtomicU64,
+    pub ipv4_cursor: AtomicU64,
+    pub ipv6_cursor: AtomicU64,
     pub reject_ipv6: bool,
 }
 
 impl FakeIPDNS {
-    const CURSOR_CACHE_KEY: &'static str = "fakeip_cursor_index";
+    const IPV4_CURSOR_CACHE_KEY: &'static str = "fakeip_ipv4_cursor_index";
+    const IPV6_CURSOR_CACHE_KEY: &'static str = "fakeip_ipv6_cursor_index";
 
     pub fn new(tag: String, cfg: &DnsServerConfig) -> Self {
         let min_ttl = cfg.min_ttl.map(Duration::from_secs);
@@ -710,7 +712,8 @@ impl FakeIPDNS {
         )
         .expect("failed to init cache");
 
-        let initial_cursor = Self::load_cursor(&cache);
+        let ipv4_cursor = Self::load_cursor(&cache, Self::IPV4_CURSOR_CACHE_KEY);
+        let ipv6_cursor = Self::load_cursor(&cache, Self::IPV6_CURSOR_CACHE_KEY);
 
         let reject_ipv6 = cfg.reject_ipv6;
 
@@ -720,13 +723,14 @@ impl FakeIPDNS {
             ipv4_cidr,
             ipv6_cidr,
             cache,
-            cursor: AtomicU64::new(initial_cursor),
+            ipv4_cursor: AtomicU64::new(ipv4_cursor),
+            ipv6_cursor: AtomicU64::new(ipv6_cursor),
             reject_ipv6,
         }
     }
 
-    fn load_cursor(cache: &FakeIPCache) -> u64 {
-        match cache.get(Self::CURSOR_CACHE_KEY) {
+    fn load_cursor(cache: &FakeIPCache, key: &str) -> u64 {
+        match cache.get(key) {
             Ok(r) => {
                 if let Some(r) = r {
                     return r.0.trim().parse().unwrap_or(0);
@@ -737,15 +741,21 @@ impl FakeIPDNS {
         }
     }
 
-    pub fn save_cursor(&self) {
-        let current = self.cursor.load(Ordering::Relaxed);
+    fn save_cursor(&self, key: &str, cursor: &AtomicU64) {
+        let current = cursor.load(Ordering::Relaxed);
         let val = current.to_string();
-        let _ = self.cache.set(Self::CURSOR_CACHE_KEY, &val);
+        let _ = self.cache.set(key, &val);
     }
 
-    pub fn next_cursor(&self) -> u64 {
-        let current = self.cursor.fetch_add(1, Ordering::SeqCst);
-        self.save_cursor();
+    pub fn next_ipv4_cursor(&self) -> u64 {
+        let current = self.ipv4_cursor.fetch_add(1, Ordering::SeqCst);
+        self.save_cursor(Self::IPV4_CURSOR_CACHE_KEY, &self.ipv4_cursor);
+        current
+    }
+
+    pub fn next_ipv6_cursor(&self) -> u64 {
+        let current = self.ipv6_cursor.fetch_add(1, Ordering::SeqCst);
+        self.save_cursor(Self::IPV6_CURSOR_CACHE_KEY, &self.ipv6_cursor);
         current
     }
 
@@ -785,10 +795,15 @@ impl FakeIPDNS {
             return Ok(r.0);
         }
 
-        let c = self.next_cursor();
         let ip_str = match qtype {
-            QTYPE::TYPE(TYPE::A) => self.get_fake_ipv4(c).to_string(),
-            QTYPE::TYPE(TYPE::AAAA) => self.get_fake_ipv6(c).to_string(),
+            QTYPE::TYPE(TYPE::A) => {
+                let c = self.next_ipv4_cursor();
+                self.get_fake_ipv4(c).to_string()
+            }
+            QTYPE::TYPE(TYPE::AAAA) => {
+                let c = self.next_ipv6_cursor();
+                self.get_fake_ipv6(c).to_string()
+            }
             _ => bail!("unspported"),
         };
 
