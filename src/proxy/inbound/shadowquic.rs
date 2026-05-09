@@ -179,6 +179,8 @@ impl AnyInbound for ShadowQuicInbound {
             self.tls.cert.as_deref(),
             self.tls.key.as_deref(),
             None,
+            self.tls.sni.clone(),
+            self.tls.alpns.clone(),
             self.tls.zero_rtt,
             self.tls.jls_username.clone(),
             self.tls.jls_password.clone(),

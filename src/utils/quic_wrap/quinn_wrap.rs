@@ -1,4 +1,4 @@
-use anyhow::{bail, Context as _};
+use anyhow::{Context as _, bail};
 use quinn::rustls::pki_types::PrivateKeyDer;
 use std::net::SocketAddr;
 use std::pin::{Pin, pin};
@@ -202,15 +202,20 @@ impl QuinnServer {
         cert_path: Option<&str>,
         key_path: Option<&str>,
         congestion_controller: Option<String>,
+        sni: Option<String>,
+        alpn: Option<Vec<String>>,
         zero_rtt: bool,
         jls_username: String,
         jls_passwrod: String,
         is_jls: bool,
     ) -> anyhow::Result<Self> {
+        let server_name = sni.as_deref().unwrap_or("apple.com");
         let mut server_config = if is_jls {
             let mut jls_config = quinn::rustls::jls::JlsServerConfig::default();
-            jls_config = jls_config.add_user(jls_passwrod, jls_username);
-            jls_config = jls_config.enable(true);
+            jls_config = jls_config
+                .enable(true)
+                .add_user(jls_passwrod, jls_username)
+                .with_server_name(server_name.to_string());
 
             let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
                 .map_err(|e| new_io_other_error(format!("Failed to generate cert: {}", e)))?;
@@ -225,6 +230,11 @@ impl QuinnServer {
                 .with_single_cert(cert_chain, private_key)?;
             config.jls_config = jls_config.into();
 
+            config.alpn_protocols = alpn
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.into_bytes())
+                .collect();
             config.max_early_data_size = if zero_rtt { u32::MAX } else { 0 };
             config.send_half_rtt_data = zero_rtt;
             let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(config)?;
@@ -350,7 +360,7 @@ pub struct QuinnClient {
     endpoint: quinn::Endpoint,
     is_jls: bool,
     zero_rtt: bool,
-    sni: Arc<str>,
+    sni: String,
 }
 
 impl QuinnClient {
@@ -361,6 +371,7 @@ impl QuinnClient {
         zero_rtt: bool,
         ca_cert_path: Option<&str>,
         sni: Option<String>,
+        alpn: Option<Vec<String>>,
         congestion_controller: Option<String>,
         username: String,
         passwrod: String,
@@ -368,19 +379,12 @@ impl QuinnClient {
     ) -> anyhow::Result<Self> {
         let server_name = sni.as_deref().unwrap_or("apple.com");
         let mut client_crypto = if is_jls {
-            let mut jls_config = quinn::rustls::jls::JlsServerConfig::default();
-            jls_config = jls_config.add_user(passwrod, username);
-            jls_config = jls_config.with_server_name(server_name.to_string());
-            jls_config = jls_config
-                .with_upstream_addr(server_name.to_string())
-                .enable(true);
-
             let mut config = quinn::rustls::ClientConfig::builder()
                 .with_root_certificates(quinn::rustls::RootCertStore::empty())
                 .with_no_client_auth();
 
             config.jls_config.enable = true;
-            config.jls_config.user = jls_config.users[0].clone();
+            config.jls_config.user = quinn::rustls::jls::JlsUser::new(&passwrod, &username);
             config
         } else {
             let mut root_store = quinn::rustls::RootCertStore::empty();
@@ -410,10 +414,14 @@ impl QuinnClient {
         };
 
         client_crypto.enable_early_data = zero_rtt;
+        client_crypto.alpn_protocols = alpn
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.into_bytes())
+            .collect();
 
-        let quic_client_config =
-            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
-                .context("Failed to build QUIC client TLS config")?;
+        let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+            .context("Failed to build QUIC client TLS config")?;
         let mut client_config = ClientConfig::new(Arc::new(quic_client_config));
         let mut transport_config = TransportConfig::default();
         let t = idle_timeout.as_millis() as u32;

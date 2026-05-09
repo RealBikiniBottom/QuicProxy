@@ -157,6 +157,7 @@ impl ShadowQuicOutbound {
                 self.tls.zero_rtt,
                 self.tls.cert.as_deref(),
                 self.tls.sni.clone(),
+                self.tls.alpns.clone(),
                 None,
                 self.tls.jls_username.clone(),
                 self.tls.jls_password.clone(),
