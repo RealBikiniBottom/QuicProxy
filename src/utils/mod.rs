@@ -9,13 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub mod cache;
+pub mod count_traffic;
 pub mod elevate;
+pub mod http_outbound;
 pub mod interface;
 pub mod logging;
-#[cfg(feature = "premium")]
-pub use crate::premium::net_monitor;
-pub mod count_traffic;
-pub mod http_outbound;
+pub mod net_monitor;
 pub mod quic_wrap;
 pub mod redb_store;
 pub mod shutdown;
