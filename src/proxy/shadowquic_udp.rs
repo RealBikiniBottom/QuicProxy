@@ -230,19 +230,19 @@ async fn get_receiver(
     context_id: u16,
     notify: Arc<Notify>,
 ) -> anyhow::Result<Arc<ShadowUdpReceiver>> {
-    timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(20), async {
         let notified = notify.notified();
         tokio::pin!(notified);
-        // 先注册当前 waiter，再检查 map，避免 insert+notify 发生在检查与 await 之间时漏通知。
-        notified.as_mut().enable();
 
         loop {
+            notified.as_mut().enable();
+
             if let Some(entry) = udp_recv_map.get(&context_id) {
-                notified.set(notify.notified());
                 return entry.value().clone();
             }
 
             notified.as_mut().await;
+            notified.set(notify.notified());
         }
     })
     .await
@@ -314,8 +314,8 @@ pub fn start_datagram_loop(
                     match res {
                         Ok(datagram) => {
                             if let Err(e) = handle_datagram(
-                                &udp_recv_map,
-                                &udp_recv_map_notify,
+                                udp_recv_map.clone(),
+                                udp_recv_map_notify.clone(),
                                 datagram,
                                 remote_src.clone(),
                             ).await {
@@ -347,8 +347,8 @@ pub fn start_datagram_loop(
 }
 
 async fn handle_datagram(
-    udp_recv_map: &UdpRecvMap,
-    udp_recv_map_notify: &Arc<Notify>,
+    udp_recv_map: UdpRecvMap,
+    udp_recv_map_notify: Arc<Notify>,
     datagram: Bytes,
     remote_src: TargetAddr,
 ) -> anyhow::Result<()> {
