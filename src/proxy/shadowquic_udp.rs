@@ -21,13 +21,14 @@ use tracing::warn;
 use crate::proxy::outbound::AnyPacket;
 use crate::proxy::{SessionCloser, TargetAddr};
 use crate::utils::format_duration;
+use crate::utils::id::Id32;
 use crate::utils::new_io_other_error;
 use crate::utils::now;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 
 use super::SourceAddr;
 
-pub type UdpRecvMap = Arc<DashMap<u16, Arc<ShadowUdpReceiver>>>;
+pub type UdpRecvMap = Arc<DashMap<String, Arc<ShadowUdpReceiver>>>;
 
 pub struct ShadowUdpReceiver {
     recveiver_sender: Sender<(SourceAddr, Bytes)>, // feed packet to recver
@@ -60,11 +61,10 @@ impl ShadowUdpReceiver {
         &self,
         unistream: Arc<Mutex<quinn::RecvStream>>,
         remote_src: TargetAddr,
-        recv_context_id: u16,
+        recv_context_id: String,
     ) {
         let closer_clone = self.closer.clone();
         let sender_clone = self.recveiver_sender.clone();
-        let udp_recv_map_clone = self.udp_recv_map.clone();
         debug!("accept_uni for udp session: {}", recv_context_id);
         tokio::spawn(async move {
             loop {
@@ -103,7 +103,6 @@ impl ShadowUdpReceiver {
                 }
             }
 
-            udp_recv_map_clone.remove(&recv_context_id);
             closer_clone.close();
         });
     }
@@ -137,8 +136,7 @@ pub fn run_bistream_recv_listener(
     mut bistream: Box<QuinnBistream>,
     udp_recv_map: UdpRecvMap,
     shadowquic_receiver: Arc<ShadowUdpReceiver>,
-    udp_recv_map_notify: Arc<Notify>,
-    recv_context_id: Option<u16>,
+    recv_context_id: String,
 ) {
     let receiver_for_spawn = shadowquic_receiver.clone();
     let closer_clone = shadowquic_receiver.closer.clone();
@@ -147,32 +145,26 @@ pub fn run_bistream_recv_listener(
         .is_binded_bistream
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    let mut context_ids: Vec<u16> = Vec::new();
-    if let Some(recv_context_id) = recv_context_id {
-        context_ids.push(recv_context_id);
+    let mut context_ids: Vec<String> = Vec::new();
+    if !recv_context_id.is_empty() {
+        context_ids.push(recv_context_id.clone());
         udp_recv_map_clone.insert(recv_context_id, receiver_for_spawn.clone());
-        udp_recv_map_notify.notify_waiters();
     }
 
     let current_span = tracing::Span::current();
 
     tokio::spawn(
         async move {
+            let mut buf = [0u8; 1];
             loop {
                 tokio::select! {
                     _ = closer_clone.wait() => {
                         debug!("bistream recv loop: received closer signal");
                         break;
                     }
-                    res = read_addr_and_context_id(&mut bistream) => {
+                    res = bistream.read_exact(&mut buf) => {
                         match res {
-                            Ok((id, _target)) => {
-                                debug!("received context_id from bistream: {}", id);
-                                if !context_ids.contains(&id) {
-                                    udp_recv_map_clone.insert(id, receiver_for_spawn.clone());
-                                    context_ids.push(id);
-                                    udp_recv_map_notify.notify_waiters();
-                                }
+                            Ok(_) => {
                             }
                             Err(e) => {
                                 error!("bistream read error: {:?}", e);
@@ -180,6 +172,21 @@ pub fn run_bistream_recv_listener(
                             }
                         }
                     }
+                    // res = read_addr_and_context_id(&mut bistream) => {
+                    //     match res {
+                    //         Ok((id, _target)) => {
+                    //             debug!("received context_id from bistream: {}", id);
+                    //             if !context_ids.contains(&id) {
+                    //                 udp_recv_map_clone.insert(id, receiver_for_spawn.clone());
+                    //                 context_ids.push(id);
+                    //             }
+                    //         }
+                    //         Err(e) => {
+                    //             error!("bistream read error: {:?}", e);
+                    //             break;
+                    //         }
+                    //     }
+                    // }
                 }
             }
 
@@ -194,75 +201,9 @@ pub fn run_bistream_recv_listener(
     );
 }
 
-pub fn start_udp_session_cleaner(
-    udp_recv_map: UdpRecvMap,
-    check_interval: Duration,
-    timeout: Duration,
-) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(check_interval).await;
-
-            let mut expired_ids = Vec::new();
-
-            for entry in udp_recv_map.iter() {
-                let receiver = entry.value();
-                if !receiver
-                    .is_binded_bistream
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    && now().duration_since(receiver.create_at) >= timeout
-                {
-                    expired_ids.push(*entry.key());
-                }
-            }
-
-            for id in expired_ids {
-                debug!("clean context_id {}", id);
-                if let Some((_, receiver)) = udp_recv_map.remove(&id) {
-                    receiver.closer.close();
-                }
-            }
-        }
-    });
-}
-
-async fn get_receiver(
-    udp_recv_map: UdpRecvMap,
-    context_id: u16,
-    notify: Arc<Notify>,
-) -> anyhow::Result<Arc<ShadowUdpReceiver>> {
-    let start_time = now();
-    let mut is_waitting = false;
-    timeout(Duration::from_secs(20), async {
-        let notified = notify.notified();
-        tokio::pin!(notified);
-
-        loop {
-            notified.as_mut().enable();
-
-            if let Some(entry) = udp_recv_map.get(&context_id) {
-                if is_waitting {
-                    debug!(
-                        "get_receiver cost: {}",
-                        format_duration(start_time.elapsed())
-                    );
-                }
-                return entry.value().clone();
-            }
-
-            is_waitting = true;
-            notified.as_mut().await;
-            notified.set(notify.notified());
-        }
-    })
-    .await
-    .context("timeout waiting for receiver")
-}
-
 pub fn start_unistream_listener(
     conn: Arc<quinn::Connection>,
     udp_recv_map: UdpRecvMap,
-    udp_recv_map_notify: Arc<Notify>,
     read_timeout: Duration,
 ) {
     tokio::spawn(async move {
@@ -271,26 +212,22 @@ pub fn start_unistream_listener(
             match conn.accept_uni().await {
                 Ok(mut recv) => {
                     let recv_map_clone = udp_recv_map.clone();
-                    let recv_map_notify_clone = udp_recv_map_notify.clone();
 
                     tokio::spawn(async move {
                         let res: anyhow::Result<()> = async {
                             let recv_context_id =
                                 try_get_recv_context_id(&mut recv, read_timeout).await?;
-                            let item = get_receiver(
-                                recv_map_clone,
-                                recv_context_id,
-                                recv_map_notify_clone,
-                            )
-                            .await?;
 
-                            item.run_unistream_worker(
-                                Arc::new(Mutex::new(recv)),
-                                remote_src.clone(),
-                                recv_context_id,
-                            );
-
-                            Ok(())
+                            let k = recv_context_id.to_string();
+                            if let Some(item) = recv_map_clone.get(&k) {
+                                item.run_unistream_worker(
+                                    Arc::new(Mutex::new(recv)),
+                                    remote_src.clone(),
+                                    k,
+                                );
+                                return anyhow::Ok(());
+                            }
+                            bail!("can not find context_id");
                         }
                         .await;
 
@@ -311,19 +248,18 @@ pub fn start_unistream_listener(
 async fn try_get_recv_context_id(
     recv: &mut quinn::RecvStream,
     read_timeout: Duration,
-) -> anyhow::Result<u16> {
-    let mut buf = [0u8; 2];
+) -> anyhow::Result<Id32> {
+    let mut buf = [0u8; 32];
     timeout(read_timeout, recv.read_exact(&mut buf))
         .await
         .context("read recv_context_id timed out")?
         .context("read recv_context_id failed")?;
-    Ok(u16::from_be_bytes(buf))
+    Ok(Id32::from_bytes(buf))
 }
 
 pub fn start_datagram_loop(
     conn: Arc<quinn::Connection>,
     udp_recv_map: UdpRecvMap,
-    udp_recv_map_notify: Arc<Notify>,
     datagram_sender_rx: flume::Receiver<Bytes>,
 ) {
     tokio::spawn(async move {
@@ -335,11 +271,10 @@ pub fn start_datagram_loop(
                         Ok(datagram) => {
                             if let Err(e) = handle_datagram(
                                 udp_recv_map.clone(),
-                                udp_recv_map_notify.clone(),
                                 datagram,
                                 remote_src.clone(),
                             ).await {
-                                debug!("handle_datagram error: {}", e);
+                                error!("handle_datagram error: {}", e);
                             }
                         }
                         Err(e) => {
@@ -368,47 +303,26 @@ pub fn start_datagram_loop(
 
 async fn handle_datagram(
     udp_recv_map: UdpRecvMap,
-    udp_recv_map_notify: Arc<Notify>,
     datagram: Bytes,
     remote_src: TargetAddr,
 ) -> anyhow::Result<()> {
-    if datagram.len() <= 2 {
+    if datagram.len() <= 32 {
         warn!("Received invalid shadowquic datagram, ignored");
         return Ok(());
     }
 
-    let recv_context_id = u16::from_be_bytes(
-        datagram[..2]
+    let recv_context_id = Id32::from_bytes(
+        datagram[..32]
             .try_into()
             .map_err(|_| anyhow::anyhow!("Invalid datagram length for context_id"))?,
     );
 
-    let payload = datagram.slice(2..);
+    let payload = datagram.slice(32..);
 
-    if let Some(entry) = udp_recv_map.get(&recv_context_id) {
+    if let Some(entry) = udp_recv_map.get(&recv_context_id.to_string()) {
         entry.feed_datagram(payload, remote_src).await;
         return Ok(());
     }
-
-    tokio::spawn(async move {
-        let result: anyhow::Result<()> = async {
-            let item = get_receiver(
-                udp_recv_map.clone(),
-                recv_context_id,
-                udp_recv_map_notify.clone(),
-            )
-            .await?;
-
-            item.feed_datagram(payload, remote_src).await;
-            Ok(())
-        }
-        .await;
-
-        // 处理错误
-        if let Err(e) = result {
-            eprintln!("Task failed: {}", e);
-        }
-    });
 
     Ok(())
 }
@@ -417,7 +331,7 @@ pub struct ShadowQuicUdpPacket {
     send_unistream: Option<Arc<Mutex<quinn::SendStream>>>,
     datagram_sender_tx: Option<flume::Sender<Bytes>>,
 
-    send_context_id: u16,
+    send_context_id: Bytes,
     target: TargetAddr,
 
     receiver: Arc<ShadowUdpReceiver>,
@@ -427,7 +341,7 @@ impl ShadowQuicUdpPacket {
     pub fn new(
         send_unistream: Option<Arc<Mutex<quinn::SendStream>>>,
         datagram_sender_tx: Option<flume::Sender<Bytes>>,
-        send_context_id: u16,
+        send_context_id: Bytes,
         target: TargetAddr,
 
         receiver: Arc<ShadowUdpReceiver>,
@@ -465,8 +379,8 @@ impl AnyPacket for ShadowQuicUdpPacket {
         }
 
         if let Some(sender) = &self.datagram_sender_tx {
-            let mut packet = Vec::with_capacity(2 + buf.len());
-            packet.extend_from_slice(&self.send_context_id.to_be_bytes());
+            let mut packet = Vec::with_capacity(self.send_context_id.len() + buf.len());
+            packet.extend_from_slice(&self.send_context_id);
             packet.extend_from_slice(&buf);
             if sender.send_async(Bytes::from(packet)).await.is_err() {
                 warn!("datagram send queue closed");
@@ -556,10 +470,10 @@ impl AnyPacket for ShadowQuicUdpOverBistream {
 pub async fn read_context_id(
     bistream: &mut QuinnBistream,
     duration: Duration,
-) -> std::io::Result<u16> {
-    let mut buf = [0u8; 2];
+) -> std::io::Result<Id32> {
+    let mut buf = [0u8; 32];
     match timeout(duration, bistream.read_exact(&mut buf)).await {
-        Ok(Ok(_)) => Ok(u16::from_be_bytes(buf)),
+        Ok(Ok(_)) => Ok(Id32::from_bytes(buf)),
         Ok(Err(e)) => Err(e),
         Err(e) => Err(new_io_other_error(e)),
     }

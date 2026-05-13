@@ -22,6 +22,7 @@ pub mod socket;
 pub mod system;
 pub mod system_proxy;
 pub mod time;
+pub mod id;
 
 pub fn format_duration(duration: Duration) -> String {
     return format!("{:.2?}", duration);

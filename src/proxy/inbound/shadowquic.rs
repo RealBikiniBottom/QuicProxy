@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tokio::sync::Notify;
 
 use crate::config::InboundConfig;
 use crate::proxy::inbound::AnyInbound;
@@ -20,7 +19,7 @@ use crate::proxy::router::get_router;
 use crate::proxy::shadowquic_udp::{
     ShadowQuicUdpPacket, ShadowUdpReceiver, UdpRecvMap, auth_sunnyquic, gen_sunny_auth_hash,
     read_context_id, read_request_head, run_bistream_recv_listener, start_datagram_loop,
-    start_udp_session_cleaner, start_unistream_listener,
+    start_unistream_listener,
 };
 use crate::proxy::{QuicTlsConfig, TargetAddr};
 use anyhow::Context;
@@ -43,7 +42,6 @@ pub struct ShadowQuicInbound {
     idle_timeout: Duration,
     next_context_id: Arc<AtomicU16>,
     udp_recv_map: UdpRecvMap,
-    udp_recv_map_notify: Arc<Notify>,
     datagram_sender_tx: flume::Sender<Bytes>,
     datagram_sender_rx: flume::Receiver<Bytes>,
 }
@@ -65,9 +63,8 @@ impl ShadowQuicInbound {
 
         let idle_timeout = Duration::from_secs(cfg.idle_timeout.unwrap_or(30));
 
-        let (datagram_sender_tx, datagram_sender_rx) = flume::bounded(100);
+        let (datagram_sender_tx, datagram_sender_rx) = flume::bounded(1024);
         let udp_recv_map = Arc::new(DashMap::new());
-        start_udp_session_cleaner(udp_recv_map.clone(), idle_timeout, idle_timeout);
 
         Ok(Self {
             tag,
@@ -78,7 +75,6 @@ impl ShadowQuicInbound {
             port: cfg.port.context("require port")?,
             idle_timeout,
             next_context_id: Arc::new(AtomicU16::new(1)),
-            udp_recv_map_notify: Arc::new(Notify::new()),
             udp_recv_map,
             datagram_sender_tx,
             datagram_sender_rx,
@@ -97,13 +93,12 @@ impl ShadowQuicInbound {
         conn: Arc<quinn::Connection>,
         send_context_id: u16,
         idle_timeout: Duration,
-        udp_recv_map_notify: Arc<Notify>,
     ) -> anyhow::Result<()> {
         let recv_context_id = read_context_id(&mut bistream, idle_timeout).await?;
         debug!("receive context_id {}", recv_context_id);
 
         let receiver = udp_recv_map
-            .entry(recv_context_id)
+            .entry(recv_context_id.to_string())
             .or_insert_with(|| Arc::new(ShadowUdpReceiver::new(udp_recv_map.clone())))
             .clone();
 
@@ -118,12 +113,12 @@ impl ShadowQuicInbound {
             bistream,
             udp_recv_map,
             receiver.clone(),
-            udp_recv_map_notify,
-            Some(recv_context_id),
+            recv_context_id.to_string(),
         );
 
         let target_clone = target.clone();
 
+        let send_context_id_bytes = recv_context_id.into_bytes();
         // build tracked_packet
         let out_packet: Arc<dyn AnyPacket>;
         match udp_mod {
@@ -141,7 +136,7 @@ impl ShadowQuicInbound {
                 out_packet = Arc::new(ShadowQuicUdpPacket::new(
                     Some(send_mutex),
                     None,
-                    send_context_id,
+                    send_context_id_bytes,
                     target,
                     receiver.clone(),
                 ));
@@ -150,7 +145,7 @@ impl ShadowQuicInbound {
                 out_packet = Arc::new(ShadowQuicUdpPacket::new(
                     None,
                     Some(datagram_sender_tx.clone()),
-                    send_context_id,
+                    send_context_id_bytes,
                     target,
                     receiver.clone(),
                 ));
@@ -202,7 +197,6 @@ impl AnyInbound for ShadowQuicInbound {
 
         let auth_hash = self.auth_hash;
         let udp_recv_map = self.udp_recv_map.clone();
-        let udp_recv_map_notify = self.udp_recv_map_notify.clone();
         let datagram_sender_tx = self.datagram_sender_tx.clone();
         let datagram_sender_rx = self.datagram_sender_rx.clone();
         let session_timeout = self.idle_timeout();
@@ -220,7 +214,6 @@ impl AnyInbound for ShadowQuicInbound {
 
                     let conn_clone = conn.clone();
                     let udp_recv_map_clone = udp_recv_map.clone();
-                    let udp_recv_map_notify_clone = udp_recv_map_notify.clone();
                     let datagram_sender_tx = datagram_sender_tx.clone();
                     let datagram_sender_rx = datagram_sender_rx.clone();
                     let session_timeout_val = session_timeout;
@@ -235,13 +228,11 @@ impl AnyInbound for ShadowQuicInbound {
                                 start_unistream_listener(
                                     conn_clone.clone(),
                                     udp_recv_map_clone.clone(),
-                                    udp_recv_map_notify_clone.clone(),
                                     session_timeout_val,
                                 );
                                 start_datagram_loop(
                                     conn_clone.clone(),
                                     udp_recv_map_clone.clone(),
-                                    udp_recv_map_notify_clone.clone(),
                                     datagram_sender_rx.clone(),
                                 );
                             };
@@ -278,7 +269,6 @@ impl AnyInbound for ShadowQuicInbound {
                                 let tag = tag_clone.clone();
                                 let router = router_clone.clone();
                                 let udp_recv_map_clone = udp_recv_map_clone.clone();
-                                let udp_recv_map_notify_clone = udp_recv_map_notify_clone.clone();
                                 let datagram_sender_tx = datagram_sender_tx.clone();
                                 let send_context_id = next_context_id.clone();
                                 let remote_addr = conn_clone2.remote_address().to_string();
@@ -331,7 +321,6 @@ impl AnyInbound for ShadowQuicInbound {
                                                     conn_clone2.clone(),
                                                     context_id,
                                                     session_timeout_val,
-                                                    udp_recv_map_notify_clone,
                                                 )
                                                 .instrument(span)
                                                 .await?;

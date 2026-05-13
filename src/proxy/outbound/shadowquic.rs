@@ -1,7 +1,8 @@
 use crate::proxy::shadowquic_udp::{
     ShadowUdpReceiver, UdpRecvMap, gen_sunny_auth_hash, run_bistream_recv_listener,
-    start_datagram_loop, start_udp_session_cleaner, start_unistream_listener,
+    start_datagram_loop, start_unistream_listener,
 };
+use crate::utils::id::TimestampIdGenerator;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 use crate::utils::quic_wrap::quinn_wrap::QuinnClient;
 use anyhow::{Context, Result};
@@ -11,10 +12,9 @@ use dashmap::DashMap;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU16;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tracing::debug;
 
 use tracing::{info, warn};
@@ -40,13 +40,13 @@ pub struct ShadowQuicOutbound {
     bind_interface: Option<String>,
 
     congestion_controller: Option<String>,
+    udp_id: Mutex<TimestampIdGenerator>,
     connect_timeout: Duration,
     idle_timeout: Duration,
     enable_gso: bool,
 
     udp_mod: UdpMode,
 
-    udp_recv_map_notify: Arc<Notify>,
     client: Mutex<Option<Arc<QuinnClient>>>,
     connection: Mutex<Option<Arc<quinn::Connection>>>,
     next_context_id: AtomicU16,
@@ -70,7 +70,7 @@ impl ShadowQuicOutbound {
 
         let (datagram_sender_tx, datagram_sender_rx) = flume::bounded(100);
         let udp_recv_map = Arc::new(DashMap::new());
-        start_udp_session_cleaner(udp_recv_map.clone(), connect_timeout, connect_timeout);
+        // start_udp_session_cleaner(udp_recv_map.clone(), connect_timeout, connect_timeout);
 
         let mut auth_hash = None;
         if !tls.enable_jls {
@@ -99,11 +99,11 @@ impl ShadowQuicOutbound {
             address,
             port,
             tls,
+            udp_id: Mutex::new(TimestampIdGenerator::new()),
             connect_timeout,
             idle_timeout,
             auth_hash,
             udp_mod,
-            udp_recv_map_notify: Arc::new(Notify::new()),
             client: Mutex::new(None),
             connection: Mutex::new(None),
             dns_server_name: cfg.dns.clone(),
@@ -221,13 +221,11 @@ impl ShadowQuicOutbound {
             UdpMode::OverStream => start_unistream_listener(
                 conn_clone,
                 self.udp_recv_map.clone(),
-                self.udp_recv_map_notify.clone(),
                 self.connect_timeout(),
             ),
             UdpMode::OverDatagram => start_datagram_loop(
                 conn_clone,
                 self.udp_recv_map.clone(),
-                self.udp_recv_map_notify.clone(),
                 self.datagram_sender_rx.clone(),
             ),
         }
@@ -363,8 +361,12 @@ impl AnyOutbound for ShadowQuicOutbound {
         let target_bytes_dummy = TargetAddr::dummy().to_bytes();
 
         // send header with control_bistream
-        let send_context_id = self.next_context_id.fetch_add(1, Ordering::SeqCst);
-        let mut packet = Vec::with_capacity(1 + target_bytes.len() + 2 + target_bytes_dummy.len());
+        // let send_context_id = self.next_context_id.fetch_add(1, Ordering::SeqCst);
+        let send_context_id = self.udp_id.lock().await.next_id();
+        let send_context_id_bytes = send_context_id.into_bytes();
+        let mut packet = Vec::with_capacity(
+            1 + target_bytes.len() + send_context_id_bytes.len() + target_bytes_dummy.len(),
+        );
         match self.udp_mod {
             UdpMode::OverStream => {
                 packet.push(0x04);
@@ -375,7 +377,7 @@ impl AnyOutbound for ShadowQuicOutbound {
         }
         packet.extend_from_slice(&target_bytes_dummy);
         packet.extend_from_slice(&target_bytes);
-        packet.extend_from_slice(&send_context_id.to_be_bytes());
+        packet.extend_from_slice(&send_context_id_bytes);
         bistream.write_all(&packet).await?;
         bistream.flush().await?;
 
@@ -384,8 +386,7 @@ impl AnyOutbound for ShadowQuicOutbound {
             bistream,
             self.udp_recv_map.clone(),
             receiver.clone(),
-            self.udp_recv_map_notify.clone(),
-            None,
+            send_context_id.to_string(),
         );
 
         // setup sender
@@ -398,14 +399,14 @@ impl AnyOutbound for ShadowQuicOutbound {
 
                 {
                     let mut lock = send_mutex.lock().await;
-                    lock.write_all(&send_context_id.to_be_bytes()).await?;
+                    lock.write_all(&send_context_id_bytes).await?;
                     lock.flush().await?;
                 }
 
                 out_packet = Arc::new(ShadowQuicUdpPacket::new(
                     Some(send_mutex),
                     None,
-                    send_context_id,
+                    send_context_id_bytes,
                     target.clone(),
                     receiver,
                 ));
@@ -414,7 +415,7 @@ impl AnyOutbound for ShadowQuicOutbound {
                 out_packet = Arc::new(ShadowQuicUdpPacket::new(
                     None,
                     Some(self.datagram_sender_tx.clone()),
-                    send_context_id,
+                    send_context_id_bytes,
                     target.clone(),
                     receiver,
                 ));

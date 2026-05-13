@@ -7,7 +7,13 @@
         // "fdfe:dcba:9876::1/126",
       ],
       "udp_timeout": 50,
-      "auto_route": true
+      "auto_route": false
+    },
+    "mix_inbound": {
+      "type": "mix",
+      "address": "127.0.0.1",
+      "set_system_proxy": false,
+      "port": 1101
     },
     "sq_inbound": {
       "type": "shadowquic",
