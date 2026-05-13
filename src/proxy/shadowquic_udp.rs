@@ -232,6 +232,7 @@ async fn get_receiver(
     notify: Arc<Notify>,
 ) -> anyhow::Result<Arc<ShadowUdpReceiver>> {
     let start_time = now();
+    let mut is_waitting = false;
     timeout(Duration::from_secs(20), async {
         let notified = notify.notified();
         tokio::pin!(notified);
@@ -240,13 +241,16 @@ async fn get_receiver(
             notified.as_mut().enable();
 
             if let Some(entry) = udp_recv_map.get(&context_id) {
-                debug!(
-                    "get_receiver cost: {}",
-                    format_duration(start_time.elapsed())
-                );
+                if is_waitting {
+                    debug!(
+                        "get_receiver cost: {}",
+                        format_duration(start_time.elapsed())
+                    );
+                }
                 return entry.value().clone();
             }
 
+            is_waitting = true;
             notified.as_mut().await;
             notified.set(notify.notified());
         }
