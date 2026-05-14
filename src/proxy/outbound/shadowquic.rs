@@ -1,6 +1,7 @@
 use crate::proxy::shadowquic_udp::{
-    ShadowUdpReceiver, UdpRecvMap, gen_sunny_auth_hash, run_bistream_recv_listener,
-    start_datagram_loop, start_udp_session_cleaner, start_unistream_listener,
+    ShadowUdpReceiver, UdpRecvMap, WaitingDatagramBuffer, gen_sunny_auth_hash,
+    run_bistream_recv_listener, start_datagram_loop, start_udp_session_cleaner,
+    start_unistream_listener,
 };
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 use crate::utils::quic_wrap::quinn_wrap::QuinnClient;
@@ -14,7 +15,7 @@ use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tracing::debug;
 
 use tracing::{info, warn};
@@ -24,6 +25,7 @@ use crate::proxy::outbound::{AnyOutbound, AnyStream, UdpMode};
 use crate::proxy::shadowquic_udp::ShadowQuicUdpPacket;
 use crate::proxy::{QuicTlsConfig, TargetAddr};
 
+use crate::utils::keyed_notify::KeyedNotify;
 use crate::utils::{format_duration, new_io_other_error};
 
 use super::AnyPacket;
@@ -46,7 +48,8 @@ pub struct ShadowQuicOutbound {
 
     udp_mod: UdpMode,
 
-    udp_recv_map_notify: Arc<Notify>,
+    waiting_datagram_buffer: WaitingDatagramBuffer,
+    udp_recv_map_notify: Arc<KeyedNotify>,
     client: Mutex<Option<Arc<QuinnClient>>>,
     connection: Mutex<Option<Arc<quinn::Connection>>>,
     next_context_id: AtomicU16,
@@ -103,7 +106,8 @@ impl ShadowQuicOutbound {
             idle_timeout,
             auth_hash,
             udp_mod,
-            udp_recv_map_notify: Arc::new(Notify::new()),
+            waiting_datagram_buffer: Arc::new(DashMap::new()),
+            udp_recv_map_notify: Arc::new(KeyedNotify::new()),
             client: Mutex::new(None),
             connection: Mutex::new(None),
             dns_server_name: cfg.dns.clone(),
@@ -227,6 +231,7 @@ impl ShadowQuicOutbound {
             UdpMode::OverDatagram => start_datagram_loop(
                 conn_clone,
                 self.udp_recv_map.clone(),
+                self.waiting_datagram_buffer.clone(),
                 self.udp_recv_map_notify.clone(),
                 self.datagram_sender_rx.clone(),
             ),

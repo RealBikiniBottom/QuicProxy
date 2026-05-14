@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tokio::sync::Notify;
 
 use crate::config::InboundConfig;
 use crate::proxy::inbound::AnyInbound;
@@ -17,6 +16,7 @@ use crate::proxy::outbound::AnyPacket;
 use crate::proxy::outbound::UdpMode;
 use crate::proxy::router::Router;
 use crate::proxy::router::get_router;
+use crate::proxy::shadowquic_udp::WaitingDatagramBuffer;
 use crate::proxy::shadowquic_udp::{
     ShadowQuicUdpPacket, ShadowUdpReceiver, UdpRecvMap, auth_sunnyquic, gen_sunny_auth_hash,
     read_context_id, read_request_head, run_bistream_recv_listener, start_datagram_loop,
@@ -25,6 +25,7 @@ use crate::proxy::shadowquic_udp::{
 use crate::proxy::{QuicTlsConfig, TargetAddr};
 use anyhow::Context;
 
+use crate::utils::keyed_notify::KeyedNotify;
 use crate::utils::new_io_other_error;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 use crate::utils::quic_wrap::quinn_wrap::QuinnServer;
@@ -43,7 +44,8 @@ pub struct ShadowQuicInbound {
     idle_timeout: Duration,
     next_context_id: Arc<AtomicU16>,
     udp_recv_map: UdpRecvMap,
-    udp_recv_map_notify: Arc<Notify>,
+    udp_recv_map_notify: Arc<KeyedNotify>,
+    waiting_datagram_buffer: WaitingDatagramBuffer,
     datagram_sender_tx: flume::Sender<Bytes>,
     datagram_sender_rx: flume::Receiver<Bytes>,
 }
@@ -78,7 +80,8 @@ impl ShadowQuicInbound {
             port: cfg.port.context("require port")?,
             idle_timeout,
             next_context_id: Arc::new(AtomicU16::new(1)),
-            udp_recv_map_notify: Arc::new(Notify::new()),
+            udp_recv_map_notify: Arc::new(KeyedNotify::new()),
+            waiting_datagram_buffer: Arc::new(DashMap::new()),
             udp_recv_map,
             datagram_sender_tx,
             datagram_sender_rx,
@@ -97,7 +100,7 @@ impl ShadowQuicInbound {
         conn: Arc<quinn::Connection>,
         send_context_id: u16,
         idle_timeout: Duration,
-        udp_recv_map_notify: Arc<Notify>,
+        udp_recv_map_notify: Arc<KeyedNotify>,
     ) -> anyhow::Result<()> {
         let recv_context_id = read_context_id(&mut bistream, idle_timeout).await?;
         debug!("receive context_id {}", recv_context_id);
@@ -203,6 +206,7 @@ impl AnyInbound for ShadowQuicInbound {
         let auth_hash = self.auth_hash;
         let udp_recv_map = self.udp_recv_map.clone();
         let udp_recv_map_notify = self.udp_recv_map_notify.clone();
+        let waiting_datagram_buffer = self.waiting_datagram_buffer.clone();
         let datagram_sender_tx = self.datagram_sender_tx.clone();
         let datagram_sender_rx = self.datagram_sender_rx.clone();
         let session_timeout = self.idle_timeout();
@@ -221,6 +225,7 @@ impl AnyInbound for ShadowQuicInbound {
                     let conn_clone = conn.clone();
                     let udp_recv_map_clone = udp_recv_map.clone();
                     let udp_recv_map_notify_clone = udp_recv_map_notify.clone();
+                    let waiting_datagram_buffer_clone = waiting_datagram_buffer.clone();
                     let datagram_sender_tx = datagram_sender_tx.clone();
                     let datagram_sender_rx = datagram_sender_rx.clone();
                     let session_timeout_val = session_timeout;
@@ -241,6 +246,7 @@ impl AnyInbound for ShadowQuicInbound {
                                 start_datagram_loop(
                                     conn_clone.clone(),
                                     udp_recv_map_clone.clone(),
+                                    waiting_datagram_buffer_clone.clone(),
                                     udp_recv_map_notify_clone.clone(),
                                     datagram_sender_rx.clone(),
                                 );

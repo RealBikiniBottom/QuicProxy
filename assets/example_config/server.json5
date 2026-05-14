@@ -57,15 +57,6 @@
       }
     }
   },
-  "observe": {
-    "enabled": true,
-    "log_interval": 500
-  },
-  "api": {
-    "address": "127.0.0.1",
-    "password": "",
-    "port": 1235
-  },
   "log": {
     "level": "debug",
     "color": true

@@ -9,7 +9,6 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::timeout;
@@ -21,6 +20,7 @@ use tracing::warn;
 use crate::proxy::outbound::AnyPacket;
 use crate::proxy::{SessionCloser, TargetAddr};
 use crate::utils::format_duration;
+use crate::utils::keyed_notify::KeyedNotify;
 use crate::utils::new_io_other_error;
 use crate::utils::now;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
@@ -28,6 +28,23 @@ use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 use super::SourceAddr;
 
 pub type UdpRecvMap = Arc<DashMap<u16, Arc<ShadowUdpReceiver>>>;
+pub type WaitingDatagramBuffer = Arc<DashMap<u16, Arc<ShadowUdpDatagramBuffer>>>;
+
+pub struct ShadowUdpDatagramBuffer {
+    recveiver_sender: Sender<Bytes>,
+    recveiver: Mutex<Receiver<Bytes>>,
+}
+
+impl ShadowUdpDatagramBuffer {
+    pub fn new() -> Self {
+        let (sender, recver) = mpsc::channel(10);
+
+        Self {
+            recveiver_sender: sender,
+            recveiver: Mutex::new(recver),
+        }
+    }
+}
 
 pub struct ShadowUdpReceiver {
     recveiver_sender: Sender<(SourceAddr, Bytes)>, // feed packet to recver
@@ -137,7 +154,7 @@ pub fn run_bistream_recv_listener(
     mut bistream: Box<QuinnBistream>,
     udp_recv_map: UdpRecvMap,
     shadowquic_receiver: Arc<ShadowUdpReceiver>,
-    udp_recv_map_notify: Arc<Notify>,
+    udp_recv_map_notify: Arc<KeyedNotify>,
     recv_context_id: Option<u16>,
 ) {
     let receiver_for_spawn = shadowquic_receiver.clone();
@@ -151,7 +168,7 @@ pub fn run_bistream_recv_listener(
     if let Some(recv_context_id) = recv_context_id {
         context_ids.push(recv_context_id);
         udp_recv_map_clone.insert(recv_context_id, receiver_for_spawn.clone());
-        udp_recv_map_notify.notify_waiters();
+        udp_recv_map_notify.notify(&recv_context_id.to_string());
     }
 
     let current_span = tracing::Span::current();
@@ -171,7 +188,7 @@ pub fn run_bistream_recv_listener(
                                 if !context_ids.contains(&id) {
                                     udp_recv_map_clone.insert(id, receiver_for_spawn.clone());
                                     context_ids.push(id);
-                                    udp_recv_map_notify.notify_waiters();
+                                    udp_recv_map_notify.notify(&id.to_string());
                                 }
                             }
                             Err(e) => {
@@ -186,6 +203,9 @@ pub fn run_bistream_recv_listener(
             for id in context_ids {
                 debug!("removing {} from udp_recv_map", id);
                 udp_recv_map_clone.remove(&id);
+                let id_string = id.to_string();
+                udp_recv_map_notify.notify(&id_string);
+                udp_recv_map_notify.remove(&id_string);
             }
             debug!("bistream recv loop ended");
             closer_clone.close();
@@ -229,40 +249,32 @@ pub fn start_udp_session_cleaner(
 async fn get_receiver(
     udp_recv_map: UdpRecvMap,
     context_id: u16,
-    notify: Arc<Notify>,
+    keyed_notify: Arc<KeyedNotify>,
 ) -> anyhow::Result<Arc<ShadowUdpReceiver>> {
+    if let Some(entry) = udp_recv_map.get(&context_id) {
+        return Ok(entry.value().clone());
+    }
+
     let start_time = now();
-    let mut is_waitting = false;
-    timeout(Duration::from_secs(20), async {
-        let notified = notify.notified();
-        tokio::pin!(notified);
+    keyed_notify
+        .wait(&context_id.to_string(), Duration::from_secs(10))
+        .await?;
 
-        loop {
-            notified.as_mut().enable();
-
-            if let Some(entry) = udp_recv_map.get(&context_id) {
-                if is_waitting {
-                    debug!(
-                        "get_receiver cost: {}",
-                        format_duration(start_time.elapsed())
-                    );
-                }
-                return entry.value().clone();
-            }
-
-            is_waitting = true;
-            notified.as_mut().await;
-            notified.set(notify.notified());
-        }
-    })
-    .await
-    .context("timeout waiting for receiver")
+    if let Some(entry) = udp_recv_map.get(&context_id) {
+        debug!(
+            "get_receiver id {} cost: {}",
+            context_id,
+            format_duration(start_time.elapsed())
+        );
+        return Ok(entry.value().clone());
+    }
+    bail!("failed to get_receiver");
 }
 
 pub fn start_unistream_listener(
     conn: Arc<quinn::Connection>,
     udp_recv_map: UdpRecvMap,
-    udp_recv_map_notify: Arc<Notify>,
+    udp_recv_map_notify: Arc<KeyedNotify>,
     read_timeout: Duration,
 ) {
     tokio::spawn(async move {
@@ -323,7 +335,8 @@ async fn try_get_recv_context_id(
 pub fn start_datagram_loop(
     conn: Arc<quinn::Connection>,
     udp_recv_map: UdpRecvMap,
-    udp_recv_map_notify: Arc<Notify>,
+    waiting_datagram_buffer: WaitingDatagramBuffer,
+    udp_recv_map_notify: Arc<KeyedNotify>,
     datagram_sender_rx: flume::Receiver<Bytes>,
 ) {
     tokio::spawn(async move {
@@ -336,6 +349,7 @@ pub fn start_datagram_loop(
                             if let Err(e) = handle_datagram(
                                 udp_recv_map.clone(),
                                 udp_recv_map_notify.clone(),
+                                waiting_datagram_buffer.clone(),
                                 datagram,
                                 remote_src.clone(),
                             ).await {
@@ -368,7 +382,8 @@ pub fn start_datagram_loop(
 
 async fn handle_datagram(
     udp_recv_map: UdpRecvMap,
-    udp_recv_map_notify: Arc<Notify>,
+    udp_recv_map_notify: Arc<KeyedNotify>,
+    waiting_datagram_buffer: WaitingDatagramBuffer,
     datagram: Bytes,
     remote_src: TargetAddr,
 ) -> anyhow::Result<()> {
@@ -385,10 +400,22 @@ async fn handle_datagram(
 
     let payload = datagram.slice(2..);
 
-    if let Some(entry) = udp_recv_map.get(&recv_context_id) {
-        entry.feed_datagram(payload, remote_src).await;
+    let mut is_new = false;
+
+    let item = waiting_datagram_buffer
+        .entry(recv_context_id)
+        .or_insert_with(|| {
+            is_new = true;
+            Arc::new(ShadowUdpDatagramBuffer::new())
+        })
+        .clone();
+
+    let _ = item.recveiver_sender.send(Bytes::from(payload)).await;
+    if !is_new {
         return Ok(());
     }
+
+    let item_clone = item.clone();
 
     tokio::spawn(async move {
         let result: anyhow::Result<()> = async {
@@ -399,10 +426,31 @@ async fn handle_datagram(
             )
             .await?;
 
-            item.feed_datagram(payload, remote_src).await;
+            let closer = item.closer.clone();
+            let mut lock = item_clone.recveiver.lock().await;
+            let addr_clone = remote_src.clone();
+
+            loop {
+                let addr_clone = addr_clone.clone();
+                tokio::select! {
+                    _ = closer.wait() => {
+                        break;
+                    }
+                    payload = lock.recv() => {
+                        if let Some(payload) = payload {
+                            item.feed_datagram(payload, addr_clone).await;
+                        }else{
+                            break;
+                        }
+                    }
+                }
+            }
+
             Ok(())
         }
         .await;
+
+        waiting_datagram_buffer.remove(&recv_context_id);
 
         // 处理错误
         if let Err(e) = result {

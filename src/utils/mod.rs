@@ -13,6 +13,7 @@ pub mod count_traffic;
 pub mod elevate;
 pub mod http_outbound;
 pub mod interface;
+pub mod keyed_notify;
 pub mod logging;
 pub mod net_monitor;
 pub mod quic_wrap;
