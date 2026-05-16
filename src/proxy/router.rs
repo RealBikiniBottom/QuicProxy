@@ -509,14 +509,24 @@ impl Router {
         let mut t1 = tokio::spawn(
             async move {
                 loop {
-                    match t1_in.recv_from().await {
-                        Ok((_source, _target, packet)) => {
-                            trace!("send {} from {} to {}", packet.len(), t1_source, t1_target);
-                            if let Err(e) = t1_out.send_to(packet, &t1_target, &t1_source).await {
+                    match t1_in.recv_many().await {
+                        Ok(packets) => {
+                            trace!(
+                                "sending {} packets from {} to {}",
+                                packets.len(),
+                                t1_source,
+                                t1_target
+                            );
+                            let items: Vec<_> = packets
+                                .into_iter()
+                                .map(|(_src, _dst, packet)| {
+                                    (packet, t1_target.clone(), t1_source.clone())
+                                })
+                                .collect();
+                            if let Err(e) = t1_out.send_many(&items).await {
                                 info!("UDP session quit because [outbound err: {:#}]", e);
                                 break;
                             }
-                            // Time Touch: 刷新最后活跃时间
                             *t1_activity.lock().unwrap() = Instant::now();
                         }
                         Err(e) => {
@@ -527,7 +537,7 @@ impl Router {
                 }
             }
             .in_current_span(),
-        ); // 注入当前 Span
+        );
 
         // ==========================================
         // Spawn: Outbound -> Inbound (接收目标服务器返回)
@@ -541,14 +551,24 @@ impl Router {
         let mut t2 = tokio::spawn(
             async move {
                 loop {
-                    match t2_out.recv_from().await {
-                        Ok((_source, _target, packet)) => {
-                            trace!("recv {} from {} to {}", packet.len(), t2_target, t2_source);
-                            if let Err(e) = t2_in.send_to(packet, &t2_source, &t2_target).await {
+                    match t2_out.recv_many().await {
+                        Ok(packets) => {
+                            trace!(
+                                "receiving {} packets from {} to {}",
+                                packets.len(),
+                                t2_target,
+                                t2_source
+                            );
+                            let items: Vec<_> = packets
+                                .into_iter()
+                                .map(|(_src, _dst, packet)| {
+                                    (packet, t2_source.clone(), t2_target.clone())
+                                })
+                                .collect();
+                            if let Err(e) = t2_in.send_many(&items).await {
                                 info!("UDP session quit because [inbound err: {:#}]", e);
                                 break;
                             }
-                            // Time Touch: 刷新最后活跃时间
                             *t2_activity.lock().unwrap() = Instant::now();
                         }
                         Err(e) => {
@@ -559,7 +579,7 @@ impl Router {
                 }
             }
             .in_current_span(),
-        ); // 注入当前 Span
+        );
 
         // 初始化检查定时器
         let mut check_timer = Box::pin(sleep(timeout_duration));

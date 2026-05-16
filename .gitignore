@@ -4,6 +4,7 @@
 /quicproxy_flutter
 /src/premium
 cache.db
+test_cache.db
 remote.mmdb
 *~
 [._]*.un~

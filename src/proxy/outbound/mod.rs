@@ -264,6 +264,18 @@ pub trait AnyPacket: Send + Sync {
         bail!("Not supported")
     }
 
+    async fn send_many(&self, items: &[(Bytes, TargetAddr, SourceAddr)]) -> anyhow::Result<usize> {
+        let mut r = 0;
+        for (buf, target, from) in items {
+            r += self.send_to(buf.clone(), target, from).await?;
+        }
+        Ok(r)
+    }
+
+    async fn recv_many(&self) -> anyhow::Result<Vec<(TargetAddr, TargetAddr, Bytes)>> {
+        Ok(vec![self.recv_from().await?])
+    }
+
     fn closer(&self) -> Arc<SessionCloser> {
         Arc::new(SessionCloser::new())
     }
@@ -414,5 +426,18 @@ impl AnyPacket for UdpHandler {
             Some(data) => Ok((self.src_addr.clone(), self.dst_addr.clone(), data)),
             None => bail!("UDP session channel closed"),
         }
+    }
+
+    async fn recv_many(&self) -> anyhow::Result<Vec<(TargetAddr, TargetAddr, Bytes)>> {
+        let mut rx = self.udp_rx.lock().await;
+        let first = match rx.recv().await {
+            Some(data) => data,
+            None => bail!("recv channel closed"),
+        };
+        let mut results = vec![(self.src_addr.clone(), self.dst_addr.clone(), first)];
+        while let Result::Ok(data) = rx.try_recv() {
+            results.push((self.src_addr.clone(), self.dst_addr.clone(), data));
+        }
+        Ok(results)
     }
 }

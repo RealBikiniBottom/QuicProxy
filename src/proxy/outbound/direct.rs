@@ -47,6 +47,21 @@ impl AnyPacket for DirectUdpOutbound {
         buf.truncate(n);
         Ok((TargetAddr::Ip(addr), TargetAddr::dummy(), buf.freeze()))
     }
+
+    async fn recv_many(&self) -> anyhow::Result<Vec<(TargetAddr, TargetAddr, Bytes)>> {
+        let first = self.recv_from().await?;
+        let mut results = vec![first];
+        loop {
+            let mut buf = BytesMut::with_capacity(1024 * 2);
+            if let Result::Ok((n, addr)) = self.socket.try_recv_buf_from(&mut buf) {
+                buf.truncate(n);
+                results.push((TargetAddr::Ip(addr), TargetAddr::dummy(), buf.freeze()));
+            } else {
+                break;
+            }
+        }
+        Ok(results)
+    }
 }
 
 impl DirectOutbound {

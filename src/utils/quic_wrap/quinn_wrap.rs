@@ -21,7 +21,7 @@ use crate::utils::new_io_other_error;
 
 use super::{QuicBistream, QuicConnection, QuicUnistream};
 
-const QUIC_DATAGRAM_BUFFER_SIZE: usize = 1024 * 10;
+pub const MAX_DATAGRAM_WINDOW: usize = 1024 * 500;
 
 fn keep_alive_interval_for(idle_timeout: Duration) -> Option<Duration> {
     if idle_timeout.is_zero() {
@@ -274,10 +274,10 @@ impl QuinnServer {
             transport_config.max_idle_timeout(None);
             transport_config.keep_alive_interval(None);
         }
-        transport_config.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_BUFFER_SIZE));
-        transport_config.datagram_send_buffer_size(QUIC_DATAGRAM_BUFFER_SIZE);
-        transport_config.max_concurrent_bidi_streams(500u32.into());
-        transport_config.max_concurrent_uni_streams(500u32.into());
+        transport_config.datagram_receive_buffer_size(Some(MAX_DATAGRAM_WINDOW as usize));
+        transport_config.datagram_send_buffer_size(MAX_DATAGRAM_WINDOW.try_into().unwrap());
+        transport_config.max_concurrent_bidi_streams(5000u32.into());
+        transport_config.max_concurrent_uni_streams(5000u32.into());
         transport_config.enable_segmentation_offload(enable_gso);
         transport_config.initial_mtu(initial_mtu);
         transport_config.min_mtu(min_mtu);
@@ -455,8 +455,8 @@ impl QuinnClient {
             transport_config.max_idle_timeout(None);
             transport_config.keep_alive_interval(None);
         }
-        transport_config.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_BUFFER_SIZE));
-        transport_config.datagram_send_buffer_size(QUIC_DATAGRAM_BUFFER_SIZE);
+        transport_config.datagram_receive_buffer_size(Some(MAX_DATAGRAM_WINDOW as usize));
+        transport_config.datagram_send_buffer_size(MAX_DATAGRAM_WINDOW.try_into().unwrap());
         transport_config.enable_segmentation_offload(enable_gso);
         transport_config.initial_mtu(initial_mtu);
         transport_config.min_mtu(min_mtu);

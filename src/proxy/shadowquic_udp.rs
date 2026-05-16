@@ -529,10 +529,24 @@ impl AnyPacket for ShadowQuicUdpPacket {
         let mut packet = Vec::with_capacity(2 + buf.len());
         packet.extend_from_slice(&self.send_context_id.to_be_bytes());
         packet.extend_from_slice(&buf);
+        // self.conn.send_datagram_wait(Bytes::from(packet));
         if let Err(e) = self.conn.send_datagram(Bytes::from(packet)) {
             warn!("datagram send queue closed: {}", e);
         }
         Ok(buf.len())
+    }
+
+    async fn recv_many(&self) -> anyhow::Result<Vec<(TargetAddr, TargetAddr, Bytes)>> {
+        let mut rx = self.receiver.recveiver.lock().await;
+
+        let mut buffer = Vec::new();
+        let _left = rx.recv_many(&mut buffer, 100).await;
+        let mut results = Vec::with_capacity(buffer.len());
+        for item in buffer {
+            let dst = self.target.clone();
+            results.push((item.0, dst, item.1));
+        }
+        Ok(results)
     }
 
     async fn recv_from(&self) -> anyhow::Result<(SourceAddr, TargetAddr, Bytes)> {
