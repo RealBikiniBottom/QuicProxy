@@ -6,9 +6,10 @@ pub mod shadowquic_udp;
 
 use crate::config::{InboundConfig, OutboundConfig};
 use crate::utils::new_io_other_error;
-use anyhow::{Context, Ok, Result, bail};
+use anyhow::{Context, Result, bail};
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -97,7 +98,54 @@ impl TargetAddr {
     }
 
     pub fn dummy() -> Self {
-        TargetAddr::Ip("0.0.0.0:0".parse().unwrap())
+        TargetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+    }
+
+    /// Parse a TargetAddr from string format
+    ///
+    /// Supported formats:
+    /// - IPv4: `"192.168.1.1:8080"`
+    /// - IPv6: `"[::1]:8080"` (bracketed, as per RFC 3986)
+    /// - Domain: `"example.com:443"` or `"sub.domain.co.uk:80"`
+    ///
+    /// # Examples
+    /// ```
+    /// let addr = TargetAddr::from_str("1.1.1.1:53")?;
+    /// let addr = TargetAddr::from_str("[2001:db8::1]:443")?;
+    /// let addr = TargetAddr::from_str("google.com:80")?;
+    /// ```
+    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+        // 1. Try standard SocketAddr parsing (handles IPv4 + bracketed IPv6)
+        if let Ok(addr) = SocketAddr::from_str(s) {
+            return Ok(TargetAddr::Ip(addr));
+        }
+
+        // 2. Fallback: parse as domain:port
+        // Find the last colon to handle domains that might contain colons (edge cases)
+        let (host, port_str) =
+            s.rfind(':')
+                .map(|pos| (&s[..pos], &s[pos + 1..]))
+                .context(format!(
+                    "Invalid address format '{}': expected host:port",
+                    s
+                ))?;
+
+        // Validate and parse port
+        let port = port_str
+            .parse::<u16>()
+            .context(format!("Invalid port '{}' in address: {}", port_str, s))?;
+
+        // Basic host validation
+        if host.is_empty() {
+            bail!("Empty hostname in address: {}", s);
+        }
+        if host.len() > 255 {
+            bail!("Hostname exceeds 255 characters: {}", s);
+        }
+
+        // Accept domain as-is (DNS resolution deferred to connect time)
+        // Allow permissive charset to support IDN, internal hostnames, etc.
+        Ok(TargetAddr::Domain(host.to_string(), port))
     }
 }
 

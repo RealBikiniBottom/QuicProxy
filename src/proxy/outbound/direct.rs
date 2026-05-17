@@ -4,6 +4,7 @@ use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream};
 use crate::proxy::{SessionCloser, SourceAddr, TargetAddr};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,11 +22,22 @@ pub struct DirectOutbound {
 struct DirectUdpOutbound {
     socket: UdpSocket,
     dns: Option<String>,
-    ip_map: DashMap<TargetAddr, SocketAddr>,
+    ip_map: DashMap<String, String>,
     closer: Arc<SessionCloser>,
 }
 
-use bytes::{Bytes, BytesMut};
+impl DirectUdpOutbound {
+    pub fn reverse(&self, ip: SocketAddr) -> anyhow::Result<TargetAddr> {
+        let key = format!("socket:{}", ip.to_string());
+        match self.ip_map.get(&key) {
+            Some(res) => {
+                let cached_str = res.value();
+                TargetAddr::from_str(&cached_str)
+            }
+            None => Ok(TargetAddr::Ip(ip)),
+        }
+    }
+}
 
 #[async_trait]
 impl AnyPacket for DirectUdpOutbound {
@@ -34,12 +46,20 @@ impl AnyPacket for DirectUdpOutbound {
     }
 
     async fn send_to(&self, buf: Bytes, target: &TargetAddr, _from: &SourceAddr) -> Result<usize> {
-        let ip = match self.ip_map.get(target) {
-            Some(res) => res.clone(),
-            None => {
-                let addr = resolve_target(target, self.dns.as_deref()).await?;
-                self.ip_map.insert(target.clone(), addr);
-                addr
+        let ip = match target {
+            TargetAddr::Ip(socket_addr) => *socket_addr,
+            TargetAddr::Domain(_, _) => {
+                let key = format!("target:{}", target.to_string());
+
+                if let Some(cached) = self.ip_map.get(&key) {
+                    cached.value().parse::<SocketAddr>()?
+                } else {
+                    let addr = resolve_target(target, self.dns.as_deref()).await?;
+                    let rkey = format!("socket:{}", addr);
+                    self.ip_map.insert(key, addr.to_string());
+                    self.ip_map.insert(rkey, target.to_string());
+                    addr
+                }
             }
         };
 
@@ -53,7 +73,7 @@ impl AnyPacket for DirectUdpOutbound {
         let mut buf = BytesMut::with_capacity(1024 * 2);
         let (n, addr) = self.socket.recv_buf_from(&mut buf).await?;
         buf.truncate(n);
-        Ok((TargetAddr::Ip(addr), TargetAddr::dummy(), buf.freeze()))
+        Ok((self.reverse(addr)?, TargetAddr::dummy(), buf.freeze()))
     }
 
     async fn recv_many(&self) -> anyhow::Result<Vec<(TargetAddr, TargetAddr, Bytes)>> {
@@ -63,7 +83,7 @@ impl AnyPacket for DirectUdpOutbound {
             let mut buf = BytesMut::with_capacity(1024 * 2);
             if let Result::Ok((n, addr)) = self.socket.try_recv_buf_from(&mut buf) {
                 buf.truncate(n);
-                results.push((TargetAddr::Ip(addr), TargetAddr::dummy(), buf.freeze()));
+                results.push((self.reverse(addr)?, TargetAddr::dummy(), buf.freeze()));
             } else {
                 break;
             }
