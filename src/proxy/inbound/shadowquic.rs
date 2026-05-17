@@ -2,15 +2,13 @@ use anyhow::bail;
 use async_trait::async_trait;
 use quinn::VarInt;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::AtomicU16;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::config::InboundConfig;
 use crate::proxy::SourceAddr;
 use crate::proxy::inbound::AnyInbound;
-use crate::proxy::outbound::AnyPacket;
 use crate::proxy::outbound::UdpMode;
 use crate::proxy::router::Router;
 use crate::proxy::router::get_router;
@@ -84,7 +82,7 @@ impl ShadowQuicInbound {
         inbound_tag: &str,
         udp_recv_map: UdpRecvMap,
         conn: Arc<quinn::Connection>,
-        send_context_id: u16,
+        send_context_id: Arc<AtomicU16>,
         idle_timeout: Duration,
         udp_recv_map_notify: Arc<KeyedNotify>,
     ) -> anyhow::Result<()> {
@@ -100,58 +98,34 @@ impl ShadowQuicInbound {
             })
             .clone();
 
-        let mut buf = target.to_bytes();
-        buf.extend_from_slice(&send_context_id.to_be_bytes());
-        bistream.write_all(&buf).await?;
-        bistream.flush().await?;
-
         receiver.bind_context_id(
             SourceAddr::Ip(conn.remote_address()),
             recv_context_id,
             receiver.clone(),
         );
-        run_bistream_recv_listener(bistream, receiver.clone());
+        run_bistream_recv_listener(bistream.recv, receiver.clone());
 
-
-        let target_clone = target.clone();
-
-        // build tracked_packet
-        let out_packet: Arc<dyn AnyPacket>;
+        let mut is_over_unistream = false;
         match udp_mod {
             UdpMode::OverStream => {
-                let uni_send = conn.open_uni().await?;
-
-                let send_mutex = Arc::new(Mutex::new(uni_send));
-
-                {
-                    let mut lock = send_mutex.lock().await;
-                    lock.write_all(&send_context_id.to_be_bytes()).await?;
-                    lock.flush().await?;
-                }
-
-                out_packet = Arc::new(ShadowQuicUdpPacket::new(
-                    Some(send_mutex),
-                    send_context_id,
-                    target,
-                    receiver.clone(),
-                    conn.clone(),
-                ));
+                is_over_unistream = true;
             }
-            UdpMode::OverDatagram => {
-                out_packet = Arc::new(ShadowQuicUdpPacket::new(
-                    None,
-                    send_context_id,
-                    target,
-                    receiver.clone(),
-                    conn.clone(),
-                ));
-            }
+            UdpMode::OverDatagram => {}
         }
+
+        let out_packet = Arc::new(ShadowQuicUdpPacket::new(
+            is_over_unistream,
+            receiver,
+            send_context_id,
+            Arc::new(Mutex::new(bistream.send)),
+            conn.clone(),
+        ));
+        out_packet.get_send_context_id(&target).await?; // init
 
         router
             .dispatch_packet(
                 out_packet,
-                &target_clone,
+                &target.clone(),
                 &TargetAddr::Ip(conn.remote_address()),
                 inbound_tag,
                 None,
@@ -303,9 +277,6 @@ impl AnyInbound for ShadowQuicInbound {
                                                     r = field::Empty,
                                                     o = field::Empty
                                                 );
-                                                let context_id = per_conn
-                                                    .next_context_id
-                                                    .fetch_add(1, Ordering::SeqCst);
                                                 Self::handle_udp(
                                                     if cmd == 0x03 {
                                                         UdpMode::OverDatagram
@@ -318,7 +289,7 @@ impl AnyInbound for ShadowQuicInbound {
                                                     tag.as_str(),
                                                     per_conn.udp_recv_map.clone(),
                                                     conn_clone2.clone(),
-                                                    context_id,
+                                                    per_conn.next_context_id.clone(),
                                                     session_timeout_val,
                                                     per_conn.udp_recv_map_notify.clone(),
                                                 )

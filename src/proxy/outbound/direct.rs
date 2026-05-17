@@ -4,7 +4,6 @@ use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream};
 use crate::proxy::{SessionCloser, SourceAddr, TargetAddr};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,8 +18,7 @@ pub struct DirectOutbound {
 
 struct DirectUdpOutbound {
     socket: UdpSocket,
-    target_addr: SocketAddr,
-    // dns: Option<String>,
+    dns: Option<String>,
     closer: Arc<SessionCloser>,
 }
 
@@ -32,11 +30,11 @@ impl AnyPacket for DirectUdpOutbound {
         self.closer.clone()
     }
 
-    async fn send_to(&self, buf: Bytes, _target: &TargetAddr, _from: &SourceAddr) -> Result<usize> {
-        // let addr = resolve_target(target, self.dns.as_deref()).await?;
+    async fn send_to(&self, buf: Bytes, target: &TargetAddr, _from: &SourceAddr) -> Result<usize> {
+        let addr = resolve_target(target, self.dns.as_deref()).await?;
 
         self.socket
-            .send_to(&buf, self.target_addr)
+            .send_to(&buf, addr)
             .await
             .context("send_to failed")
     }
@@ -122,7 +120,7 @@ impl AnyOutbound for DirectOutbound {
 
         let inner = Arc::new(DirectUdpOutbound {
             socket,
-            target_addr: addr,
+            dns: self.dns.clone(),
             closer: Arc::new(SessionCloser::new()),
         });
         Ok(inner)

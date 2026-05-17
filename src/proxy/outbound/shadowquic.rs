@@ -9,11 +9,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tracing::debug;
 
 use tracing::{info, warn};
 
@@ -350,67 +348,40 @@ impl AnyOutbound for ShadowQuicOutbound {
     }
 
     async fn connect_packet(&self, target: &TargetAddr) -> anyhow::Result<Arc<dyn AnyPacket>> {
-        let (conn, send, recv, state) = self.open_bistream_with_retry().await?;
-        let mut bistream = Box::new(QuinnBistream::new(send, recv));
+        let (conn, mut send, recv, state) = self.open_bistream_with_retry().await?;
 
-        let target_bytes = target.to_bytes();
         let target_bytes_dummy = TargetAddr::dummy().to_bytes();
+        let mut packet = Vec::with_capacity(1 + target_bytes_dummy.len());
 
-        let send_context_id = state.next_context_id.fetch_add(1, Ordering::SeqCst);
-        let mut packet = Vec::with_capacity(1 + target_bytes.len() + 2 + target_bytes_dummy.len());
+        let mut is_over_unistream = true;
         match self.udp_mod {
             UdpMode::OverStream => {
                 packet.push(0x04);
+                is_over_unistream = true;
             }
             UdpMode::OverDatagram => {
                 packet.push(0x03);
             }
         }
         packet.extend_from_slice(&target_bytes_dummy);
-        packet.extend_from_slice(&target_bytes);
-        packet.extend_from_slice(&send_context_id.to_be_bytes());
-        bistream.write_all(&packet).await?;
-        bistream.flush().await?;
+        send.write_all(&packet).await?;
+        send.flush().await?;
 
         let receiver = Arc::new(ShadowUdpReceiver::new(
             state.udp_recv_map.clone(),
             state.udp_recv_map_notify.clone(),
         ));
-        run_bistream_recv_listener(bistream, receiver.clone());
+        run_bistream_recv_listener(recv, receiver.clone());
 
-        let out_packet: Arc<dyn AnyPacket>;
-        match self.udp_mod {
-            UdpMode::OverStream => {
-                let uni_send = conn.open_uni().await?;
+        let out_packet = Arc::new(ShadowQuicUdpPacket::new(
+            is_over_unistream,
+            receiver,
+            state.next_context_id.clone(),
+            Arc::new(Mutex::new(send)),
+            conn.clone(),
+        ));
+        out_packet.get_send_context_id(target).await?; // init
 
-                let send_mutex = Arc::new(Mutex::new(uni_send));
-
-                {
-                    let mut lock = send_mutex.lock().await;
-                    lock.write_all(&send_context_id.to_be_bytes()).await?;
-                    lock.flush().await?;
-                }
-
-                out_packet = Arc::new(ShadowQuicUdpPacket::new(
-                    Some(send_mutex),
-                    send_context_id,
-                    target.clone(),
-                    receiver,
-                    conn.clone(),
-                ));
-            }
-            UdpMode::OverDatagram => {
-                out_packet = Arc::new(ShadowQuicUdpPacket::new(
-                    None,
-                    send_context_id,
-                    target.clone(),
-                    receiver,
-                    conn.clone(),
-                ));
-            }
-        }
-
-        debug!("created ShadowQuicUdpPacket");
         Ok(out_packet)
     }
 }

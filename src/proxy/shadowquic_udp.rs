@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU16;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,9 +32,10 @@ use super::SourceAddr;
 
 pub type UdpRecvMap = Arc<DashMap<u16, Arc<ShadowUdpReceiver>>>;
 pub type WaitingDatagramBuffer = Arc<DashMap<u16, Arc<ShadowUdpDatagramBuffer>>>;
+pub type SenderMapItem = (u16, Option<Arc<Mutex<quinn::SendStream>>>);
 
 pub struct PerConnectionState {
-    pub next_context_id: AtomicU16,
+    pub next_context_id: Arc<AtomicU16>,
     pub udp_recv_map: UdpRecvMap,
     pub udp_recv_map_notify: Arc<KeyedNotify>,
     pub waiting_datagram_buffer: WaitingDatagramBuffer,
@@ -43,7 +45,7 @@ impl PerConnectionState {
     pub fn new() -> Self {
         let udp_recv_map: UdpRecvMap = Arc::new(DashMap::new());
         Self {
-            next_context_id: AtomicU16::new(1),
+            next_context_id: Arc::new(AtomicU16::new(1)),
             udp_recv_map,
             udp_recv_map_notify: Arc::new(KeyedNotify::new()),
             waiting_datagram_buffer: Arc::new(DashMap::new()),
@@ -194,24 +196,22 @@ impl ShadowUdpReceiver {
         for item in keys {
             self.udp_recv_map_notify.notify(&item.to_string());
             self.udp_recv_map.remove(&item);
+            debug!("removing context_id {} from UdpRecvMap", item);
         }
     }
 }
 
 async fn read_addr_and_context_id(
-    bistream: &mut QuinnBistream,
+    recv: &mut quinn::RecvStream,
 ) -> anyhow::Result<(u16, TargetAddr)> {
-    let target = TargetAddr::read_from(bistream).await?;
+    let target = TargetAddr::read_from(recv).await?;
     let mut cid_buf = [0u8; 2];
-    bistream.read_exact(&mut cid_buf).await?;
+    recv.read_exact(&mut cid_buf).await?;
     let id = u16::from_be_bytes(cid_buf);
     Ok((id, target))
 }
 
-pub fn run_bistream_recv_listener(
-    mut bistream: Box<QuinnBistream>,
-    receiver: Arc<ShadowUdpReceiver>,
-) {
+pub fn run_bistream_recv_listener(mut recv: quinn::RecvStream, receiver: Arc<ShadowUdpReceiver>) {
     let receiver_for_spawn = receiver.clone();
     let closer_clone = receiver.closer.clone();
 
@@ -222,16 +222,16 @@ pub fn run_bistream_recv_listener(
             loop {
                 tokio::select! {
                     _ = closer_clone.wait() => {
-                        debug!("bistream recv loop: received closer signal");
+                        debug!("recv loop: received closer signal");
                         break;
                     }
-                    res = read_addr_and_context_id(&mut bistream) => {
+                    res = read_addr_and_context_id(&mut recv) => {
                         match res {
                             Ok((id, source)) => {
                                 receiver_for_spawn.bind_context_id(source, id, receiver_for_spawn.clone());
                             }
                             Err(e) => {
-                                error!("bistream read error: {}", e);
+                                error!("recv read error: {}", e);
                                 break;
                             }
                         }
@@ -240,7 +240,7 @@ pub fn run_bistream_recv_listener(
             }
 
             receiver_for_spawn.clean();
-            debug!("bistream recv loop ended");
+            debug!("control_bistream loop ended");
             closer_clone.close();
         }
         .instrument(current_span),
@@ -480,31 +480,78 @@ fn handle_datagram(
 }
 
 pub struct ShadowQuicUdpPacket {
-    send_unistream: Option<Arc<Mutex<quinn::SendStream>>>,
+    sender_map: DashMap<SourceAddr, SenderMapItem>,
+    is_over_unistream: bool,
 
-    send_context_id: u16,
-    target: TargetAddr,
     conn: Arc<quinn::Connection>,
+    control_stream: Arc<Mutex<quinn::SendStream>>,
+    next_context_id: Arc<AtomicU16>,
 
     receiver: Arc<ShadowUdpReceiver>,
 }
 
 impl ShadowQuicUdpPacket {
     pub fn new(
-        send_unistream: Option<Arc<Mutex<quinn::SendStream>>>,
-        send_context_id: u16,
-        target: TargetAddr,
-
+        is_over_unistream: bool,
         receiver: Arc<ShadowUdpReceiver>,
+        next_context_id: Arc<AtomicU16>,
+        control_stream: Arc<Mutex<quinn::SendStream>>,
         conn: Arc<quinn::Connection>,
     ) -> Self {
         Self {
-            send_unistream,
-            send_context_id,
-            target,
+            sender_map: DashMap::new(),
+            is_over_unistream,
+            control_stream,
+            next_context_id,
             receiver,
             conn,
         }
+    }
+
+    pub async fn build_sender(
+        &self,
+        send_context_id: u16,
+        target: &SourceAddr,
+    ) -> anyhow::Result<()> {
+        let mut lock = self.control_stream.lock().await;
+
+        let target_bytes = target.to_bytes();
+        let mut packet = Vec::with_capacity(target_bytes.len() + 2);
+        packet.extend_from_slice(&target_bytes);
+        packet.extend_from_slice(&send_context_id.to_be_bytes());
+        lock.write_all(&packet).await?;
+        lock.flush().await?;
+
+        if self.is_over_unistream {
+            let uni_send = self.conn.open_uni().await?;
+
+            let send_mutex = Arc::new(Mutex::new(uni_send));
+            {
+                let mut lock = send_mutex.lock().await;
+                lock.write_all(&send_context_id.to_be_bytes()).await?;
+                lock.flush().await?;
+            }
+            self.sender_map
+                .insert(target.clone(), (send_context_id, Some(send_mutex)));
+        } else {
+            self.sender_map
+                .insert(target.clone(), (send_context_id, None));
+        }
+        Ok(())
+    }
+
+    pub async fn get_send_context_id(&self, target: &SourceAddr) -> anyhow::Result<SenderMapItem> {
+        if let Some(unistream) = self.sender_map.get(&target) {
+            return Ok(unistream.clone());
+        }
+
+        let send_context_id = self.next_context_id.fetch_add(1, Ordering::SeqCst);
+        self.build_sender(send_context_id, target).await?;
+
+        if let Some(unistream) = self.sender_map.get(&target) {
+            return Ok(unistream.clone());
+        }
+        bail!("failed to init sender.");
     }
 }
 
@@ -518,10 +565,12 @@ impl AnyPacket for ShadowQuicUdpPacket {
         &self,
         buf: Bytes,
         _target: &TargetAddr,
-        _from: &SourceAddr,
+        from: &SourceAddr,
     ) -> anyhow::Result<usize> {
-        if let Some(stream) = &self.send_unistream {
-            let mut stream = stream.lock().await;
+        if self.is_over_unistream {
+            let (_, lock) = self.get_send_context_id(from).await?;
+            let lock = lock.expect("should be unistream");
+            let mut stream = lock.lock().await;
             let mut packet = Vec::with_capacity(2 + buf.len());
             packet.extend_from_slice(&(buf.len() as u16).to_be_bytes());
             packet.extend_from_slice(&buf);
@@ -530,8 +579,9 @@ impl AnyPacket for ShadowQuicUdpPacket {
             return Ok(buf.len());
         }
 
+        let (send_context_id, _) = self.get_send_context_id(from).await?;
         let mut packet = Vec::with_capacity(2 + buf.len());
-        packet.extend_from_slice(&self.send_context_id.to_be_bytes());
+        packet.extend_from_slice(&send_context_id.to_be_bytes());
         packet.extend_from_slice(&buf);
         // self.conn.send_datagram_wait(Bytes::from(packet));
         if let Err(e) = self.conn.send_datagram(Bytes::from(packet)) {
@@ -547,8 +597,7 @@ impl AnyPacket for ShadowQuicUdpPacket {
         let _left = rx.recv_many(&mut buffer, 100).await;
         let mut results = Vec::with_capacity(buffer.len());
         for item in buffer {
-            let dst = self.target.clone();
-            results.push((item.0, dst, item.1));
+            results.push((item.0, TargetAddr::dummy(), item.1));
         }
         Ok(results)
     }
@@ -557,10 +606,7 @@ impl AnyPacket for ShadowQuicUdpPacket {
         let mut rx = self.receiver.recveiver.lock().await;
 
         match rx.recv().await {
-            Some(packet) => {
-                let dst = self.target.clone();
-                Ok((packet.0, dst, packet.1))
-            }
+            Some(packet) => Ok((packet.0, TargetAddr::dummy(), packet.1)),
             None => bail!("recv_from closed."),
         }
     }
