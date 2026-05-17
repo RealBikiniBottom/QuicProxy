@@ -109,8 +109,11 @@ impl ShadowQuicInbound {
         match udp_mod {
             UdpMode::OverStream => {
                 is_over_unistream = true;
+                debug!("UdpMode::OverStream");
             }
-            UdpMode::OverDatagram => {}
+            UdpMode::OverDatagram => {
+                debug!("UdpMode::OverDatagram");
+            }
         }
 
         let out_packet = Arc::new(ShadowQuicUdpPacket::new(

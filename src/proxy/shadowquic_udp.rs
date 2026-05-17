@@ -117,7 +117,6 @@ impl ShadowUdpReceiver {
             loop {
                 tokio::select! {
                     _ = closer_clone.wait() => {
-                        debug!("unistream_worker: recv closer signal, id: {}", context_id);
                         break;
                     }
 
@@ -150,6 +149,7 @@ impl ShadowUdpReceiver {
                 }
             }
 
+            debug!("unistream_worker {} closed", context_id);
             udp_recv_map_clone.remove(&context_id);
             closer_clone.close();
         });

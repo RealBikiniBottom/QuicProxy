@@ -353,7 +353,7 @@ impl AnyOutbound for ShadowQuicOutbound {
         let target_bytes_dummy = TargetAddr::dummy().to_bytes();
         let mut packet = Vec::with_capacity(1 + target_bytes_dummy.len());
 
-        let mut is_over_unistream = true;
+        let mut is_over_unistream = false;
         match self.udp_mod {
             UdpMode::OverStream => {
                 packet.push(0x04);
