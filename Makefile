@@ -29,7 +29,7 @@ check:
 	cargo check --features "premium"
 
 run_server: build
-	./target/release/quicproxy -c ./server.json
+	./target/release/quicproxy -c ./assets/example_config/server.json5
 
 run_client: build
 	./target/release/quicproxy --elevate -c ./src/premium/test/client.json5

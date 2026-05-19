@@ -548,7 +548,7 @@ impl AnyDNS for UdpDns {
 
         let buf = bytes::Bytes::copy_from_slice(packet_bytes);
 
-        socket.send_to(buf, &target, &SourceAddr::dummy()).await?;
+        socket.send_to(buf, &SourceAddr::dummy(), &target).await?;
 
         // Use timeout for DNS queries
         let (_, _, payload) =

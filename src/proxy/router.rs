@@ -480,7 +480,7 @@ impl Router {
         let in_packet_closer = in_packet.closer();
 
         if let Some(packet) = payload {
-            debug!(
+            trace!(
                 "sending {} from {} to {}({})",
                 packet.len(),
                 source_addr,
@@ -518,15 +518,15 @@ impl Router {
                                 if *target == t1_target {
                                     t = &t1_final_target;
                                 }
-                                debug!(
+                                trace!(
                                     "sending {} from {} to {}({})",
                                     buf.len(),
                                     t1_source,
-                                    t,
-                                    t1_final_target
+                                    t1_target,
+                                    t
                                 );
                                 if let Err(e) = t1_out.send_to(buf.clone(), &t1_source, t).await {
-                                    error!("{}", e);
+                                    error!("UDP session quit because [outbound err: {:#}]", e);
                                     break;
                                 }
                             }
@@ -562,15 +562,15 @@ impl Router {
                                 if *from == t2_final_target {
                                     f = &t2_target;
                                 }
-                                debug!(
+                                trace!(
                                     "receiving {} from {}({}) to {}",
                                     buf.len(),
+                                    from,
                                     f,
-                                    t2_final_target,
                                     t2_source,
                                 );
                                 if let Err(e) = t2_in.send_to(buf.clone(), f, &t2_source).await {
-                                    error!("{}", e);
+                                    error!("UDP session quit because [inbound err: {:#}]", e);
                                     break;
                                 }
                             }

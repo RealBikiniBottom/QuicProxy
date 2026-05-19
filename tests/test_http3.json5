@@ -15,7 +15,7 @@
       ],
       "idle_timeout": 100,
       "mtu": 1424,
-      "auto_route": false
+      "auto_route": true
     },
     "sq_inbound": {
       "type": "shadowquic",
@@ -199,7 +199,6 @@
         "min_ttl": 500,
         "timeout": 10,
         "outbound": "proxy",
-        "strategy": "ipv4_only",
         "cache": "all_cache"
       },
       "fakeip_dns": {

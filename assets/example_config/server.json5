@@ -50,7 +50,8 @@
     "servers": {
       "local_dns": {
         "type": "udp",
-        "address": "8.8.8.8",
+        // "address": "8.8.8.8",
+        "address": "1.1.1.1",
         "port": 53,
         "timeout": 10,
         "outbound": "direct",
