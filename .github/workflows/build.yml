@@ -51,7 +51,7 @@ jobs:
           channel: 'stable'
 
       - name: Install Flutter dependencies
-        working-directory: ./quicproxy_flutter
+        working-directory: ./src/premium/quicproxy_flutter
         run: flutter pub get
 
       - name: Sync core version to Flutter code
@@ -67,14 +67,22 @@ jobs:
           }
           
           # Update version in vpn_service.dart
-          $vpnServicePath = "quicproxy_flutter/lib/services/vpn_service.dart"
+          $vpnServicePath = "src/premium/quicproxy_flutter/lib/services/vpn_service.dart"
           $content = Get-Content $vpnServicePath -Raw
           $updatedContent = $content -replace 'static const String currentCoreVersion = ''[^'']+'';', "static const String currentCoreVersion = '$versionStr';"
           Set-Content -Path $vpnServicePath -Value $updatedContent -NoNewline
 
       - name: Build Flutter Windows
-        working-directory: ./quicproxy_flutter
+        working-directory: ./src/premium/quicproxy_flutter
         run: flutter build windows
+
+      - name: Copy Flutter build directory
+        shell: pwsh
+        run: |
+          $sourceDir = "src/premium/quicproxy_flutter/build/windows/x64/runner/Release"
+          $destDir = "quicproxy_flutter/build/windows/x64/runner/Release"
+          New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+          Copy-Item -Path (Join-Path $sourceDir "*") -Destination $destDir -Recurse -Force
 
       - name: Copy core.exe to Flutter build directory
         shell: pwsh

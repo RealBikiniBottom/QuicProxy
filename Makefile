@@ -65,4 +65,4 @@ clean:
 build-android:
 	# cargo install cargo-ndk
 	rustup target add aarch64-linux-android armv7-linux-androideabi
-	cargo ndk -t arm64-v8a -t armeabi-v7a -o ./quicproxy_flutter/android/app/src/main/jniLibs build --release --features "jni,premium"
+	cargo ndk -t arm64-v8a -t armeabi-v7a -o ./quicproxy_flutter/android/app/src/main/jniLibs rustc --release --features "jni,premium" --lib -- --crate-type cdylib
