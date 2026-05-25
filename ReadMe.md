@@ -8,10 +8,8 @@
 
 - [Windows](https://www.url.com)
 - [Android](https://www.url.com)
-- [Linux](https://www.url.com)
-- [Macos](https://www.url.com)
-- [IOS](https://www.url.com)
-- [软路由](https://www.url.com)
+- Macos(即将发布)
+- IOS(即将发布)
 
 ## 简单易用(Out of the box)
 
