@@ -14,7 +14,7 @@ UninstallDisplayIcon={app}\quicproxy_flutter.exe
 
 [Languages]
 Name: "en"; MessagesFile: "compiler:Default.isl"
-Name: "cn"; MessagesFile: "quicproxy_flutter/cn.isl"
+Name: "cn"; MessagesFile: "cn.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
