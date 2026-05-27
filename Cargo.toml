@@ -13,7 +13,7 @@ premium = ["dep:tun-rs"]
 
 [lib]
 name = "quicproxy"
-crate-type = ["rlib"]
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 jni = { version = "0.21.1", optional = true }

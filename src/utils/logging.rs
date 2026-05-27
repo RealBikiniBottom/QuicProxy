@@ -120,7 +120,7 @@ pub fn init_logging(
 
         Some(
             fmt::layer()
-                .with_ansi(false)
+                .with_ansi(log_color)
                 .with_file(true)
                 .with_line_number(true)
                 .with_target(false)

@@ -44,17 +44,54 @@ impl SelectorOutbound {
             std::process::exit(1);
         });
 
-        let mut selected_index = 0;
         let outbound_tags = cfg.outbounds.as_ref().unwrap_or_else(|| {
             tracing::error!("selector '{}' requires outbounds", tag);
             std::process::exit(1);
         });
 
+        let mut cache = None;
+        if let Some(c) = cfg.cache.clone() {
+            cache = Cache::new_with_tag(&c, tag.clone())
+                .map_err(|e| {
+                    tracing::error!("selector '{}' failed to new cache: {:?}", tag, e);
+                    std::process::exit(1);
+                })
+                .ok();
+        }
+
+        let mut selected_tag = default_outbound.clone();
+        if let Some(ref cache) = cache {
+            match cache.get("selected") {
+                Ok(Some((cached_tag, _))) => {
+                    if outbound_tags.iter().any(|tag_item| tag_item == &cached_tag) {
+                        info!(
+                            "selector [{}] restored cached selection: {}",
+                            tag, cached_tag
+                        );
+                        selected_tag = cached_tag;
+                    } else {
+                        warn!(
+                            "selector [{}] cached selection '{}' not found in current outbounds, using default '{}'",
+                            tag,
+                            cached_tag,
+                            default_outbound
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("selector [{}] failed to read cached selection: {}", tag, e);
+                }
+            }
+        }
+
+        let mut selected_index = 0;
+
         let outbounds_vec: Vec<_> = outbound_tags
             .iter()
             .enumerate()
             .map(|(i, tag_item)| {
-                if &default_outbound == tag_item {
+                if &selected_tag == tag_item {
                     selected_index = i;
                 }
                 get_outbound_by_tag(tag_item.as_ref())
@@ -84,16 +121,6 @@ impl SelectorOutbound {
             SelectorType::Manual => 0,
             SelectorType::UrlTest => cfg.tolerance.unwrap_or(50) * 1000,
         };
-
-        let mut cache = None;
-        if let Some(c) = cfg.cache.clone() {
-            cache = Cache::new_with_tag(&c, tag.clone())
-                .map_err(|e| {
-                    tracing::error!("selector '{}' failed to new cache: {:?}", tag, e);
-                    std::process::exit(1);
-                })
-                .ok();
-        }
 
         let outbound = Arc::new(Self {
             tag,
