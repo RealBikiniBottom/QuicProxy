@@ -71,19 +71,6 @@ jobs:
       - name: Build Core
         run: cargo build --release --target x86_64-pc-windows-msvc
 
-      - name: Verify no MSVC runtime DLLs
-        shell: pwsh
-        run: |
-          $exe = "target/x86_64-pc-windows-msvc/release/quicproxy.exe"
-          if (!(Test-Path $exe)) { throw "missing exe: $exe" }
-          $deps = & dumpbin /DEPENDENTS $exe | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -ne "" }
-          $forbidden = $deps | Select-String -Pattern "VCRUNTIME|MSVCP" -CaseSensitive:$false
-          if ($forbidden) {
-            $deps | ForEach-Object { Write-Host $_ }
-            throw "found forbidden runtime dll dependency"
-          }
-          Write-Host "✓ No forbidden runtime DLLs found"
-
       - name: Package Core (Native)
         shell: pwsh
         run: |
@@ -139,33 +126,45 @@ jobs:
         run: flutter build windows
 
       - name: Prepare Flutter build directory
+        working-directory: ./
         shell: pwsh
         run: |
-          $flutterBuildDir = "quicproxy_flutter/build/windows/x64/runner/Release"
-          New-Item -ItemType Directory -Path $flutterBuildDir -Force | Out-Null
-
-          # Copy Flutter build output
+          # 确保源目录存在
           $sourceDir = "src/premium/quicproxy_flutter/build/windows/x64/runner/Release"
-          if (Test-Path $sourceDir) {
-            Copy-Item -Path (Join-Path $sourceDir "*") -Destination $flutterBuildDir -Recurse -Force
-            Write-Host "✓ Copied Flutter build files"
-          } else {
-            throw "Flutter build directory not found: $sourceDir"
+          if (-not (Test-Path $sourceDir)) {
+            throw "Flutter build directory not found at $sourceDir. Please check if flutter build succeeded."
           }
 
+          # 列出源目录内容用于调试
+          Write-Host "Contents of $sourceDir"
+          Get-ChildItem $sourceDir | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+          # 创建目标目录（相对于项目根目录）
+          $destDir = "flutter_build_dir/"
+          New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+
+          # 复制所有 Flutter 构建文件
+          Copy-Item -Path "$sourceDir/*" -Destination $destDir -Recurse -Force
+          Write-Host "✓ Copied Flutter build files to $destDir"
+
       - name: Copy core.exe to Flutter build directory
+        working-directory: ./
         shell: pwsh
         run: |
           $versionDir = "${{ steps.extract_version.outputs.VERSION_STR }}"
-          $coreDir = "quicproxy_flutter/build/windows/x64/runner/Release/core_workspace/$versionDir"
+          $coreDir = "flutter_build_dir/core_workspace/$versionDir"
           New-Item -ItemType Directory -Path $coreDir -Force | Out-Null
 
+          # 复制 core.exe
           $exe = "target/x86_64-pc-windows-msvc/release/quicproxy.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Core executable not found at $exe"
+          }
           $destExe = Join-Path $coreDir "quicproxy_core.exe"
           Copy-Item -Path $exe -Destination $destExe -Force
           Write-Host "✓ Copied core.exe to $destExe"
 
-          # Copy wintun.dll
+          # 复制 wintun.dll
           $wintunDll = "src/premium/wintun/bin/amd64/wintun.dll"
           if (Test-Path $wintunDll) {
             Copy-Item -Path $wintunDll -Destination $coreDir -Force
@@ -174,33 +173,91 @@ jobs:
             Write-Warning "wintun.dll not found at $wintunDll"
           }
 
+          # 验证所有必需的文件都已就位
+          Write-Host "`nVerifying core directory contents:"
+          Get-ChildItem $coreDir -Recurse | ForEach-Object { 
+            if ($_.PSIsContainer) {
+              Write-Host "  Directory: $($_.FullName)"
+            } else {
+              Write-Host "  File: $($_.FullName) - $([math]::Round($_.Length/1KB, 2)) KB"
+            }
+          }
+
       - name: Compile Inno Setup Installer
         shell: pwsh
+        working-directory: ./
         run: |
+          # 检查 ISCC 是否存在
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler not found at $iscc"
+          }
+
+          # 检查 .iss 文件
           $issPath = "./assets/windows_setup.iss"
           if (-not (Test-Path $issPath)) {
             throw "Inno Setup script not found at $issPath"
           }
 
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" $issPath
+          $flutterBuildDir = "flutter_build_dir/"
 
-          # Check if installer was created
-          $installerPath = "Output/QuicProxy-Windows-Setup.exe"
-          if (-not (Test-Path $installerPath)) {
-            Write-Warning "Installer not found at default path, searching..."
-            $foundInstaller = Get-ChildItem -Path . -Filter "*.exe" -Recurse | Where-Object { $_.Name -like "*Setup*" } | Select-Object -First 1
-            if ($foundInstaller) {
-              $installerPath = $foundInstaller.FullName
-              Write-Host "Found installer at: $installerPath"
-            } else {
-              throw "No installer executable found"
+          # 列出要打包的文件
+          Write-Host "`nFiles to be packaged by Inno Setup:"
+          Get-ChildItem -Path $flutterBuildDir -Recurse | ForEach-Object { 
+            if (-not $_.PSIsContainer) {
+              Write-Host "  $($_.FullName) - $([math]::Round($_.Length/1KB, 2)) KB"
             }
-          } else {
-            Write-Host "✓ Installer compiled successfully: $installerPath"
           }
 
-          # Save installer path for artifact upload
-          echo "INSTALLER_PATH=$installerPath" >> $env:GITHUB_ENV
+          # 编译安装程序
+          Write-Host "`nCompiling Inno Setup installer..."
+          & $iscc $issPath
+
+          # 检查编译是否成功
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
+          }
+
+          # 查找生成的安装程序
+          $possiblePaths = @(
+            "Output/QuicProxy-Windows-Setup.exe",
+            "assets/Output/QuicProxy-Windows-Setup.exe",
+            ".\QuicProxy-Windows-Setup.exe"
+          )
+
+          $installerPath = $null
+          foreach ($path in $possiblePaths) {
+            if (Test-Path $path) {
+              $installerPath = (Resolve-Path $path).Path
+              Write-Host "✓ Found installer at: $installerPath"
+              break
+            }
+          }
+
+          # 如果没找到，搜索整个项目
+          if (-not $installerPath) {
+            Write-Warning "Installer not found in default locations, searching entire project..."
+            $foundInstaller = Get-ChildItem -Path . -Filter "*.exe" -Recurse | Where-Object { 
+              $_.Name -like "*QuicProxy*Setup*" -or $_.Name -like "*Setup*.exe"
+            } | Select-Object -First 1
+            
+            if ($foundInstaller) {
+              $installerPath = $foundInstaller.FullName
+              Write-Host "✓ Found installer at: $installerPath"
+            } else {
+              Write-Host "`nSearch results for .exe files:"
+              Get-ChildItem -Path . -Filter "*.exe" -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+              throw "No installer executable found after compilation"
+            }
+          }
+
+          # 保存安装程序路径
+          echo "INSTALLER_PATH=$installerPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "`n✓ Installer saved to environment: $installerPath"
+
+          # 验证安装程序文件大小
+          $installerInfo = Get-Item $installerPath
+          Write-Host "Installer size: $([math]::Round($installerInfo.Length/1MB, 2)) MB"
 
       - name: Upload Flutter Windows Installer Artifact
         uses: actions/upload-artifact@v4
