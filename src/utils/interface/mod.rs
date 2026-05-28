@@ -60,10 +60,12 @@ impl InterfaceInfo {
     }
 
     pub fn is_usable(&self) -> bool {
-        let mut ok = self.is_up && !self.is_loopback && (self.has_ipv4() || self.has_ipv6());
+        let ok = self.is_up && !self.is_loopback && (self.has_ipv4() || self.has_ipv6());
         #[cfg(windows)]
         {
-            ok = ok && self.gateway.is_some();
+            if ok {
+                return self.gateway.is_some();
+            }
         }
         return ok;
     }
