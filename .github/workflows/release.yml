@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
@@ -38,12 +38,12 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           cd target/x86_64-unknown-linux-musl/release
-          tar czf ../../../quicproxy-${VERSION}-linux-x64.tar.gz quicproxy
+          tar czf ../../../quicproxy-core-${VERSION}-linux-x64.tar.gz quicproxy
 
       - uses: actions/upload-artifact@v4
         with:
-          name: quicproxy-${{ github.ref_name }}-linux-x64
-          path: quicproxy-${{ github.ref_name }}-linux-x64.tar.gz
+          name: quicproxy-core-${{ github.ref_name }}-linux-x64
+          path: quicproxy-core-${{ github.ref_name }}-linux-x64.tar.gz
 
   build-windows:
     name: Windows x64 (MSVC, static CRT)
@@ -68,7 +68,7 @@ jobs:
 
       - uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Build
+      - name: Build Core
         run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Verify no MSVC runtime DLLs
@@ -82,89 +82,131 @@ jobs:
             $deps | ForEach-Object { Write-Host $_ }
             throw "found forbidden runtime dll dependency"
           }
+          Write-Host "✓ No forbidden runtime DLLs found"
+
+      - name: Package Core (Native)
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/quicproxy.exe -DestinationPath quicproxy-core-${{ github.ref_name }}-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quicproxy-core-${{ github.ref_name }}-windows-x64
+          path: quicproxy-core-${{ github.ref_name }}-windows-x64.zip
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.x'
-          channel: 'stable'
+          flutter-version: "3.x"
+          channel: "stable"
 
       - name: Install Flutter dependencies
         working-directory: ./src/premium/quicproxy_flutter
         run: flutter pub get
 
-      - name: Sync core version to Flutter code
+      - name: Extract version from Cargo.toml
+        id: extract_version
         shell: pwsh
         run: |
           $cargoToml = Get-Content "Cargo.toml" -Raw
           if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
             $version = $matches[1]
             $versionStr = "v$version"
+            echo "VERSION_STR=$versionStr" >> $env:GITHUB_OUTPUT
+            echo "VERSION_NUM=$version" >> $env:GITHUB_OUTPUT
+            Write-Host "✓ Extracted version: $versionStr"
           } else {
             throw "Failed to extract version from Cargo.toml"
           }
 
+      - name: Sync core version to Flutter code
+        shell: pwsh
+        run: |
+          $versionStr = "${{ steps.extract_version.outputs.VERSION_STR }}"
           $vpnServicePath = "src/premium/quicproxy_flutter/lib/services/vpn_service.dart"
+
+          if (-not (Test-Path $vpnServicePath)) {
+            throw "vpn_service.dart not found at $vpnServicePath"
+          }
+
           $content = Get-Content $vpnServicePath -Raw
           $updatedContent = $content -replace 'static const String currentCoreVersion = ''[^'']+'';', "static const String currentCoreVersion = '$versionStr';"
           Set-Content -Path $vpnServicePath -Value $updatedContent -NoNewline
+          Write-Host "✓ Updated core version to $versionStr in Flutter code"
 
       - name: Build Flutter Windows
         working-directory: ./src/premium/quicproxy_flutter
         run: flutter build windows
 
-      - name: Copy Flutter build directory
+      - name: Prepare Flutter build directory
         shell: pwsh
         run: |
+          $flutterBuildDir = "quicproxy_flutter/build/windows/x64/runner/Release"
+          New-Item -ItemType Directory -Path $flutterBuildDir -Force | Out-Null
+
+          # Copy Flutter build output
           $sourceDir = "src/premium/quicproxy_flutter/build/windows/x64/runner/Release"
-          $destDir = "quicproxy_flutter/build/windows/x64/runner/Release"
-          New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-          Copy-Item -Path (Join-Path $sourceDir "*") -Destination $destDir -Recurse -Force
+          if (Test-Path $sourceDir) {
+            Copy-Item -Path (Join-Path $sourceDir "*") -Destination $flutterBuildDir -Recurse -Force
+            Write-Host "✓ Copied Flutter build files"
+          } else {
+            throw "Flutter build directory not found: $sourceDir"
+          }
 
       - name: Copy core.exe to Flutter build directory
         shell: pwsh
         run: |
-          $cargoToml = Get-Content "Cargo.toml" -Raw
-          if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
-            $version = $matches[1]
-            $versionDir = "v$version"
-          } else {
-            throw "Failed to extract version from Cargo.toml"
-          }
+          $versionDir = "${{ steps.extract_version.outputs.VERSION_STR }}"
+          $coreDir = "quicproxy_flutter/build/windows/x64/runner/Release/core_workspace/$versionDir"
+          New-Item -ItemType Directory -Path $coreDir -Force | Out-Null
 
           $exe = "target/x86_64-pc-windows-msvc/release/quicproxy.exe"
-          $destDir = "quicproxy_flutter/build/windows/x64/runner/Release/core_workspace/$versionDir"
-          New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-          $dest = Join-Path $destDir "quicproxy_core.exe"
-          Copy-Item -Path $exe -Destination $dest -Force
+          $destExe = Join-Path $coreDir "quicproxy_core.exe"
+          Copy-Item -Path $exe -Destination $destExe -Force
+          Write-Host "✓ Copied core.exe to $destExe"
 
+          # Copy wintun.dll
           $wintunDll = "src/premium/wintun/bin/amd64/wintun.dll"
           if (Test-Path $wintunDll) {
-            Copy-Item -Path $wintunDll -Destination $destDir -Force
+            Copy-Item -Path $wintunDll -Destination $coreDir -Force
+            Write-Host "✓ Copied wintun.dll to $coreDir"
           } else {
-            throw "missing wintun.dll: $wintunDll"
+            Write-Warning "wintun.dll not found at $wintunDll"
           }
-
-      - name: Package
-        shell: pwsh
-        run: |
-          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/quicproxy.exe -DestinationPath quicproxy-${{ github.ref_name }}-windows-x64.zip
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: quicproxy-${{ github.ref_name }}-windows-x64
-          path: quicproxy-${{ github.ref_name }}-windows-x64.zip
 
       - name: Compile Inno Setup Installer
         shell: pwsh
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ./assets/windows_setup.iss
+          $issPath = "./assets/windows_setup.iss"
+          if (-not (Test-Path $issPath)) {
+            throw "Inno Setup script not found at $issPath"
+          }
+
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" $issPath
+
+          # Check if installer was created
+          $installerPath = "Output/QuicProxy-Windows-Setup.exe"
+          if (-not (Test-Path $installerPath)) {
+            Write-Warning "Installer not found at default path, searching..."
+            $foundInstaller = Get-ChildItem -Path . -Filter "*.exe" -Recurse | Where-Object { $_.Name -like "*Setup*" } | Select-Object -First 1
+            if ($foundInstaller) {
+              $installerPath = $foundInstaller.FullName
+              Write-Host "Found installer at: $installerPath"
+            } else {
+              throw "No installer executable found"
+            }
+          } else {
+            Write-Host "✓ Installer compiled successfully: $installerPath"
+          }
+
+          # Save installer path for artifact upload
+          echo "INSTALLER_PATH=$installerPath" >> $env:GITHUB_ENV
 
       - name: Upload Flutter Windows Installer Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: quicproxy-${{ github.ref_name }}-windows-flutter
-          path: Output/QuicProxy-Windows-Setup.exe
+          name: quicproxy-flutter-${{ github.ref_name }}-windows-setup
+          path: ${{ env.INSTALLER_PATH }}
           if-no-files-found: error
 
   create-release:
@@ -175,24 +217,46 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: quicproxy-${{ github.ref_name }}-linux-x64
+          name: quicproxy-core-${{ github.ref_name }}-linux-x64
           path: release-assets/linux
 
       - uses: actions/download-artifact@v4
         with:
-          name: quicproxy-${{ github.ref_name }}-windows-x64
-          path: release-assets/windows-native
+          name: quicproxy-core-${{ github.ref_name }}-windows-x64
+          path: release-assets/windows-core
 
       - uses: actions/download-artifact@v4
         with:
-          name: quicproxy-${{ github.ref_name }}-windows-flutter
+          name: quicproxy-flutter-${{ github.ref_name }}-windows-setup
           path: release-assets/windows-flutter
 
-      - name: Publish Release
+      - name: List release assets
+        run: |
+          echo "Linux assets:"
+          ls -la release-assets/linux/
+          echo "Windows core assets:"
+          ls -la release-assets/windows-core/
+          echo "Windows Flutter assets:"
+          ls -la release-assets/windows-flutter/
+
+      - name: Publish Release with Core Labels
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/linux/quicproxy-${{ github.ref_name }}-linux-x64.tar.gz
-            release-assets/windows-native/quicproxy-${{ github.ref_name }}-windows-x64.zip
+            release-assets/linux/quicproxy-core-${{ github.ref_name }}-linux-x64.tar.gz
+            release-assets/windows-core/quicproxy-core-${{ github.ref_name }}-windows-x64.zip
             release-assets/windows-flutter/QuicProxy-Windows-Setup.exe
           generate_release_notes: true
+          name: QuicProxy ${{ github.ref_name }} - Core Release
+          body: |
+            ## QuicProxy ${{ github.ref_name }}
+
+            ### Core Binaries
+            - **Linux x64**: `quicproxy-core-${{ github.ref_name }}-linux-x64.tar.gz`
+            - **Windows x64**: `quicproxy-core-${{ github.ref_name }}-windows-x64.zip`
+
+            ### Windows Application
+            - **Flutter Installer**: `QuicProxy-Windows-Setup.exe`
+
+            ### Core Version
+            This release includes core version `${{ github.ref_name }}`
