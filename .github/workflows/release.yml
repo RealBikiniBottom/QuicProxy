@@ -20,6 +20,12 @@ jobs:
           ssh-private-key: ${{ secrets.PRIVATE_KEY }}
       - run: git clone git@github.com:RealBikiniBottom/premium.git ./src/premium
 
+      - name: Sync Cargo.toml version from git tag
+        run: |
+          VERSION_NUM=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          sed -i "0,/^version = \"[^\"]*\"/s/^version = \"[^\"]*\"/version = \"${VERSION_NUM}\"/" Cargo.toml
+          echo "✓ Synced Cargo.toml version to ${VERSION_NUM}"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -57,6 +63,15 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.PRIVATE_KEY }}
       - run: git clone git@github.com:RealBikiniBottom/premium.git ./src/premium
+
+      - name: Sync Cargo.toml version from git tag
+        shell: pwsh
+        run: |
+          $versionNum = "${{ github.ref_name }}" -replace '^v', ''
+          $cargoToml = Get-Content "Cargo.toml" -Raw
+          $cargoToml = $cargoToml -replace '(?m)^(version\s*=\s*)"[^"]*"', "`${1}`"$versionNum`""
+          Set-Content -Path "Cargo.toml" -Value $cargoToml -NoNewline
+          Write-Host "✓ Synced Cargo.toml version to $versionNum"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -259,6 +274,15 @@ jobs:
           $installerInfo = Get-Item $installerPath
           Write-Host "Installer size: $([math]::Round($installerInfo.Length/1MB, 2)) MB"
 
+      - name: Rename installer with version
+        shell: pwsh
+        run: |
+          $versionedName = "QuicProxy-Windows-Setup-${{ github.ref_name }}.exe"
+          $versionedPath = Join-Path (Split-Path $env:INSTALLER_PATH -Parent) $versionedName
+          Move-Item -Path $env:INSTALLER_PATH -Destination $versionedPath -Force
+          echo "INSTALLER_PATH=$versionedPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "✓ Renamed installer to $versionedName"
+
       - name: Upload Flutter Windows Installer Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -266,9 +290,99 @@ jobs:
           path: ${{ env.INSTALLER_PATH }}
           if-no-files-found: error
 
+  build-android:
+    name: Android (Flutter APK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.PRIVATE_KEY }}
+      - run: git clone git@github.com:RealBikiniBottom/premium.git ./src/premium
+
+      - name: Sync Cargo.toml version from git tag
+        run: |
+          VERSION_NUM=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          sed -i "0,/^version = \"[^\"]*\"/s/^version = \"[^\"]*\"/version = \"${VERSION_NUM}\"/" Cargo.toml
+          echo "✓ Synced Cargo.toml version to ${VERSION_NUM}"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-release
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build Rust core for Android
+        run: |
+          cargo ndk -t arm64-v8a -t armeabi-v7a \
+            -o ./src/premium/quicproxy_flutter/android/app/src/main/jniLibs \
+            build --release --features "jni,premium" --lib
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.x"
+          channel: "stable"
+
+      - name: Install Flutter dependencies
+        working-directory: ./src/premium/quicproxy_flutter
+        run: flutter pub get
+
+      - name: Extract version from Cargo.toml
+        id: extract_version
+        run: |
+          VERSION=$(grep -m1 'version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "VERSION_STR=v${VERSION}" >> $GITHUB_OUTPUT
+          echo "VERSION_NUM=${VERSION}" >> $GITHUB_OUTPUT
+          echo "✓ Extracted version: v${VERSION}"
+
+      - name: Sync core version to Flutter code
+        run: |
+          VERSION_STR="${{ steps.extract_version.outputs.VERSION_STR }}"
+          VPN_SERVICE_PATH="src/premium/quicproxy_flutter/lib/services/vpn_service.dart"
+          if [ ! -f "$VPN_SERVICE_PATH" ]; then
+            echo "vpn_service.dart not found at $VPN_SERVICE_PATH"
+            exit 1
+          fi
+          sed -i "s/static const String currentCoreVersion = '[^']*';/static const String currentCoreVersion = '${VERSION_STR}';/" "$VPN_SERVICE_PATH"
+          echo "✓ Updated core version to ${VERSION_STR} in Flutter code"
+
+      - name: Build Flutter APK
+        working-directory: ./src/premium/quicproxy_flutter
+        run: flutter build apk --release
+
+      - name: Copy APK with version
+        run: |
+          APK_PATH="src/premium/quicproxy_flutter/build/app/outputs/flutter-apk/app-release.apk"
+          if [ ! -f "$APK_PATH" ]; then
+            echo "APK not found at $APK_PATH"
+            exit 1
+          fi
+          VERSIONED_NAME="QuicProxy-Android-${{ github.ref_name }}.apk"
+          cp "$APK_PATH" "$VERSIONED_NAME"
+          echo "APK_PATH=$PWD/$VERSIONED_NAME" >> $GITHUB_ENV
+          echo "✓ Copied APK to $VERSIONED_NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quicproxy-flutter-${{ github.ref_name }}-android
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+
   create-release:
     name: Create GitHub Release
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-android]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -287,6 +401,11 @@ jobs:
           name: quicproxy-flutter-${{ github.ref_name }}-windows-setup
           path: release-assets/windows-flutter
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-flutter-${{ github.ref_name }}-android
+          path: release-assets/android
+
       - name: List release assets
         run: |
           echo "Linux assets:"
@@ -295,6 +414,8 @@ jobs:
           ls -la release-assets/windows-core/
           echo "Windows Flutter assets:"
           ls -la release-assets/windows-flutter/
+          echo "Android Flutter assets:"
+          ls -la release-assets/android/
 
       - name: Publish Release with Core Labels
         uses: softprops/action-gh-release@v2
@@ -302,7 +423,8 @@ jobs:
           files: |
             release-assets/linux/quicproxy-core-${{ github.ref_name }}-linux-x64.tar.gz
             release-assets/windows-core/quicproxy-core-${{ github.ref_name }}-windows-x64.zip
-            release-assets/windows-flutter/QuicProxy-Windows-Setup.exe
+            release-assets/windows-flutter/QuicProxy-Windows-Setup-${{ github.ref_name }}.exe
+            release-assets/android/QuicProxy-Android-${{ github.ref_name }}.apk
           generate_release_notes: true
           name: QuicProxy ${{ github.ref_name }} - Core Release
           body: |
@@ -313,7 +435,10 @@ jobs:
             - **Windows x64**: `quicproxy-core-${{ github.ref_name }}-windows-x64.zip`
 
             ### Windows Application
-            - **Flutter Installer**: `QuicProxy-Windows-Setup.exe`
+            - **Flutter Installer**: `QuicProxy-Windows-Setup-${{ github.ref_name }}.exe`
+
+            ### Android Application
+            - **Flutter APK**: `QuicProxy-Android-${{ github.ref_name }}.apk`
 
             ### Core Version
             This release includes core version `${{ github.ref_name }}`
