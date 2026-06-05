@@ -15,7 +15,7 @@
       ],
       "idle_timeout": 100,
       "mtu": 1424,
-      "auto_route": false
+      "auto_route": true
     },
     "sq_inbound": {
       "type": "shadowquic",
@@ -70,8 +70,8 @@
       "real_out": {
         "type": "anytls",
         "address": "127.0.0.1",
-        "port": 8443,
-        // "port": 2343,
+        // "port": 8443,
+        "port": 2343,
         "password": "testpassword123",
         "tls": {
           "enable": true,

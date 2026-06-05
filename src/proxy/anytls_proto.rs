@@ -1,3 +1,6 @@
+use anyhow::{bail, Result};
+use crate::proxy::TargetAddr;
+
 // ─── Shared Anytls Protocol Constants ─────────────────────────────────────────
 
 /// Protocol version supported by this implementation
@@ -14,6 +17,73 @@ pub const AUTH_LENGTH_FIELD_SIZE: usize = 2; // BE u16
 
 /// UDP-over-TCP target domain
 pub const UDP_OVER_TCP_TARGET: &str = "sp.v2.udp-over-tcp.arpa";
+
+// ─── UoT Helpers ──────────────────────────────────────────────────────────────
+
+/// Encode TargetAddr in sing-box UoT packet format (AddrParser):
+/// IPv4: 0x00, IPv6: 0x01, Domain: 0x02
+pub fn uot_encode_target(target: &TargetAddr) -> Vec<u8> {
+    let mut buf = Vec::new();
+    match target {
+        TargetAddr::Ip(std::net::SocketAddr::V4(addr)) => {
+            buf.push(0x00);
+            buf.extend_from_slice(&addr.ip().octets());
+            buf.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        TargetAddr::Ip(std::net::SocketAddr::V6(addr)) => {
+            buf.push(0x01);
+            buf.extend_from_slice(&addr.ip().octets());
+            buf.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        TargetAddr::Domain(domain, port) => {
+            buf.push(0x02);
+            buf.push(domain.len() as u8);
+            buf.extend_from_slice(domain.as_bytes());
+            buf.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+    buf
+}
+
+/// Decode TargetAddr from sing-box UoT packet format (AddrParser)
+pub fn uot_decode_target(data: &[u8]) -> Result<(TargetAddr, usize)> {
+    if data.is_empty() {
+        bail!("empty UoT packet");
+    }
+    match data[0] {
+        0x00 => {
+            if data.len() < 7 {
+                bail!("UoT IPv4 address too short");
+            }
+            let mut ip = [0u8; 4];
+            ip.copy_from_slice(&data[1..5]);
+            let port = u16::from_be_bytes([data[5], data[6]]);
+            Ok((TargetAddr::Ip(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(ip), port))), 7))
+        }
+        0x01 => {
+            if data.len() < 19 {
+                bail!("UoT IPv6 address too short");
+            }
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&data[1..17]);
+            let port = u16::from_be_bytes([data[17], data[18]]);
+            Ok((TargetAddr::Ip(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::from(ip), port, 0, 0))), 19))
+        }
+        0x02 => {
+            if data.len() < 2 {
+                bail!("UoT domain address too short");
+            }
+            let domain_len = data[1] as usize;
+            if data.len() < 2 + domain_len + 2 {
+                bail!("UoT domain address too short for domain length");
+            }
+            let domain = String::from_utf8_lossy(&data[2..2 + domain_len]).to_string();
+            let port = u16::from_be_bytes([data[2 + domain_len], data[2 + domain_len + 1]]);
+            Ok((TargetAddr::Domain(domain, port), 2 + domain_len + 2))
+        }
+        _ => bail!("unknown UoT address type: {}", data[0]),
+    }
+}
 
 // ─── Frame Commands ───────────────────────────────────────────────────────────
 

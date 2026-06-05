@@ -485,7 +485,7 @@ fn make_fakeipdns(
     let ipv4_cidr = v4_found.unwrap_or(default_v4);
     let ipv6_cidr = v6_found.unwrap_or(default_v6);
 
-    let cache = quicproxy::cache::Cache::new_with_tag(
+    let cache: quicproxy::cache::Cache<String> = quicproxy::cache::Cache::new_with_tag(
         cache_tag,
         format!("fakeip:{}", tag),
     )

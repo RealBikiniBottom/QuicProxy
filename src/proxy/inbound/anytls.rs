@@ -3,7 +3,7 @@ use crate::proxy::QuicTlsConfig;
 use crate::proxy::anytls_proto::*;
 use crate::proxy::outbound::{AnyPacket, PacketInfo};
 use crate::proxy::router::{Router, get_router};
-use crate::proxy::{SourceAddr, TargetAddr, inbound};
+use crate::proxy::{SessionCloser, SourceAddr, TargetAddr, inbound};
 use crate::utils::new_io_other_error;
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
@@ -139,13 +139,21 @@ impl AnytlsInboundUdp {
         loop {
             {
                 let mut buf = self.read_buf.lock().await;
-                if buf.len() >= 2 {
-                    let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-                    let total_needed = 2 + len;
-                    if buf.len() >= total_needed {
-                        let msg = Bytes::copy_from_slice(&buf[2..total_needed]);
-                        buf.drain(..total_needed);
-                        return Ok(msg);
+                if !buf.is_empty() {
+                    // UoT format: target_addr + payload_len(u16 BE) + payload
+                    if let Ok((_, target_len)) = uot_decode_target(&buf) {
+                        if buf.len() >= target_len + 2 {
+                            let payload_len =
+                                u16::from_be_bytes([buf[target_len], buf[target_len + 1]]) as usize;
+                            let total_needed = target_len + 2 + payload_len;
+                            if buf.len() >= total_needed {
+                                let msg = Bytes::copy_from_slice(&buf[..total_needed]);
+                                buf.drain(..total_needed);
+                                return Ok(msg);
+                            }
+                        }
+                    } else if buf.len() > 256 {
+                        bail!("invalid UoT packet header");
                     }
                 }
             }
@@ -167,11 +175,12 @@ impl AnyPacket for AnytlsInboundUdp {
         &self,
         buf: Bytes,
         _from: &SourceAddr,
-        _target: &TargetAddr,
+        target: &TargetAddr,
     ) -> Result<usize> {
-        // udp-over-tcp v2: 2-byte length prefix + payload
-        // The source address is encoded as target address in the udp-over-tcp protocol
-        let mut packet = Vec::with_capacity(2 + buf.len());
+        // UoT v2 format: target_addr + payload_len(u16 BE) + payload
+        let target_bytes = uot_encode_target(target);
+        let mut packet = Vec::with_capacity(target_bytes.len() + 2 + buf.len());
+        packet.extend_from_slice(&target_bytes);
         packet.extend_from_slice(&(buf.len() as u16).to_be_bytes());
         packet.extend_from_slice(&buf);
 
@@ -184,7 +193,25 @@ impl AnyPacket for AnytlsInboundUdp {
 
     async fn recv_from(&self) -> Result<PacketInfo> {
         let data = self.read_next_msg().await?;
-        Ok((self.client_addr.clone(), TargetAddr::dummy(), data))
+        // UoT format: target_addr + payload_len(u16 BE) + payload
+        let (target, target_len) = uot_decode_target(&data)?;
+        if data.len() < target_len + 2 {
+            bail!("UoT packet too short for length");
+        }
+        let payload_len =
+            u16::from_be_bytes([data[target_len], data[target_len + 1]]) as usize;
+        if data.len() < target_len + 2 + payload_len {
+            bail!("UoT packet too short for payload");
+        }
+        let payload = Bytes::copy_from_slice(
+            &data[target_len + 2..target_len + 2 + payload_len],
+        );
+        Ok((self.client_addr.clone(), target, payload))
+    }
+
+    fn closer(&self) -> Arc<SessionCloser> {
+        // Minimal stub; actual session close is managed externally
+        Arc::new(SessionCloser::new())
     }
 }
 
@@ -194,7 +221,10 @@ impl AnyPacket for AnytlsInboundUdp {
 enum StreamState {
     /// Waiting for first PSH (target address)
     Pending,
-    /// Active stream, data forwarded via this sender
+    /// UDP-over-TCP: target received, waiting for UoT Request header
+    #[allow(dead_code)]
+    WaitingUotRequest(TargetAddr),
+    /// Active TCP stream, data forwarded via this sender
     Active(mpsc::UnboundedSender<Bytes>),
 }
 
@@ -309,19 +339,40 @@ impl InboundSession {
                         .send((stream_id, Command::SynAck as u8, Bytes::new()));
                 }
                 Command::Psh => {
-                    // Check if this is a pending stream (first PSH = target address)
-                    let is_pending = match self.streams.get(&stream_id) {
-                        Some(entry) => matches!(entry.value(), StreamState::Pending),
-                        None => false,
-                    };
-                    if is_pending {
-                        self.handle_target(stream_id, data).await;
+                    // Check stream state
+                    let state_type = self.streams.get(&stream_id).and_then(|e| {
+                        match *e.value() {
+                            StreamState::Pending => Some("pending"),
+                            StreamState::WaitingUotRequest(_) => Some("waiting_uot"),
+                            _ => None,
+                        }
+                    });
+                    if state_type == Some("pending") {
+                        let target = match parse_target_from_syn(&data) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!("Anytls inbound bad target from {}: {:?}", self.peer_addr, e);
+                                let _ = self.write_tx.send((stream_id, Command::Fin as u8, Bytes::new()));
+                                self.streams.remove(&stream_id);
+                                continue;
+                            }
+                        };
+                        // Check if UDP-over-TCP
+                        if let TargetAddr::Domain(ref domain, _) = target {
+                            if domain == UDP_OVER_TCP_TARGET {
+                                // Wait for UoT Request (SYNACK already sent in SYN handler)
+                                self.streams.insert(stream_id, StreamState::WaitingUotRequest(target));
+                                continue;
+                            }
+                        }
+                        // TCP: handle immediately
+                        self.handle_target(stream_id, target).await;
+                    } else if state_type == Some("waiting_uot") {
+                        self.handle_uot_request(stream_id, data).await;
                     } else if let Some(entry) = self.streams.get(&stream_id) {
                         if let StreamState::Active(tx) = entry.value() {
                             let _ = tx.send(data);
                         }
-                    } else {
-                        debug!("Anytls inbound PSH for unknown stream {}", stream_id);
                     }
                 }
                 Command::Fin => {
@@ -362,79 +413,17 @@ impl InboundSession {
         Ok(())
     }
 
-    async fn handle_target(&self, stream_id: u32, data: Bytes) {
-        let target = match parse_target_from_syn(&data) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Anytls inbound bad target from {}: {:?}", self.peer_addr, e);
-                let _ = self
-                    .write_tx
-                    .send((stream_id, Command::Fin as u8, Bytes::new()));
-                self.streams.remove(&stream_id);
-                return;
-            }
-        };
-
+    /// Handle TCP target: create stream and dispatch to router.
+    async fn handle_target(&self, stream_id: u32, target: TargetAddr) {
         let (data_tx, data_rx) = mpsc::unbounded_channel();
         let write_tx = self.write_tx.clone();
 
-        // Check if this is a UDP-over-TCP request
-        if let TargetAddr::Domain(ref domain, _) = target {
-            if domain == UDP_OVER_TCP_TARGET {
-                let client_addr = TargetAddr::Ip(self.peer_addr);
-                let udp = Arc::new(AnytlsInboundUdp::new(
-                    stream_id,
-                    write_tx.clone(),
-                    data_rx,
-                    client_addr.clone(),
-                ));
-                // Transition to active
-                self.streams
-                    .insert(stream_id, StreamState::Active(data_tx));
-
-                let router = self.router.clone();
-                let tag = self.tag.clone();
-                let udp_timeout = self.udp_timeout;
-                let target_c = target.clone();
-                let span = info_span!(
-                    "udp",
-                    i = tag,
-                    s = self.peer_addr.to_string(),
-                    d = field::Empty,
-                    r = field::Empty,
-                    o = field::Empty
-                );
-                tokio::spawn(
-                    async move {
-                        if let Err(e) = router
-                            .dispatch_packet(
-                                udp,
-                                &target_c,
-                                &client_addr,
-                                &tag,
-                                None,
-                                udp_timeout,
-                                None,
-                            )
-                            .await
-                        {
-                            error!("Anytls inbound UDP routing error: {:?}", e);
-                        }
-                    }
-                    .instrument(span),
-                );
-                return;
-            }
-        }
-
-        // TCP stream
         let stream = Box::new(AnytlsInboundStream::new(
             stream_id,
             write_tx,
             data_rx,
         )) as crate::proxy::outbound::AnyStream;
 
-        // Transition to active
         self.streams
             .insert(stream_id, StreamState::Active(data_tx));
 
@@ -455,6 +444,95 @@ impl InboundSession {
                     .await
                 {
                     error!("Anytls inbound TCP routing error: {:?}", e);
+                }
+            }
+            .instrument(span),
+        );
+    }
+
+    /// Handle UoT Request: parse destination, create UDP socket and dispatch.
+    async fn handle_uot_request(&self, stream_id: u32, data: Bytes) {
+        // Parse UoT Request: isConnect(u8) + destination(AddrParser)
+        if data.is_empty() {
+            warn!("Anytls inbound empty UoT request from {}", self.peer_addr);
+            let _ = self.write_tx.send((stream_id, Command::Fin as u8, Bytes::new()));
+            self.streams.remove(&stream_id);
+            return;
+        }
+        let is_connect = data[0] != 0;
+        let (_udp_target, addr_len) = match uot_decode_target(&data[1..]) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Anytls inbound bad UoT request from {}: {:?}", self.peer_addr, e);
+                let _ = self.write_tx.send((stream_id, Command::Fin as u8, Bytes::new()));
+                self.streams.remove(&stream_id);
+                return;
+            }
+        };
+        let _ = is_connect;
+
+        // The remaining bytes after the UoT Request header are part of the first packet
+        let remaining = if data.len() > 1 + addr_len {
+            Bytes::copy_from_slice(&data[1 + addr_len..])
+        } else {
+            Bytes::new()
+        };
+
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        if !remaining.is_empty() {
+            let _ = data_tx.send(remaining);
+        }
+
+        let client_addr = TargetAddr::Ip(self.peer_addr);
+        let write_tx = self.write_tx.clone();
+        let udp = Arc::new(AnytlsInboundUdp::new(
+            stream_id,
+            write_tx.clone(),
+            data_rx,
+            client_addr.clone(),
+        ));
+
+        // Retrieve the proxy target from WaitingUotRequest state
+        let udp_proxy_target = match self.streams.get(&stream_id) {
+            Some(entry) => match entry.value() {
+                StreamState::WaitingUotRequest(t) => t.clone(),
+                _ => {
+                    warn!("Anytls inbound unexpected state for UoT stream {}", stream_id);
+                    return;
+                }
+            },
+            None => return,
+        };
+
+        self.streams
+            .insert(stream_id, StreamState::Active(data_tx));
+
+        let router = self.router.clone();
+        let tag = self.tag.clone();
+        let udp_timeout = self.udp_timeout;
+        let span = info_span!(
+            "udp",
+            i = tag,
+            s = self.peer_addr.to_string(),
+            d = field::Empty,
+            r = field::Empty,
+            o = field::Empty
+        );
+        tokio::spawn(
+            async move {
+                if let Err(e) = router
+                    .dispatch_packet(
+                        udp,
+                        &udp_proxy_target,
+                        &client_addr,
+                        &tag,
+                        None,
+                        udp_timeout,
+                        None,
+                    )
+                    .await
+                {
+                    error!("Anytls inbound UDP routing error: {:?}", e);
                 }
             }
             .instrument(span),

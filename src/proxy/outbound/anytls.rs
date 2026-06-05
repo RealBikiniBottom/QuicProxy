@@ -783,13 +783,21 @@ impl AnytlsUdpSocket {
         loop {
             {
                 let mut buf = self.read_buffer.lock().await;
-                if buf.len() >= 2 {
-                    let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-                    let total_needed = 2 + len;
-                    if buf.len() >= total_needed {
-                        let msg = Bytes::copy_from_slice(&buf[2..total_needed]);
-                        buf.drain(..total_needed);
-                        return Ok(msg);
+                if !buf.is_empty() {
+                    // Peek target to get its length
+                    if let Ok((_, target_len)) = uot_decode_target(&buf) {
+                        if buf.len() >= target_len + 2 {
+                            let payload_len = u16::from_be_bytes([buf[target_len], buf[target_len + 1]]) as usize;
+                            let total_needed = target_len + 2 + payload_len;
+                            if buf.len() >= total_needed {
+                                let msg = Bytes::copy_from_slice(&buf[..total_needed]);
+                                buf.drain(..total_needed);
+                                return Ok(msg);
+                            }
+                        }
+                    } else if buf.len() > 256 {
+                        // Avoid infinite buffering on invalid data
+                        bail!("invalid UoT packet header");
                     }
                 }
             }
@@ -822,8 +830,10 @@ impl Drop for AnytlsUdpSocket {
 
 #[async_trait]
 impl AnyPacket for AnytlsUdpSocket {
-    async fn send_to(&self, buf: Bytes, _from: &SourceAddr, _target: &TargetAddr) -> Result<usize> {
-        let mut packet = Vec::with_capacity(2 + buf.len());
+    async fn send_to(&self, buf: Bytes, _from: &SourceAddr, target: &TargetAddr) -> Result<usize> {
+        let target_bytes = uot_encode_target(target);
+        let mut packet = Vec::with_capacity(target_bytes.len() + 2 + buf.len());
+        packet.extend_from_slice(&target_bytes);
         packet.extend_from_slice(&(buf.len() as u16).to_be_bytes());
         packet.extend_from_slice(&buf);
 
@@ -835,7 +845,16 @@ impl AnyPacket for AnytlsUdpSocket {
 
     async fn recv_from(&self) -> Result<PacketInfo> {
         let data = self.read_next_msg().await?;
-        Ok((TargetAddr::dummy(), TargetAddr::dummy(), data))
+        let (target, target_len) = uot_decode_target(&data)?;
+        if data.len() < target_len + 2 {
+            bail!("UoT packet too short for length");
+        }
+        let payload_len = u16::from_be_bytes([data[target_len], data[target_len + 1]]) as usize;
+        if data.len() < target_len + 2 + payload_len {
+            bail!("UoT packet too short for payload");
+        }
+        let payload = Bytes::copy_from_slice(&data[target_len + 2..target_len + 2 + payload_len]);
+        Ok((TargetAddr::dummy(), target, payload))
     }
 
     fn closer(&self) -> Arc<SessionCloser> {
@@ -966,6 +985,14 @@ impl AnyOutbound for AnytlsOutbound {
         session
             .write_tx
             .send((stream_id, Command::Psh as u8, Bytes::from(target_data)))
+            .context("session write channel closed")?;
+
+        // Send UoT Request header
+        let mut uot_request = vec![0x00]; // IsConnect = false
+        uot_request.extend_from_slice(&target.to_bytes());
+        session
+            .write_tx
+            .send((stream_id, Command::Psh as u8, Bytes::from(uot_request)))
             .context("session write channel closed")?;
 
         Ok(Arc::new(AnytlsUdpSocket::new(stream_id, session, event_rx)))
@@ -1799,7 +1826,7 @@ mod tests {
             "-p",
             password,
         ]);
-        cmd.env("LOG_LEVEL", "debug");
+        cmd.env("LOG_LEVEL", "info");
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -1823,7 +1850,7 @@ mod tests {
             "-m",
             "1",
         ]);
-        cmd.env("LOG_LEVEL", "debug");
+        cmd.env("LOG_LEVEL", "info");
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -1856,6 +1883,21 @@ mod tests {
                         let (mut rd, mut wr) = sock.split();
                         let _ = tokio::io::copy(&mut rd, &mut wr).await;
                     });
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    /// Run a simple UDP echo server that echoes all data back.
+    async fn spawn_udp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind udp echo");
+        let addr = socket.local_addr().expect("udp echo addr");
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                if let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+                    let _ = socket.send_to(&buf[..len], peer).await;
                 }
             }
         });
@@ -2200,6 +2242,103 @@ mod tests {
         println!("Rust AnytlsOutbound ↔ Go server: TCP echo OK");
 
         drop(stream);
+        let _ = go_child.kill();
+        let _ = go_child.wait();
+        _echo_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_crossver_rust_outbound_go_server_udp_echo() {
+        if !std::path::Path::new(GO_SERVER_PATH).exists() {
+            eprintln!("Skipping: Go server binary not found at {}", GO_SERVER_PATH);
+            return;
+        }
+
+        // 1. Start UDP echo server
+        let (echo_addr, _echo_handle) = spawn_udp_echo_server().await;
+        println!("UDP Echo server on {}", echo_addr);
+
+        // 2. Start Go anytls server
+        let go_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let password = "rust_outbound_go_server_udp";
+        let mut go_child = start_go_server(go_port, password).await;
+        wait_port_ready(go_port, Duration::from_secs(10)).await;
+        println!("Go server on port {}", go_port);
+
+        // 3. Create Rust AnytlsOutbound
+        let cfg = crate::config::OutboundConfig {
+            protocol_type: "anytls".to_string(),
+            address: Some("127.0.0.1".to_string()),
+            port: Some(go_port),
+            password: Some(password.to_string()),
+            connect_timeout: Some(10),
+            bind_interface: None,
+            dns: None,
+            idle_timeout: None,
+            username: None,
+            udp_mod: None,
+            congestion_controller: None,
+            pool_size: None,
+            gso: false,
+            mtu_discoveriy: true,
+            min_mtu: 1200,
+            initial_mtu: 1200,
+            outbounds: None,
+            default_outbound: None,
+            url: None,
+            interval: None,
+            tolerance: None,
+            prefer_ipv6: None,
+            cache: None,
+            tls: Some(crate::config::OutboundTlsConfig {
+                enable: true,
+                insecure: Some(true),
+                server_name: Some("127.0.0.1".to_string()),
+                ca: None,
+                alpn: None,
+                enable_jls: false,
+                jls_username: None,
+                jls_password: None,
+            }),
+            transport: None,
+        };
+
+        let outbound = AnytlsOutbound::new("test_anytls_out".to_string(), &cfg)
+            .expect("create AnytlsOutbound");
+
+        // 4. Connect packet targeting echo server
+        let target = TargetAddr::Ip(echo_addr);
+        let udp_socket = tokio::time::timeout(
+            Duration::from_secs(15),
+            outbound.connect_packet(&target),
+        )
+        .await
+        .expect("connect_packet timeout")
+        .expect("connect_packet failed");
+
+        // 5. Send data
+        let test_data = b"hello UDP from rust AnytlsOutbound via Go server!";
+        udp_socket
+            .send_to(Bytes::from_static(test_data), &TargetAddr::dummy(), &target)
+            .await
+            .expect("send_to failed");
+
+        // 6. Read echo
+        match tokio::time::timeout(Duration::from_secs(10), udp_socket.recv_from()).await {
+            Ok(Ok((_, _, data))) => {
+                assert_eq!(&data[..], test_data, "echo should match sent data");
+            }
+            Ok(Err(e)) => panic!("recv_from failed: {:?}", e),
+            Err(_) => panic!("recv_from timed out"),
+        }
+
+        println!("Rust AnytlsOutbound ↔ Go server: UDP echo OK");
+
         let _ = go_child.kill();
         let _ = go_child.wait();
         _echo_handle.abort();
