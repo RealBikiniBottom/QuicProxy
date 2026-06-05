@@ -190,10 +190,18 @@ impl AnyPacket for AnytlsInboundUdp {
 
 // ─── Inbound Session ──────────────────────────────────────────────────────────
 
+/// Per-stream lifecycle state
+enum StreamState {
+    /// Waiting for first PSH (target address)
+    Pending,
+    /// Active stream, data forwarded via this sender
+    Active(mpsc::UnboundedSender<Bytes>),
+}
+
 /// Server-side session: one per TLS connection, manages multiplexed streams.
 struct InboundSession {
-    /// Map stream_id -> data sender
-    streams: DashMap<u32, mpsc::UnboundedSender<Bytes>>,
+    /// Map stream_id -> stream state
+    streams: DashMap<u32, StreamState>,
     /// Write channel to the TLS write loop
     write_tx: mpsc::UnboundedSender<(u32, u8, Bytes)>,
     /// Tag of this inbound
@@ -294,19 +302,26 @@ impl InboundSession {
 
             match cmd {
                 Command::Syn => {
-                    // New stream: parse target address from SYN data
-                    let target = match parse_target_from_syn(&data) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            warn!("Anytls inbound bad SYN from {}: {:?}", self.peer_addr, e);
-                            continue;
-                        }
-                    };
-                    self.handle_syn(stream_id, target).await;
+                    // Go protocol: SYN has no data. Create pending entry, send SYNACK.
+                    self.streams.insert(stream_id, StreamState::Pending);
+                    let _ = self
+                        .write_tx
+                        .send((stream_id, Command::SynAck as u8, Bytes::new()));
                 }
                 Command::Psh => {
-                    if let Some(tx) = self.streams.get(&stream_id) {
-                        let _ = tx.send(data);
+                    // Check if this is a pending stream (first PSH = target address)
+                    let is_pending = match self.streams.get(&stream_id) {
+                        Some(entry) => matches!(entry.value(), StreamState::Pending),
+                        None => false,
+                    };
+                    if is_pending {
+                        self.handle_target(stream_id, data).await;
+                    } else if let Some(entry) = self.streams.get(&stream_id) {
+                        if let StreamState::Active(tx) = entry.value() {
+                            let _ = tx.send(data);
+                        }
+                    } else {
+                        debug!("Anytls inbound PSH for unknown stream {}", stream_id);
                     }
                 }
                 Command::Fin => {
@@ -347,14 +362,21 @@ impl InboundSession {
         Ok(())
     }
 
-    async fn handle_syn(&self, stream_id: u32, target: TargetAddr) {
+    async fn handle_target(&self, stream_id: u32, data: Bytes) {
+        let target = match parse_target_from_syn(&data) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Anytls inbound bad target from {}: {:?}", self.peer_addr, e);
+                let _ = self
+                    .write_tx
+                    .send((stream_id, Command::Fin as u8, Bytes::new()));
+                self.streams.remove(&stream_id);
+                return;
+            }
+        };
+
         let (data_tx, data_rx) = mpsc::unbounded_channel();
-        self.streams.insert(stream_id, data_tx);
-
         let write_tx = self.write_tx.clone();
-
-        // Send SYNACK (v2 behavior)
-        let _ = write_tx.send((stream_id, Command::SynAck as u8, Bytes::new()));
 
         // Check if this is a UDP-over-TCP request
         if let TargetAddr::Domain(ref domain, _) = target {
@@ -366,6 +388,10 @@ impl InboundSession {
                     data_rx,
                     client_addr.clone(),
                 ));
+                // Transition to active
+                self.streams
+                    .insert(stream_id, StreamState::Active(data_tx));
+
                 let router = self.router.clone();
                 let tag = self.tag.clone();
                 let udp_timeout = self.udp_timeout;
@@ -407,6 +433,11 @@ impl InboundSession {
             write_tx,
             data_rx,
         )) as crate::proxy::outbound::AnyStream;
+
+        // Transition to active
+        self.streams
+            .insert(stream_id, StreamState::Active(data_tx));
+
         let router = self.router.clone();
         let tag = self.tag.clone();
         let span = info_span!(

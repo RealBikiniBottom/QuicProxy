@@ -15,12 +15,11 @@
       ],
       "idle_timeout": 100,
       "mtu": 1424,
-      "auto_route": true
+      "auto_route": false
     },
     "sq_inbound": {
       "type": "shadowquic",
       "address": "127.0.0.1",
-      "set_system_proxy": false,
       "idle_timeout": 500,
       "port": 2344,
       "gso": true,
@@ -32,6 +31,15 @@
         "zero_rtt": true,
         "sni": "www.apple.com"
       }
+    },
+    "anytls_inbound": {
+      "type": "anytls",
+      "address": "127.0.0.1",
+      "password": "testpassword123",
+      "port": 2343,
+      "tls": {
+        "enable": true,
+      }
     }
   },
   "outbounds": {
@@ -39,12 +47,12 @@
     "servers": {
       "autoSelect": {
         "type": "urltest",
-        "default_outbound": "real_sq",
+        "default_outbound": "real_out",
         "outbounds": [
-          "real_sq",
+          "real_out",
         ]
       },
-      "real_sq": {
+      "real_out2": {
         "type": "shadowquic",
         "address": "127.0.0.1",
         "port": 2344,
@@ -57,6 +65,17 @@
           "alpn": [],
           "zero_rtt": true,
           "sni": "www.apple.com"
+        }
+      },
+      "real_out": {
+        "type": "anytls",
+        "address": "127.0.0.1",
+        "port": 8443,
+        // "port": 2343,
+        "password": "testpassword123",
+        "tls": {
+          "enable": true,
+          "insecure": true,
         }
       },
       "hijack_dns_outbound": {
@@ -73,11 +92,11 @@
       },
       "proxy": {
         "type": "selector",
-        "default_outbound": "real_sq",
+        "default_outbound": "real_out",
         "cache": "all_cache",
         "outbounds": [
           "autoSelect",
-          "real_sq",
+          "real_out",
         ]
       },
       "direct": {
@@ -123,6 +142,7 @@
       {
         "inbounds": [
           "sq_inbound",
+          "anytls_inbound",
         ],
         "outbound": "direct"
       },
@@ -185,7 +205,7 @@
       {
         "mode": ["rule"],
         "geoip": ["cn"],
-        "outbound": "direct"
+        "outbound": "real_out"
       }
     ]
   },
@@ -234,7 +254,7 @@
     "log_interval": 15
   },
   "log": {
-    "level": "debug",
+    "level": "info",
     "color": true
   }
 }

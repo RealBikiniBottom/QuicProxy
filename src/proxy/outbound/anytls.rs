@@ -52,88 +52,38 @@ stop=8\n\
 
 // ─── Padding Scheme ───────────────────────────────────────────────────────────
 
+/// CheckMark: if payload remains, skip; if no payload, stop generating sizes.
+const CHECK_MARK: i64 = -1;
+
 #[derive(Debug, Clone)]
-enum PaddingPolicy {
-    Chunks(Vec<(usize, usize, bool)>),
-}
-
-impl PaddingPolicy {
-    fn parse(s: &str) -> Result<Self> {
-        let parts: Vec<&str> = s.split(',').collect();
-        let mut chunks = Vec::new();
-        let mut i = 0;
-        while i < parts.len() {
-            let part = parts[i].trim();
-            let mut can_skip = false;
-            if i + 1 < parts.len() && parts[i + 1].trim() == "c" {
-                can_skip = true;
-                i += 1;
-            }
-            if let Some(dash_pos) = part.find('-') {
-                let min: usize = part[..dash_pos]
-                    .trim()
-                    .parse()
-                    .context("invalid padding min")?;
-                let max: usize = part[dash_pos + 1..]
-                    .trim()
-                    .parse()
-                    .context("invalid padding max")?;
-                chunks.push((min, max, can_skip));
-            }
-            i += 1;
-        }
-        Ok(PaddingPolicy::Chunks(chunks))
-    }
-
-    #[allow(dead_code)]
-    fn apply(&self, payload_len: usize, rng: &mut impl Rng) -> Vec<usize> {
-        match self {
-            PaddingPolicy::Chunks(chunks) => {
-                let mut remaining = payload_len;
-                let mut result = Vec::new();
-                for &(min, max, can_skip) in chunks.iter() {
-                    if remaining == 0 {
-                        if !can_skip {
-                            let pad_size = if min == max {
-                                min
-                            } else {
-                                rng.gen_range(min..=max)
-                            };
-                            result.push(pad_size);
-                        }
-                        break;
-                    }
-                    let max_for_this = max.min(remaining);
-                    let size = if min >= remaining {
-                        remaining
-                    } else {
-                        rng.gen_range(min..=max_for_this)
-                    };
-                    result.push(size);
-                    remaining = remaining.saturating_sub(size);
-                }
-                if remaining > 0 {
-                    result.push(remaining);
-                }
-                result
-            }
-        }
-    }
+enum PaddingEntry {
+    /// Fixed size (min == max)
+    Fixed(usize),
+    /// Random size in [min, max]
+    Range(usize, usize),
+    /// CheckMark
+    CheckMark,
 }
 
 #[derive(Debug, Clone)]
 struct PaddingScheme {
-    #[allow(dead_code)]
-    stop_at: u8,
-    policies: HashMap<u8, PaddingPolicy>,
+    stop_at: u32,
+    /// Map: packet_index → list of padding entries
+    policies: HashMap<u32, Vec<PaddingEntry>>,
+    /// MD5 hex of the raw scheme bytes
     hash: String,
+    /// Raw scheme bytes (for cmdUpdatePaddingScheme)
+    #[allow(dead_code)]
+    raw: Vec<u8>,
 }
 
 impl PaddingScheme {
-    fn parse(raw: &str) -> Result<Self> {
-        let mut stop_at: u8 = 0;
+    fn parse(raw: &[u8]) -> Result<Self> {
+        let text = std::str::from_utf8(raw).context("padding scheme is not UTF-8")?;
+        let mut stop_at: u32 = 0;
         let mut policies = HashMap::new();
-        for line in raw.lines() {
+
+        for line in text.lines() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -143,27 +93,70 @@ impl PaddingScheme {
                 let value = value.trim();
                 if key == "stop" {
                     stop_at = value.parse().context("invalid stop value")?;
-                } else if let Ok(pkt_idx) = key.parse::<u8>() {
-                    policies.insert(pkt_idx, PaddingPolicy::parse(value)?);
+                } else if let Ok(pkt_idx) = key.parse::<u32>() {
+                    let entries = Self::parse_entries(value)?;
+                    policies.insert(pkt_idx, entries);
                 }
             }
         }
-        let hash = Self::compute_hash(raw);
+
+        let hash = format!("{:x}", md5::compute(raw));
         Ok(Self {
             stop_at,
             policies,
             hash,
+            raw: raw.to_vec(),
         })
     }
 
-    fn compute_hash(raw: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(raw.as_bytes());
-        hex::encode(hasher.finalize())
+    fn parse_entries(s: &str) -> Result<Vec<PaddingEntry>> {
+        let mut entries = Vec::new();
+        for part in s.split(',') {
+            let part = part.trim();
+            if part == "c" {
+                entries.push(PaddingEntry::CheckMark);
+                continue;
+            }
+            if let Some(dash_pos) = part.find('-') {
+                let min: usize = part[..dash_pos].trim().parse().context("invalid padding min")?;
+                let max: usize = part[dash_pos + 1..].trim().parse().context("invalid padding max")?;
+                let (min, max) = (min.min(max), min.max(max));
+                if min <= 0 || max <= 0 {
+                    continue;
+                }
+                if min == max {
+                    entries.push(PaddingEntry::Fixed(min));
+                } else {
+                    entries.push(PaddingEntry::Range(min, max));
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Generate target record payload sizes for a given packet number.
+    /// Returns a list of target sizes. `CHECK_MARK` (-1) means CheckMark.
+    fn generate_record_payload_sizes(&self, pkt: u32) -> Vec<i64> {
+        if let Some(entries) = self.policies.get(&pkt) {
+            entries
+                .iter()
+                .map(|e| match e {
+                    PaddingEntry::Fixed(v) => *v as i64,
+                    PaddingEntry::Range(min, max) => {
+                        let mut rng = rand::thread_rng();
+                        rng.gen_range(*min..=*max) as i64
+                    }
+                    PaddingEntry::CheckMark => CHECK_MARK,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn get_default() -> Self {
-        Self::parse(DEFAULT_PADDING_SCHEME).expect("default padding scheme must be valid")
+        Self::parse(DEFAULT_PADDING_SCHEME.as_bytes())
+            .expect("default padding scheme must be valid")
     }
 }
 
@@ -192,6 +185,7 @@ struct Session {
     server_version: AtomicU8,
     is_dead: AtomicBool,
     packet_count: AtomicU64,
+    send_padding: AtomicBool,
     padding_scheme: Mutex<PaddingScheme>,
     closer: Arc<SessionCloser>,
 }
@@ -225,20 +219,28 @@ impl Session {
             next_stream_id: AtomicU32::new(1),
             server_version: AtomicU8::new(1),
             is_dead: AtomicBool::new(false),
-            packet_count: AtomicU64::new(0),
+            packet_count: AtomicU64::new(1), // pkt=0 used for auth
+            send_padding: AtomicBool::new(true),
             padding_scheme: Mutex::new(padding_scheme),
             closer: Arc::new(SessionCloser::new()),
         });
 
-        // Authenticate
+        // Authenticate (pkt=0)
         let scheme = session.padding_scheme.lock().await.clone();
         let (tls_read, mut tls_write) = tokio::io::split(tls_stream);
         Self::authenticate(&mut tls_write, password_hash, &scheme).await?;
 
-        // Send cmdSettings
-        Self::send_settings(&mut tls_write).await?;
+        // Queue cmdSettings through write channel (will be buffered in write_loop)
+        let settings_data = format!(
+            "v={}\nclient={}\npadding-md5={}\n",
+            PROTOCOL_VERSION, CLIENT_NAME, scheme.hash
+        );
+        session
+            .write_tx
+            .send((0, Command::Settings as u8, Bytes::from(settings_data)))
+            .map_err(|_| new_io_other_error("failed to queue settings"))?;
 
-        // Spawn write loop
+        // Spawn write loop (starts in buffering mode)
         let session_w = session.clone();
         tokio::spawn(async move {
             if let Err(e) = session_w.write_loop(tls_write, write_rx).await {
@@ -266,21 +268,12 @@ impl Session {
         password_hash: &[u8; 32],
         scheme: &PaddingScheme,
     ) -> Result<()> {
+        // Auth padding uses pkt=0's first entry
         let padding0_size: usize = scheme
-            .policies
-            .get(&0)
-            .and_then(|p| match p {
-                PaddingPolicy::Chunks(chunks) => chunks.first(),
-            })
-            .map(|&(min, max, _can_skip)| {
-                let mut rng = rand::thread_rng();
-                if min == max {
-                    min
-                } else {
-                    rng.gen_range(min..=max)
-                }
-            })
-            .unwrap_or(30);
+            .generate_record_payload_sizes(0)
+            .first()
+            .copied()
+            .unwrap_or(30) as usize;
 
         let mut auth_packet =
             Vec::with_capacity(AUTH_HASH_SIZE + AUTH_LENGTH_FIELD_SIZE + padding0_size);
@@ -290,16 +283,6 @@ impl Session {
 
         tls.write_all(&auth_packet).await?;
         tls.flush().await?;
-        Ok(())
-    }
-
-    async fn send_settings<S: AsyncWrite + Unpin>(tls: &mut S) -> Result<()> {
-        let scheme = PaddingScheme::get_default();
-        let settings = format!(
-            "v={}\nclient={}\npadding-md5={}\n",
-            PROTOCOL_VERSION, CLIENT_NAME, scheme.hash
-        );
-        Self::write_frame(tls, Command::Settings, 0, settings.as_bytes()).await?;
         Ok(())
     }
 
@@ -317,24 +300,6 @@ impl Session {
                 .context("read frame data")?;
         }
         Ok((Command::from(cmd), stream_id, Bytes::from(data)))
-    }
-
-    async fn write_frame<S: AsyncWrite + Unpin>(
-        stream: &mut S,
-        cmd: Command,
-        stream_id: u32,
-        data: &[u8],
-    ) -> Result<()> {
-        let mut header = [0u8; FRAME_HEADER_SIZE];
-        header[0] = u8::from(cmd);
-        header[1..5].copy_from_slice(&stream_id.to_be_bytes());
-        header[5..7].copy_from_slice(&(data.len() as u16).to_be_bytes());
-        stream.write_all(&header).await?;
-        if !data.is_empty() {
-            stream.write_all(data).await?;
-        }
-        stream.flush().await?;
-        Ok(())
     }
 
     // ── Loops ─────────────────────────────────────────────────────────────
@@ -380,8 +345,7 @@ impl Session {
                     return Err(new_io_other_error(format!("server alert: {}", msg)).into());
                 }
                 Command::UpdatePaddingScheme => {
-                    let scheme_str = String::from_utf8_lossy(&data);
-                    match PaddingScheme::parse(&scheme_str) {
+                    match PaddingScheme::parse(&data) {
                         Ok(new_scheme) => {
                             debug!("Anytls session {} updated padding scheme", self.session_seq);
                             *self.padding_scheme.lock().await = new_scheme;
@@ -396,7 +360,9 @@ impl Session {
                 }
                 Command::HeartRequest => {
                     // Send heart response via write channel
-                    let _ = self.write_tx.send((0, Command::HeartResponse as u8, Bytes::new()));
+                    let _ = self
+                        .write_tx
+                        .send((0, Command::HeartResponse as u8, Bytes::new()));
                 }
                 Command::HeartResponse => {}
                 Command::ServerSettings => {
@@ -422,9 +388,123 @@ impl Session {
         mut tls: impl AsyncWrite + Unpin + Send,
         mut write_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, u8, Bytes)>,
     ) -> Result<()> {
+        // Buffering: accumulate frames until the first PSH (target address)
+        // is received, then flush all buffered data with padding.
+        let mut buffering = true;
+        let mut buffer: Vec<u8> = Vec::new();
+
         while let Some((stream_id, cmd, data)) = write_rx.recv().await {
-            Self::write_frame(&mut tls, Command::from(cmd), stream_id, &data).await?;
+            let frame_bytes = Self::build_frame_bytes(Command::from(cmd), stream_id, &data);
+
+            if buffering {
+                buffer.extend_from_slice(&frame_bytes);
+                // First PSH = target address → stop buffering and flush
+                if Command::from(cmd) == Command::Psh {
+                    buffering = false;
+                    let combined = std::mem::take(&mut buffer);
+                    if let Err(e) = self.write_with_padding(&mut tls, &combined).await {
+                        debug!("Anytls write_with_padding error: {:?}", e);
+                        break;
+                    }
+                }
+            } else {
+                if let Err(e) = self.write_with_padding(&mut tls, &frame_bytes).await {
+                    debug!("Anytls write_with_padding error: {:?}", e);
+                    break;
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// Build frame bytes without sending them.
+    fn build_frame_bytes(cmd: Command, stream_id: u32, data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + data.len());
+        buf.push(u8::from(cmd));
+        buf.extend_from_slice(&stream_id.to_be_bytes());
+        buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        buf.extend_from_slice(data);
+        buf
+    }
+
+    /// Write data with padding according to the current scheme.
+    /// Matches Go's `writeConn` logic: split payload into target-sized records,
+    /// insert WASTE frames for padding.
+    async fn write_with_padding(
+        &self,
+        tls: &mut (impl AsyncWrite + Unpin),
+        data: &[u8],
+    ) -> Result<()> {
+        if !self.send_padding.load(Ordering::Acquire) {
+            tls.write_all(data).await?;
+            tls.flush().await?;
+            return Ok(());
+        }
+
+        let pkt = self.packet_count.fetch_add(1, Ordering::Relaxed);
+        let scheme = self.padding_scheme.lock().await;
+
+        if pkt >= scheme.stop_at as u64 {
+            self.send_padding.store(false, Ordering::Release);
+            drop(scheme);
+            tls.write_all(data).await?;
+            tls.flush().await?;
+            return Ok(());
+        }
+
+        let sizes = scheme.generate_record_payload_sizes(pkt as u32);
+        drop(scheme);
+
+        let mut remaining = data;
+
+        for target_size in &sizes {
+            if *target_size == CHECK_MARK {
+                if remaining.is_empty() {
+                    break; // no payload left, stop
+                } else {
+                    continue; // payload remains, skip this mark
+                }
+            }
+
+            let target_size = *target_size as usize;
+            let remain_len = remaining.len();
+
+            if remain_len > target_size {
+                // This record is all payload
+                tls.write_all(&remaining[..target_size]).await?;
+                remaining = &remaining[target_size..];
+            } else if remain_len > 0 {
+                // This record contains payload + padding
+                let padding_len = target_size.saturating_sub(remain_len + FRAME_HEADER_SIZE);
+                if padding_len > 0 {
+                    // Build WASTE frame header + padding data
+                    let mut waste = vec![0u8; FRAME_HEADER_SIZE + padding_len];
+                    waste[0] = u8::from(Command::Waste);
+                    waste[1..5].copy_from_slice(&0u32.to_be_bytes());
+                    waste[5..7].copy_from_slice(&(padding_len as u16).to_be_bytes());
+                    tls.write_all(remaining).await?;
+                    tls.write_all(&waste).await?;
+                } else {
+                    tls.write_all(remaining).await?;
+                }
+                remaining = &[];
+            } else {
+                // This record is all padding (WASTE frame)
+                let mut waste = vec![0u8; FRAME_HEADER_SIZE + target_size];
+                waste[0] = u8::from(Command::Waste);
+                waste[1..5].copy_from_slice(&0u32.to_be_bytes());
+                waste[5..7].copy_from_slice(&(target_size as u16).to_be_bytes());
+                tls.write_all(&waste).await?;
+                remaining = &[];
+            }
+        }
+
+        // Write any remaining payload beyond the scheme's entries
+        if !remaining.is_empty() {
+            tls.write_all(remaining).await?;
+        }
+
+        tls.flush().await?;
         Ok(())
     }
 
@@ -733,7 +813,9 @@ impl AnytlsUdpSocket {
 impl Drop for AnytlsUdpSocket {
     fn drop(&mut self) {
         // Send FIN
-        let _ = self.write_tx.send((self.stream_id, Command::Fin as u8, Bytes::new()));
+        let _ = self
+            .write_tx
+            .send((self.stream_id, Command::Fin as u8, Bytes::new()));
         self.session.unregister_stream(self.stream_id);
     }
 }
@@ -850,12 +932,17 @@ impl AnyOutbound for AnytlsOutbound {
         // Register stream to receive incoming data
         let event_rx = session.register_stream(stream_id);
 
-        // Send cmdSYN with target address
-        let syn_data = target.to_bytes();
+        // Go protocol: SYN has no data, target address sent as first PSH
         session
             .write_tx
-            .send((stream_id, Command::Syn as u8, Bytes::copy_from_slice(&syn_data)))
-            .map_err(|_| new_io_other_error("session write channel closed"))?;
+            .send((stream_id, Command::Syn as u8, Bytes::new()))
+            .context("session write channel closed")?;
+
+        let target_data = target.to_bytes();
+        session
+            .write_tx
+            .send((stream_id, Command::Psh as u8, Bytes::from(target_data)))
+            .context("session write channel closed")?;
 
         let proxy = AnytlsProxyStream::new(stream_id, session.clone(), event_rx);
         Ok(Box::new(proxy))
@@ -869,12 +956,17 @@ impl AnyOutbound for AnytlsOutbound {
 
         let event_rx = session.register_stream(stream_id);
 
-        // Send cmdSYN with udp-over-tcp target
-        let syn_data = udp_target.to_bytes();
+        // Go protocol: SYN has no data, target sent as first PSH
         session
             .write_tx
-            .send((stream_id, Command::Syn as u8, Bytes::copy_from_slice(&syn_data)))
-            .map_err(|_| new_io_other_error("session write channel closed"))?;
+            .send((stream_id, Command::Syn as u8, Bytes::new()))
+            .context("session write channel closed")?;
+
+        let target_data = udp_target.to_bytes();
+        session
+            .write_tx
+            .send((stream_id, Command::Psh as u8, Bytes::from(target_data)))
+            .context("session write channel closed")?;
 
         Ok(Arc::new(AnytlsUdpSocket::new(stream_id, session, event_rx)))
     }
@@ -1001,10 +1093,11 @@ impl AsyncWrite for AnytlsProxyStream {
                 "stream already closed",
             )));
         }
-        match this
-            .write_tx
-            .send((this.stream_id, Command::Psh as u8, Bytes::copy_from_slice(buf)))
-        {
+        match this.write_tx.send((
+            this.stream_id,
+            Command::Psh as u8,
+            Bytes::copy_from_slice(buf),
+        )) {
             Ok(_) => Poll::Ready(Ok(buf.len())),
             Err(_) => Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -1020,7 +1113,9 @@ impl AsyncWrite for AnytlsProxyStream {
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         if !this.fin_sent.swap(true, Ordering::AcqRel) {
-            let _ = this.write_tx.send((this.stream_id, Command::Fin as u8, Bytes::new()));
+            let _ = this
+                .write_tx
+                .send((this.stream_id, Command::Fin as u8, Bytes::new()));
         }
         Poll::Ready(Ok(()))
     }
@@ -1029,7 +1124,9 @@ impl AsyncWrite for AnytlsProxyStream {
 impl Drop for AnytlsProxyStream {
     fn drop(&mut self) {
         if !self.fin_sent.load(Ordering::Acquire) {
-            let _ = self.write_tx.send((self.stream_id, Command::Fin as u8, Bytes::new()));
+            let _ = self
+                .write_tx
+                .send((self.stream_id, Command::Fin as u8, Bytes::new()));
         }
         self.session.unregister_stream(self.stream_id);
     }
@@ -1178,8 +1275,8 @@ mod tests {
     /// 1. Accepts TLS connection
     /// 2. Verifies auth (password hash match)
     /// 3. Reads cmdSettings, sends cmdServerSettings
-    /// 4. Reads cmdSYN, echoes target data back as SYNACK data
-    /// 5. Echoes all cmdPSH data back
+    /// 4. Reads cmdSYN, sends SYNACK, reads first PSH (target) silently
+    /// 5. Echoes subsequent cmdPSH data back
     /// 6. Closes on cmdFIN
     async fn mock_anytls_server(
         listener: TcpListener,
@@ -1211,18 +1308,36 @@ mod tests {
 
         // 2. Read cmdSettings
         let (settings_cmd, _, _settings_data) = read_frame(&mut rd).await?;
-        assert_eq!(settings_cmd, Command::Settings, "expected Command::Settings");
+        assert_eq!(
+            settings_cmd,
+            Command::Settings,
+            "expected Command::Settings"
+        );
 
         // 3. Send cmdServerSettings (v=2)
         let server_settings = format!("v={}\n", PROTOCOL_VERSION);
-        write_frame(&mut wr, Command::ServerSettings, 0, server_settings.as_bytes()).await?;
+        write_frame(
+            &mut wr,
+            Command::ServerSettings,
+            0,
+            server_settings.as_bytes(),
+        )
+        .await?;
 
-        // 4. Read cmdSYN, respond with SYNACK (empty = success)
+        // 4. Read cmdSYN, send SYNACK, consume target PSH
         let (syn_cmd, stream_id, _target) = read_frame(&mut rd).await?;
         assert_eq!(syn_cmd, Command::Syn, "expected Command::Syn");
         write_frame(&mut wr, Command::SynAck, stream_id, b"").await?;
 
-        // 5. Echo loop: read frames, echo PSH data back, break on FIN
+        // Consume first PSH (target address)
+        let (psh_cmd, _, _) = read_frame(&mut rd).await?;
+        assert!(
+            psh_cmd == Command::Psh || psh_cmd == Command::Fin,
+            "expected PSH or FIN, got {:?}",
+            psh_cmd
+        );
+
+        // 5. Echo loop: echo subsequent PSH data back, break on FIN
         loop {
             let (cmd, sid, data) = read_frame(&mut rd).await?;
             match cmd {
@@ -1232,9 +1347,7 @@ mod tests {
                 Command::Fin => {
                     break;
                 }
-                cmd => {
-                    eprintln!("Mock server received unexpected cmd: {:?}", cmd);
-                }
+                _ => {} // Ignore WASTE and other frames
             }
         }
 
@@ -1272,10 +1385,17 @@ mod tests {
         assert_eq!(settings_cmd, Command::Settings);
         write_frame(&mut wr, Command::ServerSettings, 0, b"v=2\n").await?;
 
-        // SYN (expecting UDP-over-TCP target)
+        // SYN (expecting empty data in Go protocol)
         let (syn_cmd, stream_id, _) = read_frame(&mut rd).await?;
         assert_eq!(syn_cmd, Command::Syn);
         write_frame(&mut wr, Command::SynAck, stream_id, b"").await?;
+
+        // Consume first PSH (target)
+        let (psh_cmd, _, _) = read_frame(&mut rd).await?;
+        assert!(
+            psh_cmd == Command::Psh || psh_cmd == Command::Fin,
+            "expected PSH or FIN"
+        );
 
         // Echo UDP messages
         loop {
@@ -1307,6 +1427,68 @@ mod tests {
             jls_username: String::new(),
             jls_password: String::new(),
         }
+    }
+
+    /// Mock server that consumes the first PSH as target address (Go-client-compatible).
+    /// Subsequently echoes PSH data.
+    async fn mock_anytls_server_strip_target(
+        listener: TcpListener,
+        expected_password_hash: [u8; 32],
+        acceptor: TlsAcceptor,
+        ready_tx: oneshot::Sender<SocketAddr>,
+    ) -> Result<()> {
+        let addr = listener.local_addr()?;
+        let _ = ready_tx.send(addr);
+
+        let (tcp_stream, _peer) = listener.accept().await?;
+        let tls_stream = acceptor.accept(tcp_stream).await?;
+        let (mut rd, mut wr) = tokio::io::split(tls_stream);
+
+        // Auth
+        let mut auth_hash = [0u8; AUTH_HASH_SIZE];
+        rd.read_exact(&mut auth_hash).await?;
+        assert_eq!(&auth_hash, &expected_password_hash);
+
+        let pad_len = rd.read_u16().await? as usize;
+        if pad_len > 0 {
+            let mut pad = vec![0u8; pad_len];
+            rd.read_exact(&mut pad).await?;
+        }
+
+        // Settings
+        let (settings_cmd, _, _) = read_frame(&mut rd).await?;
+        assert_eq!(settings_cmd, Command::Settings);
+        write_frame(&mut wr, Command::ServerSettings, 0, b"v=2\n").await?;
+
+        // SYN
+        let (syn_cmd, stream_id, _) = read_frame(&mut rd).await?;
+        assert_eq!(syn_cmd, Command::Syn);
+        write_frame(&mut wr, Command::SynAck, stream_id, b"").await?;
+
+        // Read first PSH (target address), consume it silently
+        let (psh_cmd, _, _) = read_frame(&mut rd).await?;
+        assert!(
+            psh_cmd == Command::Psh || psh_cmd == Command::Fin,
+            "expected PSH or FIN, got {:?}",
+            psh_cmd
+        );
+        if psh_cmd == Command::Fin {
+            return Ok(());
+        }
+
+        // Echo subsequent PSH data
+        loop {
+            let (cmd, sid, data) = read_frame(&mut rd).await?;
+            match cmd {
+                Command::Psh => {
+                    write_frame(&mut wr, Command::Psh, sid, &data).await?;
+                }
+                Command::Fin => break,
+                _ => {}
+            }
+        }
+
+        Ok(())
     }
 
     /// Run a mock anytls server that mismatches on auth and closes the connection.
@@ -1405,16 +1587,23 @@ mod tests {
         // Wait for server to process settings and be ready
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Create stream
+        // Create stream (Go protocol: SYN empty, target as first PSH)
         let stream_id = session.next_stream_id();
         let event_rx = session.register_stream(stream_id);
 
-        let target = TargetAddr::Domain("example.com".to_string(), 80);
-        let syn_data = target.to_bytes();
+        // 1. Send empty SYN
         session
             .write_tx
-            .send((stream_id, Command::Syn as u8, Bytes::copy_from_slice(&syn_data)))
+            .send((stream_id, Command::Syn as u8, Bytes::new()))
             .expect("send SYN");
+
+        // 2. Send target address as first PSH
+        let target = TargetAddr::Domain("example.com".to_string(), 80);
+        let target_data = target.to_bytes();
+        session
+            .write_tx
+            .send((stream_id, Command::Psh as u8, Bytes::from(target_data)))
+            .expect("send target PSH");
 
         let proxy = AnytlsProxyStream::new(stream_id, session.clone(), event_rx);
 
@@ -1485,13 +1674,18 @@ mod tests {
         let stream_id = session.next_stream_id();
         let event_rx = session.register_stream(stream_id);
 
-        // Use UDP-over-TCP target
-        let udp_target = TargetAddr::Domain(UDP_OVER_TCP_TARGET.to_string(), 12345);
-        let syn_data = udp_target.to_bytes();
+        // Go protocol: SYN empty, target as first PSH
         session
             .write_tx
-            .send((stream_id, Command::Syn as u8, Bytes::copy_from_slice(&syn_data)))
+            .send((stream_id, Command::Syn as u8, Bytes::new()))
             .expect("send SYN");
+
+        let udp_target = TargetAddr::Domain(UDP_OVER_TCP_TARGET.to_string(), 12345);
+        let target_data = udp_target.to_bytes();
+        session
+            .write_tx
+            .send((stream_id, Command::Psh as u8, Bytes::from(target_data)))
+            .expect("send target PSH");
 
         let udp_socket = AnytlsUdpSocket::new(stream_id, session.clone(), event_rx);
 
@@ -1572,5 +1766,442 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    // ── Go Cross-Verification Helpers ──────────────────────────────────────
+
+    /// Path to the pre-built Go anytls server binary.
+    /// Build: `cd anytls-go && go build -o /tmp/anytls-server ./cmd/server`
+    const GO_SERVER_PATH: &str = "/tmp/anytls-server";
+
+    /// Path to the pre-built Go anytls client binary.
+    /// Build: `cd anytls-go && go build -o /tmp/anytls-client ./cmd/client`
+    const GO_CLIENT_PATH: &str = "/tmp/anytls-client";
+
+    fn insecure_tls_client_config() -> Arc<rustls::ClientConfig> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(SkipServerVerification));
+        Arc::new(config)
+    }
+
+    /// Start the Go anytls server on a random port. Returns (child, port).
+    /// The server auto-generates TLS cert and proxies to any destination.
+    async fn start_go_server(port: u16, password: &str) -> std::process::Child {
+        let mut cmd = std::process::Command::new(GO_SERVER_PATH);
+        cmd.args([
+            "-l",
+            &format!("127.0.0.1:{}", port),
+            "-p",
+            password,
+        ]);
+        cmd.env("LOG_LEVEL", "debug");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.spawn().expect("failed to start Go anytls server")
+    }
+
+    /// Start the Go anytls client (SOCKS5 → anytls) on a random port.
+    async fn start_go_client(
+        socks5_port: u16,
+        server_addr: &str,
+        password: &str,
+    ) -> std::process::Child {
+        let mut cmd = std::process::Command::new(GO_CLIENT_PATH);
+        cmd.args([
+            "-l",
+            &format!("127.0.0.1:{}", socks5_port),
+            "-s",
+            server_addr,
+            "-p",
+            password,
+            "-m",
+            "1",
+        ]);
+        cmd.env("LOG_LEVEL", "debug");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.spawn().expect("failed to start Go anytls client")
+    }
+
+    /// Wait for port to be connectable (up to 10s).
+    async fn wait_port_ready(port: u16, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            if TcpStream::connect(addr).await.is_ok() {
+                return;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("port {} not ready after {:?}", port, timeout);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Run a simple TCP echo server that echoes all data back.
+    async fn spawn_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
+        let addr = listener.local_addr().expect("echo addr");
+        let handle = tokio::spawn(async move {
+            loop {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let (mut rd, mut wr) = sock.split();
+                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                    });
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    // ── Cross-Verification: Rust client ↔ Go server ────────────────────────
+
+    /// Test that our Rust anytls client can talk to the Go anytls server.
+    /// The Go server proxies to a local TCP echo server.
+    #[tokio::test]
+    async fn test_crossver_rust_client_go_server_tcp_echo() {
+        // Ensure Go server binary exists
+        if !std::path::Path::new(GO_SERVER_PATH).exists() {
+            eprintln!(
+                "Skipping: Go server binary not found at {}. Build with: \
+                 cd anytls-go && go build -o {} ./cmd/server",
+                GO_SERVER_PATH, GO_SERVER_PATH
+            );
+            return;
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // 1. Start TCP echo server
+        let (echo_addr, _echo_handle) = spawn_echo_server().await;
+        println!("Echo server on {}", echo_addr);
+
+        // 2. Start Go anytls server
+        let go_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let password = "cross_ver_test";
+        let mut go_child = start_go_server(go_port, password).await;
+        wait_port_ready(go_port, Duration::from_secs(10)).await;
+        println!("Go server on port {}", go_port);
+
+        // 3. Rust client: connect to Go server via TLS
+        let tls_cfg = insecure_tls_client_config();
+        let server_name = rustls::pki_types::ServerName::try_from("127.0.0.1")
+            .unwrap()
+            .to_owned();
+
+        let tcp_stream = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], go_port)))
+            .await
+            .expect("TCP connect to Go server");
+
+        let session = Session::new(
+            tcp_stream,
+            tls_cfg,
+            server_name,
+            &password_hash(password),
+            Duration::from_secs(10),
+            0,
+            PaddingScheme::get_default(),
+        )
+        .await
+        .expect("create session to Go server");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // 4. Open stream: send SYN (empty), then PSH with target address
+        let stream_id = session.next_stream_id();
+        let event_rx = session.register_stream(stream_id);
+
+        // Send SYN (Go server expects empty SYN data)
+        session
+            .write_tx
+            .send((stream_id, Command::Syn as u8, Bytes::new()))
+            .expect("send SYN");
+
+        let proxy = AnytlsProxyStream::new(stream_id, session.clone(), event_rx);
+        let (mut rd, mut wr) = tokio::io::split(proxy);
+
+        // Send target address as PSH (Go client sends target via PSH after SYN)
+        let target = TargetAddr::Ip(echo_addr);
+        let target_bytes = target.to_bytes();
+        wr.write_all(&target_bytes).await.expect("write target");
+        wr.flush().await.expect("flush target");
+
+        // Wait for Go server to process SYN+target and connect to echo
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // 5. Write test data, read echo
+        let test_data = b"hello from rust anytls client!";
+        wr.write_all(test_data).await.expect("write");
+        wr.flush().await.expect("flush");
+
+        let mut buf = vec![0u8; test_data.len()];
+        match tokio::time::timeout(Duration::from_secs(10), rd.read_exact(&mut buf)).await {
+            Ok(Ok(_n)) => {}
+            Ok(Err(e)) => panic!("read echo failed: {:?}", e),
+            Err(_) => panic!("read echo timed out"),
+        }
+        assert_eq!(&buf, test_data, "echo should match");
+
+        println!("Rust client ↔ Go server: TCP echo OK");
+
+        drop(wr);
+        drop(rd);
+
+        // Cleanup
+        let _ = go_child.kill();
+        let _ = go_child.wait();
+        _echo_handle.abort();
+    }
+
+    // ── Cross-Verification: Go client ↔ Rust server ────────────────────────
+
+    /// Test that the Go anytls client can talk to our Rust mock server.
+    /// The mock server echoes data back.
+    #[tokio::test]
+    async fn test_crossver_go_client_rust_server_tcp_echo() {
+        if !std::path::Path::new(GO_CLIENT_PATH).exists() {
+            eprintln!(
+                "Skipping: Go client binary not found at {}. Build with: \
+                 cd anytls-go && go build -o {} ./cmd/client",
+                GO_CLIENT_PATH, GO_CLIENT_PATH
+            );
+            return;
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (server_tls_cfg, _) = generate_tls_config();
+        let acceptor = TlsAcceptor::from(Arc::new(server_tls_cfg));
+        let phash = password_hash("go_cross_ver");
+
+        // 1. Start Rust mock server
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rust server");
+        let rust_server_addr = listener.local_addr().expect("rust server addr");
+
+        let server_handle = tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(30),
+                mock_anytls_server_strip_target(
+                    listener,
+                    phash,
+                    acceptor,
+                    oneshot::channel().0,
+                ),
+            )
+            .await;
+        });
+
+        // 2. Start Go anytls client (SOCKS5 → anytls)
+        let socks5_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind socks");
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+
+        let mut go_child = start_go_client(
+            socks5_port,
+            &format!("127.0.0.1:{}", rust_server_addr.port()),
+            "go_cross_ver",
+        )
+        .await;
+
+        // Wait for Go client's SOCKS5 port to be ready
+        wait_port_ready(socks5_port, Duration::from_secs(10)).await;
+        println!(
+            "Go client SOCKS5 on port {}, connecting to Rust server {}",
+            socks5_port, rust_server_addr
+        );
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // 3. SOCKS5 connect: tell Go client to connect to our echo server
+        let (echo_addr, _echo_handle) = spawn_echo_server().await;
+
+        // Manual SOCKS5 handshake to Go client
+        let mut sock = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], socks5_port)))
+            .await
+            .expect("SOCKS5 connect to Go client");
+
+        // SOCKS5 greeting: no auth
+        sock.write_all(&[0x05, 0x01, 0x00]).await.expect("SOCKS5 hello");
+        let mut resp = [0u8; 2];
+        sock.read_exact(&mut resp).await.expect("SOCKS5 auth resp");
+        assert_eq!(resp, [0x05, 0x00], "SOCKS5 no-auth accepted");
+
+        // SOCKS5 CONNECT request to echo server
+        let echo_ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            _ => panic!("expected IPv4"),
+        };
+        let mut req = Vec::new();
+        req.push(0x05); // version
+        req.push(0x01); // CONNECT
+        req.push(0x00); // reserved
+        req.push(0x01); // IPv4
+        req.extend_from_slice(&echo_ip.octets());
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        sock.write_all(&req).await.expect("SOCKS5 connect req");
+
+        // Read SOCKS5 connect response
+        let mut connect_resp = [0u8; 10];
+        sock.read_exact(&mut connect_resp)
+            .await
+            .expect("SOCKS5 connect resp");
+        assert_eq!(
+            connect_resp[0..4],
+            [0x05, 0x00, 0x00, 0x01],
+            "SOCKS5 connect succeeded"
+        );
+
+        // 4. Now the tunnel is established. Write test data, read echo.
+        let test_data = b"hello from go anytls client via rust server!";
+        sock.write_all(test_data).await.expect("write data");
+        sock.flush().await.expect("flush");
+
+        // Read echo via the tunnel
+        let mut buf = vec![0u8; test_data.len()];
+        let mut total = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while total < test_data.len() {
+            match tokio::time::timeout_at(deadline, AsyncReadExt::read(&mut sock, &mut buf[total..]))
+                .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => total += n,
+                Ok(Err(e)) => {
+                    eprintln!("read error: {:?}", e);
+                    break;
+                }
+                Err(_) => {
+                    eprintln!("read timeout");
+                    break;
+                }
+            }
+        }
+        assert_eq!(total, test_data.len(), "should receive all echo bytes");
+        assert_eq!(&buf[..total], test_data, "echo data mismatch");
+
+        println!("Go client ↔ Rust server: TCP echo OK");
+
+        drop(sock);
+        let _ = go_child.kill();
+        let _ = go_child.wait();
+        server_handle.abort();
+        _echo_handle.abort();
+    }
+
+    // ── Cross-Verification: Rust AnytlsOutbound → Go server ──────────────
+
+    /// Full-stack test: Rust AnytlsOutbound → Go anytls server → TCP echo.
+    /// Uses the real production outbound, not raw Session.
+    #[tokio::test]
+    async fn test_crossver_rust_outbound_go_server_tcp_echo() {
+        if !std::path::Path::new(GO_SERVER_PATH).exists() {
+            eprintln!("Skipping: Go server binary not found at {}", GO_SERVER_PATH);
+            return;
+        }
+
+        // 1. Start TCP echo server
+        let (echo_addr, _echo_handle) = spawn_echo_server().await;
+        println!("Echo server on {}", echo_addr);
+
+        // 2. Start Go anytls server
+        let go_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let password = "rust_outbound_go_server";
+        let mut go_child = start_go_server(go_port, password).await;
+        wait_port_ready(go_port, Duration::from_secs(10)).await;
+        println!("Go server on port {}", go_port);
+
+        // 3. Create Rust AnytlsOutbound
+        let cfg = crate::config::OutboundConfig {
+            protocol_type: "anytls".to_string(),
+            address: Some("127.0.0.1".to_string()),
+            port: Some(go_port),
+            password: Some(password.to_string()),
+            connect_timeout: Some(10),
+            bind_interface: None,
+            dns: None,
+            idle_timeout: None,
+            username: None,
+            udp_mod: None,
+            congestion_controller: None,
+            pool_size: None,
+            gso: false,
+            mtu_discoveriy: true,
+            min_mtu: 1200,
+            initial_mtu: 1200,
+            outbounds: None,
+            default_outbound: None,
+            url: None,
+            interval: None,
+            tolerance: None,
+            prefer_ipv6: None,
+            cache: None,
+            tls: Some(crate::config::OutboundTlsConfig {
+                enable: true,
+                insecure: Some(true),
+                server_name: Some("127.0.0.1".to_string()),
+                ca: None,
+                alpn: None,
+                enable_jls: false,
+                jls_username: None,
+                jls_password: None,
+            }),
+            transport: None,
+        };
+
+        let outbound = AnytlsOutbound::new("test_anytls_out".to_string(), &cfg)
+            .expect("create AnytlsOutbound");
+
+        // 4. Connect stream targeting echo server
+        let target = TargetAddr::Ip(echo_addr);
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(15),
+            outbound.connect_stream(&target),
+        )
+        .await
+        .expect("connect_stream timeout")
+        .expect("connect_stream failed");
+
+        // 5. Write data, read echo
+        let test_data = b"hello from rust AnytlsOutbound via Go server!";
+        stream.write_all(test_data).await.expect("write");
+        stream.flush().await.expect("flush");
+
+        let mut buf = vec![0u8; test_data.len()];
+        match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf)).await {
+            Ok(Ok(_n)) => {}
+            Ok(Err(e)) => panic!("read echo failed: {:?}", e),
+            Err(_) => panic!("read echo timed out"),
+        }
+        assert_eq!(&buf, test_data, "echo should match sent data");
+
+        println!("Rust AnytlsOutbound ↔ Go server: TCP echo OK");
+
+        drop(stream);
+        let _ = go_child.kill();
+        let _ = go_child.wait();
+        _echo_handle.abort();
     }
 }
