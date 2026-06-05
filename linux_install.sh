@@ -187,6 +187,49 @@ generate_credentials() {
   log_info "已生成随机密码: ${PASSWORD}"
 }
 
+detect_available_port() {
+  log_step "检测可用端口..."
+
+  local preferred=443
+  local fallback_ports=(13431 8443 4443 54321)
+
+  if [[ -n "${PORT:-}" ]]; then
+    SHADOWQUIC_PORT="$PORT"
+    log_info "使用手动指定的端口: ${SHADOWQUIC_PORT}"
+    return
+  fi
+
+  check_udp_port_free() {
+    local port=$1
+    if command -v ss &>/dev/null; then
+      ss -uln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
+    elif command -v netstat &>/dev/null; then
+      netstat -uln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
+    fi
+    return 0
+  }
+
+  if check_udp_port_free "$preferred"; then
+    SHADOWQUIC_PORT="$preferred"
+    log_info "UDP ${preferred} 端口可用, 优先使用"
+    return
+  fi
+
+  log_warn "UDP ${preferred} 端口已被占用"
+
+  for port in "${fallback_ports[@]}"; do
+    if check_udp_port_free "$port"; then
+      SHADOWQUIC_PORT="$port"
+      log_info "使用备用端口: UDP ${port}"
+      return
+    fi
+    log_warn "UDP ${port} 端口已被占用"
+  done
+
+  log_error "所有候选端口均被占用, 请手动指定: PORT=12345 sudo bash linux_install.sh"
+  exit 1
+}
+
 detect_server_ip() {
   log_step "检测公网 IP..."
 
@@ -251,7 +294,6 @@ detect_server_ip() {
 write_server_config() {
   log_step "生成服务端配置文件..."
 
-  local shadowquic_port=13431
   local sni="www.apple.com"
   local idle_timeout=500
 
@@ -261,7 +303,7 @@ write_server_config() {
     "shadowquic_inbound": {
       "type": "shadowquic",
       "address": "0.0.0.0",
-      "port": ${shadowquic_port},
+      "port": ${SHADOWQUIC_PORT},
       "idle_timeout": ${idle_timeout},
       "gso": true,
       "tls": {
@@ -353,11 +395,13 @@ generate_subscription_url() {
   log_step "生成订阅链接..."
 
   local host="${SERVER_IP}"
-  local port=13431
+  local port="${SHADOWQUIC_PORT}"
   local sni="www.apple.com"
   local tag="QuicProxy-$(hostname 2>/dev/null || echo 'Server')"
+  local encoded_tag
+  encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${tag}', safe=''))" 2>/dev/null || echo "${tag}")
 
-  local sub_url="sq://${USERNAME}:${PASSWORD}@${host}:${port}?tag=${tag}&sni=${sni}&zero_rtt=true&idle_timeout=500"
+  local sub_url="sq://${USERNAME}:${PASSWORD}@${host}:${port}?sni=${sni}&zero_rtt=true&idle_timeout=500#${encoded_tag}"
 
   echo ""
   echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
@@ -414,6 +458,7 @@ main() {
 
   download_and_extract
   generate_credentials
+  detect_available_port
   detect_server_ip
   write_server_config
   install_systemd_service
