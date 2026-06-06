@@ -477,7 +477,6 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-ExecStartPre=/bin/sh -c 'echo "[quicproxy] 机器重启，订阅链接存放于 ${INSTALL_DIR}/subscription.txt" | systemd-cat -t quicproxy'
 ExecStart=${BIN_PATH} -c ${CONFIG_PATH}
 Restart=on-failure
 RestartSec=5

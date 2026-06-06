@@ -1,4 +1,4 @@
-use crate::cache::init_cache;
+use crate::cache::{init_cache, shutdown_cache};
 use crate::config::Config;
 use crate::proxy::inbound::init_inbounds;
 use crate::proxy::observe::init_observer;
@@ -53,6 +53,9 @@ where
     info!("Stopping inbound listeners...");
 
     InterfaceManager::shutdown();
+
+    // 必须在 abort 任务之前关闭缓存数据库，确保 redb 文件锁释放
+    shutdown_cache();
 
     shutdown::abort_all_and_wait().await;
 

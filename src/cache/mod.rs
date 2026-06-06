@@ -19,6 +19,11 @@ struct AnyCache {
     path: Option<String>,
 }
 
+/// 关闭所有缓存数据库，释放文件锁，避免进程重启时卡死。
+pub fn shutdown_cache() {
+    redb_store::shutdown_redb();
+}
+
 pub fn init_cache(cfg: &Config) -> anyhow::Result<()> {
     for (name, item) in cfg.cache.iter() {
         let cache_entry = AnyCache {

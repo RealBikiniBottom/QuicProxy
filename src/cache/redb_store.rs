@@ -10,6 +10,12 @@ pub struct RedbStore {
     db: Arc<Database>,
 }
 
+/// 显式关闭所有 redb 数据库，释放文件锁。
+/// 应在进程退出前调用，避免重启时因残留锁导致卡死。
+pub fn shutdown_redb() {
+    REDB_CACHE.clear();
+}
+
 #[allow(dead_code)]
 impl RedbStore {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
