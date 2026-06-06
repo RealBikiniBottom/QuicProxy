@@ -33,6 +33,10 @@ pub async fn init_geoip(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn shutdown_geoip() {
+    GEOIP_MAP.clear();
+}
+
 pub fn get_geoip_by_tag(tag: &str) -> Result<Arc<Geoip>> {
     match GEOIP_MAP.get(tag) {
         Some(r) => Ok(r.clone()),

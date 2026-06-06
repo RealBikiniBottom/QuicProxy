@@ -150,5 +150,5 @@ pub fn sha256(bytes: &[u8]) -> Vec<u8> {
 pub fn md5(bytes: &[u8]) -> Vec<u8> {
     let mut hasher = md5::Context::new();
     hasher.consume(bytes);
-    hasher.compute().to_vec()
+    hasher.finalize().to_vec()
 }

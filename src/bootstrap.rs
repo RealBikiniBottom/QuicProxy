@@ -3,13 +3,13 @@ use crate::config::Config;
 use crate::proxy::inbound::init_inbounds;
 use crate::proxy::observe::init_observer;
 use crate::proxy::outbound::init_outbounds;
-use crate::proxy::router::geoip::init_geoip;
-use crate::proxy::router::geoip_db::init_geoip_db;
+use crate::proxy::router::geoip::{init_geoip, shutdown_geoip};
+use crate::proxy::router::geoip_db::{init_geoip_db, shutdown_geoip_db};
 use crate::proxy::router::init_router;
 use crate::utils::interface::InterfaceManager;
 use crate::utils::logging;
 use crate::utils::shutdown;
-use crate::{api::init_api, dns::init_dns};
+use crate::{api::init_api, dns::{init_dns, shutdown_dns}};
 use anyhow::{Context, Result};
 use std::future::Future;
 use tracing::{debug, error, info};
@@ -54,10 +54,14 @@ where
 
     InterfaceManager::shutdown();
 
-    // 必须在 abort 任务之前关闭缓存数据库，确保 redb 文件锁释放
-    shutdown_cache();
-
     shutdown::abort_all_and_wait().await;
+
+    // 先清空所有持有 RedbStore → Arc<Database> 引用的静态变量
+    shutdown_dns();
+    shutdown_geoip();
+    shutdown_geoip_db();
+    // 再清空 REDB_CACHE，此时 Database 引用计数归零，flock 释放
+    shutdown_cache();
 
     info!("All Exited.");
     Ok(())

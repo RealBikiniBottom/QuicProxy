@@ -10,8 +10,8 @@ pub struct RedbStore {
     db: Arc<Database>,
 }
 
-/// 显式关闭所有 redb 数据库，释放文件锁。
-/// 应在进程退出前调用，避免重启时因残留锁导致卡死。
+/// 显式关闭并释放所有 redb 数据库连接。
+/// 调用前应确保所有持有 RedbStore 的静态变量（如 DNS_MAP）已被清空。
 pub fn shutdown_redb() {
     REDB_CACHE.clear();
 }

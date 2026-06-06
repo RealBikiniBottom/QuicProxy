@@ -66,6 +66,12 @@ pub fn init_dns(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// 关闭所有 DNS 服务器并清空 DNS 缓存，释放底层的 redb 数据库引用。
+/// 应在进程退出前调用，确保 redb 文件锁能被正常释放。
+pub fn shutdown_dns() {
+    DNS_MAP.clear();
+}
+
 pub fn get_dns_by_tag(tag: &str) -> Result<Arc<dyn AnyDNS>> {
     match DNS_MAP.get(tag) {
         Some(r) => Ok(r.clone()),

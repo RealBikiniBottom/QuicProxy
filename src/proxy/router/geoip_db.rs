@@ -39,6 +39,10 @@ pub async fn init_geoip_db(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+pub fn shutdown_geoip_db() {
+    GEOIP_DB_MAP.clear();
+}
+
 pub fn get_geoip_db_by_tag(tag: &str) -> Result<Arc<GeoipDB>> {
     match GEOIP_DB_MAP.get(tag) {
         Some(r) => Ok(r.clone()),

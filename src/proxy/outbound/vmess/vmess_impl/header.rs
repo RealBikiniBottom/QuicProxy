@@ -96,7 +96,7 @@ fn aes_gcm_encrypt(
     plaintext: &[u8],
     associated_data: Option<&[u8]>,
 ) -> anyhow::Result<Vec<u8>> {
-    use aes_gcm::aead::{Aead, OsRng};
+    use aes_gcm::aead::Aead;
     use aes_gcm::KeyInit;
 
     let cipher = aes_gcm::Aes128Gcm::new_from_slice(key)
