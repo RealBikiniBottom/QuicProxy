@@ -1,17 +1,15 @@
 pub mod vmess_impl;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::config::OutboundConfig;
-use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, LazyHandshakeStream, PacketInfo};
+use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo};
 use crate::proxy::{SourceAddr, TargetAddr};
 use crate::utils::new_io_other_error;
 
@@ -26,7 +24,6 @@ pub struct VmessOutbound {
     uuid: String,
     alter_id: u16,
     security: String,
-    udp: bool,
     connect_timeout: Duration,
     dns_server_name: Option<String>,
     bind_interface: Option<String>,
@@ -59,15 +56,12 @@ impl VmessOutbound {
             .clone()
             .unwrap_or_else(|| "auto".to_string());
 
-        let udp = true;
-
         Ok(Arc::new(Self {
             tag,
             server,
             uuid,
             alter_id,
             security,
-            udp,
             connect_timeout: Duration::from_secs(cfg.connect_timeout.unwrap_or(30)),
             dns_server_name: cfg.dns.clone(),
             bind_interface: cfg.bind_interface.clone(),

@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use crate::{
     config::OutboundConfig,
     proxy::{
-        QuicTlsConfig, SessionCloser, SourceAddr, TargetAddr,
+        TlsConfig, SessionCloser, SourceAddr, TargetAddr,
         anytls_proto::*,
         outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo, select_outbound_interface},
     },
@@ -118,8 +118,14 @@ impl PaddingScheme {
                 continue;
             }
             if let Some(dash_pos) = part.find('-') {
-                let min: usize = part[..dash_pos].trim().parse().context("invalid padding min")?;
-                let max: usize = part[dash_pos + 1..].trim().parse().context("invalid padding max")?;
+                let min: usize = part[..dash_pos]
+                    .trim()
+                    .parse()
+                    .context("invalid padding min")?;
+                let max: usize = part[dash_pos + 1..]
+                    .trim()
+                    .parse()
+                    .context("invalid padding max")?;
                 let (min, max) = (min.min(max), min.max(max));
                 if min <= 0 || max <= 0 {
                     continue;
@@ -344,20 +350,18 @@ impl Session {
                     }
                     return Err(new_io_other_error(format!("server alert: {}", msg)).into());
                 }
-                Command::UpdatePaddingScheme => {
-                    match PaddingScheme::parse(&data) {
-                        Ok(new_scheme) => {
-                            debug!("Anytls session {} updated padding scheme", self.session_seq);
-                            *self.padding_scheme.lock().await = new_scheme;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Anytls session {} invalid padding scheme: {:?}",
-                                self.session_seq, e
-                            );
-                        }
+                Command::UpdatePaddingScheme => match PaddingScheme::parse(&data) {
+                    Ok(new_scheme) => {
+                        debug!("Anytls session {} updated padding scheme", self.session_seq);
+                        *self.padding_scheme.lock().await = new_scheme;
                     }
-                }
+                    Err(e) => {
+                        warn!(
+                            "Anytls session {} invalid padding scheme: {:?}",
+                            self.session_seq, e
+                        );
+                    }
+                },
                 Command::HeartRequest => {
                     // Send heart response via write channel
                     let _ = self
@@ -578,7 +582,7 @@ impl AnytlsClient {
     pub fn new(
         address: TargetAddr,
         password: &str,
-        tls: &QuicTlsConfig,
+        tls: &TlsConfig,
         connect_timeout: Duration,
         bind_interface: Option<String>,
         dns_server_name: Option<String>,
@@ -624,8 +628,9 @@ impl AnytlsClient {
         })
     }
 
-    fn build_tls_client_config(tls: &QuicTlsConfig) -> Result<rustls::ClientConfig> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+    fn build_tls_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig> {
+        let _ = rustls::crypto::ring::default_provider()
+            .install_default();
 
         if !tls.insecure {
             let mut root_store = rustls::RootCertStore::empty();
@@ -789,8 +794,7 @@ impl AnytlsUdpSocket {
                 if self.is_connect {
                     // Connect mode: length(u16) + data
                     if buf.len() >= 2 {
-                        let payload_len =
-                            u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                        let payload_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
                         let total_needed = 2 + payload_len;
                         if buf.len() >= total_needed {
                             let msg = Bytes::copy_from_slice(&buf[..total_needed]);
@@ -804,7 +808,8 @@ impl AnytlsUdpSocket {
                         if let Ok((_, target_len)) = uot_decode_target(&buf) {
                             if buf.len() >= target_len + 2 {
                                 let payload_len =
-                                    u16::from_be_bytes([buf[target_len], buf[target_len + 1]]) as usize;
+                                    u16::from_be_bytes([buf[target_len], buf[target_len + 1]])
+                                        as usize;
                                 let total_needed = target_len + 2 + payload_len;
                                 if buf.len() >= total_needed {
                                     let msg = Bytes::copy_from_slice(&buf[..total_needed]);
@@ -877,8 +882,7 @@ impl AnyPacket for AnytlsUdpSocket {
             if data.len() < 2 {
                 bail!("UoT connect packet too short");
             }
-            let payload_len =
-                u16::from_be_bytes([data[0], data[1]]) as usize;
+            let payload_len = u16::from_be_bytes([data[0], data[1]]) as usize;
             if data.len() < 2 + payload_len {
                 bail!("UoT connect packet too short for payload");
             }
@@ -894,7 +898,8 @@ impl AnyPacket for AnytlsUdpSocket {
             if data.len() < target_len + 2 + payload_len {
                 bail!("UoT packet too short for payload");
             }
-            let payload = Bytes::copy_from_slice(&data[target_len + 2..target_len + 2 + payload_len]);
+            let payload =
+                Bytes::copy_from_slice(&data[target_len + 2..target_len + 2 + payload_len]);
             Ok((TargetAddr::dummy(), target, payload))
         }
     }
@@ -930,7 +935,7 @@ impl AnytlsOutbound {
             .clone()
             .context(format!("anytls outbound '{}' requires password", tag))?;
 
-        let tls = QuicTlsConfig::from_outbound(cfg)?;
+        let tls = TlsConfig::from_outbound(cfg)?;
         let connect_timeout = Duration::from_secs(cfg.connect_timeout.unwrap_or(30));
 
         let client = AnytlsClient::new(
@@ -1037,7 +1042,9 @@ impl AnyOutbound for AnytlsOutbound {
             .send((stream_id, Command::Psh as u8, Bytes::from(uot_request)))
             .context("session write channel closed")?;
 
-        Ok(Arc::new(AnytlsUdpSocket::new(stream_id, session, event_rx, false)))
+        Ok(Arc::new(AnytlsUdpSocket::new(
+            stream_id, session, event_rx, false,
+        )))
     }
 
     async fn retry_connect_stream(&self, target: &TargetAddr) -> Result<AnyStream> {
@@ -1263,7 +1270,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::QuicTlsConfig;
+    use crate::proxy::TlsConfig;
     use sha2::{Digest, Sha256};
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -1483,8 +1490,8 @@ mod tests {
 
     /// Create a TLS client config for testing
     #[allow(dead_code)]
-    fn test_tls_client_config(_client_cfg: rustls::ClientConfig) -> QuicTlsConfig {
-        QuicTlsConfig {
+    fn test_tls_client_config(_client_cfg: rustls::ClientConfig) -> TlsConfig {
+        TlsConfig {
             enable: true,
             insecure: false,
             zero_rtt: false,
@@ -1610,7 +1617,7 @@ mod tests {
 
         // Create AnytlsClient
         let address = TargetAddr::Ip(server_addr);
-        let tls_cfg = QuicTlsConfig {
+        let tls_cfg = TlsConfig {
             enable: true,
             insecure: false,
             zero_rtt: false,
@@ -1862,12 +1869,7 @@ mod tests {
     /// The server auto-generates TLS cert and proxies to any destination.
     async fn start_go_server(port: u16, password: &str) -> std::process::Child {
         let mut cmd = std::process::Command::new(GO_SERVER_PATH);
-        cmd.args([
-            "-l",
-            &format!("127.0.0.1:{}", port),
-            "-p",
-            password,
-        ]);
+        cmd.args(["-l", &format!("127.0.0.1:{}", port), "-p", password]);
         cmd.env("LOG_LEVEL", "info");
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
@@ -1933,7 +1935,9 @@ mod tests {
 
     /// Run a simple UDP echo server that echoes all data back.
     async fn spawn_udp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind udp echo");
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind udp echo");
         let addr = socket.local_addr().expect("udp echo addr");
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -2080,12 +2084,7 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let _ = tokio::time::timeout(
                 Duration::from_secs(30),
-                mock_anytls_server_strip_target(
-                    listener,
-                    phash,
-                    acceptor,
-                    oneshot::channel().0,
-                ),
+                mock_anytls_server_strip_target(listener, phash, acceptor, oneshot::channel().0),
             )
             .await;
         });
@@ -2123,7 +2122,9 @@ mod tests {
             .expect("SOCKS5 connect to Go client");
 
         // SOCKS5 greeting: no auth
-        sock.write_all(&[0x05, 0x01, 0x00]).await.expect("SOCKS5 hello");
+        sock.write_all(&[0x05, 0x01, 0x00])
+            .await
+            .expect("SOCKS5 hello");
         let mut resp = [0u8; 2];
         sock.read_exact(&mut resp).await.expect("SOCKS5 auth resp");
         assert_eq!(resp, [0x05, 0x00], "SOCKS5 no-auth accepted");
@@ -2163,8 +2164,11 @@ mod tests {
         let mut total = 0;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while total < test_data.len() {
-            match tokio::time::timeout_at(deadline, AsyncReadExt::read(&mut sock, &mut buf[total..]))
-                .await
+            match tokio::time::timeout_at(
+                deadline,
+                AsyncReadExt::read(&mut sock, &mut buf[total..]),
+            )
+            .await
             {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => total += n,
@@ -2260,13 +2264,11 @@ mod tests {
 
         // 4. Connect stream targeting echo server
         let target = TargetAddr::Ip(echo_addr);
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(15),
-            outbound.connect_stream(&target),
-        )
-        .await
-        .expect("connect_stream timeout")
-        .expect("connect_stream failed");
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(15), outbound.connect_stream(&target))
+                .await
+                .expect("connect_stream timeout")
+                .expect("connect_stream failed");
 
         // 5. Write data, read echo
         let test_data = b"hello from rust AnytlsOutbound via Go server!";
@@ -2355,13 +2357,11 @@ mod tests {
 
         // 4. Connect packet targeting echo server
         let target = TargetAddr::Ip(echo_addr);
-        let udp_socket = tokio::time::timeout(
-            Duration::from_secs(15),
-            outbound.connect_packet(&target),
-        )
-        .await
-        .expect("connect_packet timeout")
-        .expect("connect_packet failed");
+        let udp_socket =
+            tokio::time::timeout(Duration::from_secs(15), outbound.connect_packet(&target))
+                .await
+                .expect("connect_packet timeout")
+                .expect("connect_packet failed");
 
         // 5. Send data
         let test_data = b"hello UDP from rust AnytlsOutbound via Go server!";

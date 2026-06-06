@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 
 use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::{debug, error};
+use tracing::debug;
 
 use crate::proxy::TargetAddr;
 use crate::proxy::outbound::{AnyStream, PacketInfo};
@@ -80,7 +80,7 @@ impl futures::Sink<(TargetAddr, bytes::Bytes)> for OutboundDatagramVmess {
 
         let pkt_container = pkt;
 
-        if let &mut Some((ref pkt_target, ref data)) = pkt_container {
+        if let &mut Some((ref _pkt_target, ref data)) = pkt_container {
             // For vmess UDP, the target address is encoded in the data since
             // the connection is already established with a specific target
             if written.is_none() {

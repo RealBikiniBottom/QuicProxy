@@ -165,7 +165,7 @@ impl fmt::Display for TargetAddr {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct QuicTlsConfig {
+pub struct TlsConfig {
     pub enable: bool,
     pub insecure: bool,
     pub zero_rtt: bool,
@@ -186,7 +186,7 @@ fn validate_jls(enable: bool, username: &str, password: &str) -> Result<()> {
     Ok(())
 }
 
-impl QuicTlsConfig {
+impl TlsConfig {
     pub fn from_inbound(config: &InboundConfig) -> Result<Self> {
         let tls = config.tls.as_ref();
 

@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use crate::config::OutboundConfig;
 use crate::proxy::outbound::{AnyOutbound, AnyStream, UdpMode};
-use crate::proxy::{QuicTlsConfig, TargetAddr};
+use crate::proxy::{TlsConfig, TargetAddr};
 
 use crate::utils::{format_duration, new_io_other_error};
 
@@ -29,7 +29,7 @@ pub struct ShadowQuicOutbound {
     address: TargetAddr,
 
     auth_hash: Option<[u8; 64]>,
-    tls: QuicTlsConfig,
+    tls: TlsConfig,
 
     dns_server_name: Option<String>,
     bind_interface: Option<String>,
@@ -60,7 +60,7 @@ impl ShadowQuicOutbound {
         let connect_timeout = Duration::from_secs(cfg.connect_timeout.unwrap_or(30));
         let idle_timeout = Duration::from_secs(cfg.idle_timeout.unwrap_or(30));
 
-        let tls = QuicTlsConfig::from_outbound(cfg)?;
+        let tls = TlsConfig::from_outbound(cfg)?;
 
         let mut udp_mod = UdpMode::OverStream;
         if cfg.udp_mod.clone().unwrap_or("stream".to_string()) == "datagram" {

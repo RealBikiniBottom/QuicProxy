@@ -31,7 +31,7 @@ macro_rules! impl_hmac_kdf {
             pub fn new(mut hasher: $inner, key: &[u8]) -> Self {
                 let mut ikey = [0u8; BLOCK_LEN];
                 let mut okey = [0u8; BLOCK_LEN];
-                let mut hasher_outer = hasher.clone();
+                let hasher_outer = hasher.clone();
                 if key.len() > BLOCK_LEN {
                     hasher.update(key);
                     let hkey = digest_bytes(&mut hasher);
@@ -75,16 +75,8 @@ macro_rules! impl_hmac_kdf {
 }
 
 fn digest_bytes(h: &mut HmacSha256) -> Vec<u8> {
-    let mut h_clone = h.clone();
+    let h_clone = h.clone();
     h_clone.finalize().into_bytes().to_vec()
-}
-
-fn digest_bytes_vmess_kdf1(h: &mut VmessKdf1) -> Vec<u8> {
-    let mut h_clone = h.clone();
-    h_clone.hasher.update(&[0u8; 0]);
-    // Take ownership of hasher to finalize
-    let result = std::mem::replace(h, unsafe { std::mem::zeroed() });
-    result.hasher.finalize().into_bytes().to_vec()
 }
 
 impl_hmac_kdf!(VmessKdf1, HmacSha256);
@@ -103,7 +95,7 @@ impl VmessKdf2 {
     pub fn new(mut hasher: VmessKdf1, key: &[u8]) -> Self {
         let mut ikey = [0u8; BLOCK_LEN];
         let mut okey = [0u8; BLOCK_LEN];
-        let mut hasher_outer = hasher.clone();
+        let hasher_outer = hasher.clone();
         if key.len() > BLOCK_LEN {
             hasher.update(key);
             let hkey = hasher.clone().finalize();
@@ -152,7 +144,7 @@ impl VmessKdf3 {
     pub fn new(mut hasher: VmessKdf2, key: &[u8]) -> Self {
         let mut ikey = [0u8; BLOCK_LEN];
         let mut okey = [0u8; BLOCK_LEN];
-        let mut hasher_outer = hasher.clone();
+        let hasher_outer = hasher.clone();
         if key.len() > BLOCK_LEN {
             hasher.update(key);
             let hkey = hasher.clone().finalize();

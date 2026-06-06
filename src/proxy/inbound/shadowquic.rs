@@ -16,7 +16,7 @@ use crate::proxy::shadowquic_udp::{
     gen_sunny_auth_hash, read_context_id, read_request_head, run_bistream_recv_listener,
     start_datagram_loop, start_udp_session_cleaner, start_unistream_listener,
 };
-use crate::proxy::{QuicTlsConfig, TargetAddr};
+use crate::proxy::{TlsConfig, TargetAddr};
 use anyhow::Context;
 
 use crate::utils::keyed_notify::KeyedNotify;
@@ -30,7 +30,7 @@ pub struct ShadowQuicInbound {
     tag: String,
     address: String,
     port: u16,
-    tls: QuicTlsConfig,
+    tls: TlsConfig,
     auth_hash: Option<[u8; 64]>,
     enable_gso: bool,
     enable_mtudis: bool,
@@ -43,7 +43,7 @@ pub struct ShadowQuicInbound {
 
 impl ShadowQuicInbound {
     pub fn new(tag: String, cfg: &InboundConfig) -> anyhow::Result<Self> {
-        let tls = QuicTlsConfig::from_inbound(cfg)?;
+        let tls = TlsConfig::from_inbound(cfg)?;
 
         if !tls.enable && !tls.enable_jls {
             anyhow::bail!("ShadowQuic inbound requires TLS to be enabled");

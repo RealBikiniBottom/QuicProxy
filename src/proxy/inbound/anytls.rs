@@ -1,5 +1,5 @@
 use crate::config::InboundConfig;
-use crate::proxy::QuicTlsConfig;
+use crate::proxy::TlsConfig;
 use crate::proxy::anytls_proto::*;
 use crate::proxy::outbound::{AnyPacket, PacketInfo};
 use crate::proxy::router::{Router, get_router};
@@ -668,7 +668,7 @@ pub struct AnytlsInbound {
     address: SocketAddr,
     idle_timeout: Duration,
     password_hash: [u8; 32],
-    tls: QuicTlsConfig,
+    tls: TlsConfig,
 }
 
 impl AnytlsInbound {
@@ -678,7 +678,7 @@ impl AnytlsInbound {
         hasher.update(password.as_bytes());
         let password_hash: [u8; 32] = hasher.finalize().into();
 
-        let tls = QuicTlsConfig::from_inbound(cfg)?;
+        let tls = TlsConfig::from_inbound(cfg)?;
 
         let address: SocketAddr = format!(
             "{}:{}",

@@ -58,7 +58,8 @@ tun-rs = { version = "2", features = ["async", "async_framed", "utun_fd"], optio
 netdev = "0.43"
 etherparse = "0.13"
 libc = "0.2.180"
-tokio-rustls = "0.26.4"
+# tokio-rustls = "0.26.4"
+tokio-rustls = { git = "https://github.com/spongebob888/tokio-rustls", branch="jls-dev", features=["ring"]}
 anyhow = { version = "1.0.101", features = ["backtrace"] }
 tracing-error = "0.2"
 redb = "3.1.0"

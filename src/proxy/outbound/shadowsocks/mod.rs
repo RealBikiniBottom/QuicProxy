@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use futures::{SinkExt, StreamExt};
 use shadowsocks::{
     ProxyClientStream, ProxySocket, ServerConfig, config::ServerType, context::Context as SsContext,
     relay::udprelay::proxy_socket::UdpSocketType,
