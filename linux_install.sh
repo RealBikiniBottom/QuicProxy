@@ -510,24 +510,30 @@ generate_subscription_url() {
   local host="${SERVER_IP}"
   local port="${SHADOWQUIC_PORT}"
   local sni="www.apple.com"
-  local tag="QuicProxy-$(hostname 2>/dev/null || echo 'Server')"
-  local encoded_tag
-  encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${tag}', safe=''))" 2>/dev/null || echo "${tag}")
+  local base_tag="$(hostname 2>/dev/null || echo 'Server')"
 
   local anytls_enabled=false
   local sq_enabled=false
   [[ "${ENABLE_ANYTLS:-yes}" == "yes" ]] && anytls_enabled=true
   [[ "${ENABLE_SHADOWQUIC:-yes}" == "yes" ]] && sq_enabled=true
 
+  local node_num=1
   local sq_url=""
   local anytls_url=""
 
   if $sq_enabled; then
+    local sq_tag
+    sq_tag=$(printf "%02d-%s" "${node_num}" "${base_tag}")
+    node_num=$((node_num + 1))
+    local encoded_tag
+    encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${sq_tag}', safe=''))" 2>/dev/null || echo "${sq_tag}")
     sq_url="sq://${USERNAME}:${PASSWORD}@${host}:${port}?sni=${sni}&zero_rtt=true&idle_timeout=500#${encoded_tag}"
   fi
 
   if $anytls_enabled; then
-    local anytls_tag="${tag// /-}"
+    local anytls_tag
+    anytls_tag=$(printf "%02d-%s" "${node_num}" "${base_tag}")
+    node_num=$((node_num + 1))
     local anytls_encoded_tag
     anytls_encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${anytls_tag}', safe=''))" 2>/dev/null || echo "${anytls_tag}")
     anytls_url="anytls://${PASSWORD}@${host}:${port}?sni=${sni}&jls_username=${USERNAME}&jls_password=${PASSWORD}&insecure=false#${anytls_encoded_tag}"
