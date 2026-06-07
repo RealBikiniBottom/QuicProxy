@@ -27,7 +27,6 @@ impl RedbStore {
             match parent.canonicalize() {
                 Ok(p) => p.join(path.file_name().unwrap_or_default()),
                 Err(_) => {
-                    // Parent doesn't exist or error, fallback to cwd join
                     if let Ok(cwd) = std::env::current_dir() {
                         cwd.join(path)
                     } else {
@@ -36,19 +35,49 @@ impl RedbStore {
                 }
             }
         } else {
-            // No parent (just filename), use cwd
             if let Ok(cwd) = std::env::current_dir() {
                 cwd.join(path)
             } else {
                 path.to_path_buf()
             }
         };
-
         if let Some(db) = REDB_CACHE.get(&key) {
             return Ok(Self { db: db.clone() });
         }
 
-        let db = redb::Builder::new().set_cache_size(0).create(path)?;
+        // redb 在 Linux 上使用 flock，正常退出时通过 shutdown_cache() → REDB_CACHE.clear()
+        // 释放所有 Database 引用，lock 会被释放。以下超时机制仅作为保险：
+        // 应对 SIGKILL / panic 在 shutdown 之前 / OOM killer 等极端情况下残留的文件锁。
+        let path_owned = key.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = redb::Builder::new().set_cache_size(0)
+                .create(&path_owned);
+            let _ = tx.send(result);
+        });
+
+        let db = match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(Ok(db)) => db,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    "redb database {:?} is locked by another process. \
+                     If no other instance is running, delete this file manually.",
+                    path
+                );
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("redb database {:?} is locked by another process. \
+                             If no other instance is running, delete this file manually.", path),
+                )));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "redb worker thread panicked",
+                )));
+            }
+        };
 
         let arc_db = Arc::new(db);
         REDB_CACHE.insert(key, arc_db.clone());

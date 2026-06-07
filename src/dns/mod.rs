@@ -55,14 +55,14 @@ pub fn init_dns(cfg: &Config) -> Result<()> {
             )?,
     };
 
-    match DNS_MAP.get(&final_tag) {
-        Some(default_outbound) => {
-            DNS_MAP.insert("default_server".to_string(), default_outbound.clone());
-        }
+    // 先 clone 再 drop Ref（释放 DashMap 读锁），避免 insert 时获取写锁死锁
+    let default_dns = match DNS_MAP.get(&final_tag) {
+        Some(o) => o.clone(),
         None => {
             bail!("Final dns tag '{}' not found in servers config", final_tag);
         }
-    }
+    };
+    DNS_MAP.insert("default_server".to_string(), default_dns);
     Ok(())
 }
 

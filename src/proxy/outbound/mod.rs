@@ -1,3 +1,4 @@
+pub mod anytls;
 pub mod direct;
 pub mod dns;
 pub mod http;
@@ -8,9 +9,9 @@ pub mod shadowsocks;
 pub mod socks5;
 pub mod trojan;
 pub mod vmess;
-pub mod anytls;
 
 use anyhow::{Context, bail};
+use anytls::AnytlsOutbound;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use direct::DirectOutbound;
@@ -19,8 +20,6 @@ use selector::SelectorOutbound;
 use shadowquic::ShadowQuicOutbound;
 use shadowsocks::ShadowsocksOutbound;
 use socks5::Socks5Outbound;
-use anytls::AnytlsOutbound;
-use vmess::VmessOutbound;
 use std::io;
 use std::io::IoSlice;
 use std::net::{IpAddr, SocketAddr};
@@ -34,6 +33,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, Sender};
 use trojan::TrojanOutbound;
+use vmess::VmessOutbound;
 
 use crate::config::Config;
 use crate::dns::resolve_target;
@@ -100,17 +100,17 @@ pub fn init_outbounds(cfg: &Config) -> anyhow::Result<()> {
             )?,
     };
 
-    match OUTBOUNDS_MAP.get(&final_tag) {
-        Some(default_outbound) => {
-            OUTBOUNDS_MAP.insert("default_server".to_string(), default_outbound.clone());
-        }
+    // 先 clone 再 drop Ref（释放 DashMap 读锁），避免 insert 时获取写锁死锁
+    let default_outbound = match OUTBOUNDS_MAP.get(&final_tag) {
+        Some(o) => o.clone(),
         None => {
             bail!(
                 "Final outbound tag '{}' not found in servers config",
                 final_tag
             );
         }
-    }
+    };
+    OUTBOUNDS_MAP.insert("default_server".to_string(), default_outbound);
     Ok(())
 }
 
