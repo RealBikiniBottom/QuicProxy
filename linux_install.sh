@@ -252,6 +252,41 @@ prompt_install_options() {
   log_info "已选择: ${parts[*]}"
 }
 
+check_udp_port_free() {
+  local port=$1
+  if command -v ss &>/dev/null; then
+    ss -uln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
+  elif command -v netstat &>/dev/null; then
+    netstat -uln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
+  fi
+  return 0
+}
+
+check_tcp_port_free() {
+  local port=$1
+  if command -v ss &>/dev/null; then
+    ss -tln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
+  elif command -v netstat &>/dev/null; then
+    netstat -tln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
+  fi
+  return 0
+}
+
+port_is_ok() {
+  local port=$1
+  local ok=true
+  if [[ "${ENABLE_SHADOWQUIC:-}" == "yes" ]]; then
+    check_udp_port_free "$port" || ok=false
+  fi
+  if [[ "${ENABLE_ANYTLS:-}" == "yes" ]]; then
+    check_tcp_port_free "$port" || ok=false
+  fi
+  if [[ "${ENABLE_TROJAN:-}" == "yes" ]]; then
+    check_tcp_port_free "$port" || ok=false
+  fi
+  [[ "$ok" == true ]]
+}
+
 detect_available_port() {
   log_step "检测可用端口..."
 
@@ -259,65 +294,52 @@ detect_available_port() {
   local fallback_ports=(13431 8443 4443 54321)
 
   if [[ -n "${PORT:-}" ]]; then
-    SHADOWQUIC_PORT="$PORT"
-    log_info "使用手动指定的端口: ${SHADOWQUIC_PORT}"
-    return
+    SQ_PORT="$PORT"
+    ANYTLS_PORT="$PORT"
+    TROJAN_PORT="$PORT"
+    log_info "使用手动指定的端口: ${SQ_PORT}"
+  else
+    local found_port=""
+    if port_is_ok "$preferred"; then
+      found_port="$preferred"
+      log_info "端口 ${preferred} 可用, 优先使用"
+    else
+      log_warn "端口 ${preferred} 已被占用"
+      for port in "${fallback_ports[@]}"; do
+        if port_is_ok "$port"; then
+          found_port="$port"
+          log_info "使用备用端口: ${port}"
+          break
+        fi
+        log_warn "端口 ${port} 已被占用"
+      done
+    fi
+
+    if [[ -z "$found_port" ]]; then
+      log_error "所有候选端口均被占用, 请手动指定: PORT=12345 sudo bash linux_install.sh"
+      exit 1
+    fi
+
+    SQ_PORT="$found_port"
+    ANYTLS_PORT="$found_port"
+    TROJAN_PORT="$found_port"
   fi
 
-  check_udp_port_free() {
-    local port=$1
-    if command -v ss &>/dev/null; then
-      ss -uln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
-    elif command -v netstat &>/dev/null; then
-      netstat -uln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
+  # anytls 和 trojan 都是 TCP，不能共用同一端口
+  if [[ "${ENABLE_ANYTLS:-}" == "yes" ]] && [[ "${ENABLE_TROJAN:-}" == "yes" ]]; then
+    for offset in 1 2 3 11 21 31 41 51; do
+      local candidate=$((SQ_PORT + offset))
+      if check_tcp_port_free "$candidate"; then
+        TROJAN_PORT="$candidate"
+        log_info "anytls(TCP) → ${ANYTLS_PORT}, trojan(TCP) → ${TROJAN_PORT}"
+        break
+      fi
+    done
+    if [[ "$TROJAN_PORT" == "$ANYTLS_PORT" ]]; then
+      log_error "无法为 trojan 找到额外的可用 TCP 端口 (尝试了 ${SQ_PORT}+1~51)"
+      exit 1
     fi
-    return 0
-  }
-
-  check_tcp_port_free() {
-    local port=$1
-    if command -v ss &>/dev/null; then
-      ss -tln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
-    elif command -v netstat &>/dev/null; then
-      netstat -tln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
-    fi
-    return 0
-  }
-
-  port_is_ok() {
-    local port=$1
-    local ok=true
-    if [[ "${ENABLE_SHADOWQUIC:-}" == "yes" ]]; then
-      check_udp_port_free "$port" || ok=false
-    fi
-    if [[ "${ENABLE_ANYTLS:-}" == "yes" ]]; then
-      check_tcp_port_free "$port" || ok=false
-    fi
-    if [[ "${ENABLE_TROJAN:-}" == "yes" ]]; then
-      check_tcp_port_free "$port" || ok=false
-    fi
-    [[ "$ok" == true ]]
-  }
-
-  if port_is_ok "$preferred"; then
-    SHADOWQUIC_PORT="$preferred"
-    log_info "端口 ${preferred} 可用, 优先使用"
-    return
   fi
-
-  log_warn "端口 ${preferred} 已被占用"
-
-  for port in "${fallback_ports[@]}"; do
-    if port_is_ok "$port"; then
-      SHADOWQUIC_PORT="$port"
-      log_info "使用备用端口: ${port}"
-      return
-    fi
-    log_warn "端口 ${port} 已被占用"
-  done
-
-  log_error "所有候选端口均被占用, 请手动指定: PORT=12345 sudo bash linux_install.sh"
-  exit 1
 }
 
 detect_server_ip() {
@@ -420,7 +442,7 @@ write_server_config() {
   [[ "${ENABLE_ANYTLS:-yes}" == "yes" ]] && anytls_enabled=true
   [[ "${ENABLE_TROJAN:-yes}" == "yes" ]] && trojan_enabled=true
 
-  local port="${SHADOWQUIC_PORT}"
+  local port="${SQ_PORT}"
 
   # 计算启用的协议列表，用于逗号控制
   local enabled=()
@@ -465,7 +487,7 @@ JSON5EOF
     "anytls_inbound": {
       "type": "anytls",
       "address": "0.0.0.0",
-      "port": ${port},
+      "port": ${ANYTLS_PORT},
       "password": "${PASSWORD}",
       "idle_timeout": ${idle_timeout},
       "tls": {
@@ -485,7 +507,7 @@ JSON5EOF
     "trojan_inbound": {
       "type": "trojan",
       "address": "0.0.0.0",
-      "port": ${port},
+      "port": ${TROJAN_PORT},
       "password": "${PASSWORD}",
       "idle_timeout": ${idle_timeout},
       "transport": {
@@ -580,7 +602,6 @@ generate_subscription_url() {
   log_step "生成订阅链接..."
 
   local host="${SERVER_IP}"
-  local port="${SHADOWQUIC_PORT}"
   local sni="www.apple.com"
 
   local anytls_enabled=false
@@ -601,7 +622,7 @@ generate_subscription_url() {
     node_num=$((node_num + 1))
     local encoded_tag
     encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${sq_tag}', safe=''))" 2>/dev/null || echo "${sq_tag}")
-    sq_url="sq://${USERNAME}:${PASSWORD}@${host}:${port}?sni=${sni}&zero_rtt=true&idle_timeout=500#${encoded_tag}"
+    sq_url="sq://${USERNAME}:${PASSWORD}@${host}:${SQ_PORT}?sni=${sni}&zero_rtt=true&idle_timeout=500#${encoded_tag}"
   fi
 
   if $anytls_enabled; then
@@ -610,7 +631,7 @@ generate_subscription_url() {
     node_num=$((node_num + 1))
     local anytls_encoded_tag
     anytls_encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${anytls_tag}', safe=''))" 2>/dev/null || echo "${anytls_tag}")
-    anytls_url="anytls://${PASSWORD}@${host}:${port}?sni=${sni}&insecure=true#${anytls_encoded_tag}"
+    anytls_url="anytls://${PASSWORD}@${host}:${ANYTLS_PORT}?sni=${sni}&insecure=true#${anytls_encoded_tag}"
   fi
 
   if $trojan_enabled; then
@@ -619,7 +640,7 @@ generate_subscription_url() {
     node_num=$((node_num + 1))
     local trojan_encoded_tag
     trojan_encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${trojan_tag}', safe=''))" 2>/dev/null || echo "${trojan_tag}")
-    trojan_url="trojan://${PASSWORD}@${host}:${port}?sni=${sni}&type=tcp#${trojan_encoded_tag}"
+    trojan_url="trojan://${PASSWORD}@${host}:${TROJAN_PORT}?sni=${sni}&type=tcp#${trojan_encoded_tag}"
   fi
 
   # 将订阅写入文件，方便之后查看、systemd 日志也会引用这个路径
