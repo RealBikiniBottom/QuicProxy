@@ -67,6 +67,37 @@ build-android:
 	rustup target add aarch64-linux-android armv7-linux-androideabi
 	cargo ndk -t arm64-v8a -t armeabi-v7a -o ./src/premium/quicproxy_flutter/android/app/src/main/jniLibs build --release --features "jni,premium" --lib
 
+# ── Flutter Android 打包（需先执行 build-android 准备好 Rust core） ──
+FLUTTER_DIR = ./src/premium/quicproxy_flutter
+APK_OUTPUT  = $(FLUTTER_DIR)/build/app/outputs/flutter-apk/app-release.apk
+
+flutter-apk:
+	@echo "=== Building Flutter APK (signed) ==="
+	cd $(FLUTTER_DIR) && flutter pub get
+	cd $(FLUTTER_DIR) && flutter build apk --release
+	@echo ""
+	@echo "✓ APK: $(APK_OUTPUT)"
+	@ls -lh $(APK_OUTPUT)
+
+# 一键打包：Rust core + Flutter APK（自动签名）
+android-release: build-android flutter-apk
+	@echo ""
+	@echo "=== android-release done ==="
+	@echo "APK: $(APK_OUTPUT)"
+	@ls -lh $(APK_OUTPUT)
+
+# 验证 APK 签名
+apk-verify:
+	@echo "=== Verifying APK signature ==="
+	@if [ ! -f "$(APK_OUTPUT)" ]; then \
+		echo "❌ APK not found. Run 'make android-release' first."; \
+		exit 1; \
+	fi
+	jarsigner -verify -verbose -certs $(APK_OUTPUT) 2>&1 | grep -E "jar verified|CN=|Warning" || true
+	@echo ""
+	@echo "--- Certificate details ---"
+	keytool -printcert -jarfile $(APK_OUTPUT) 2>/dev/null || echo "keytool not available"
+
 build-ios:
 	rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 	RUSTFLAGS="-C link-arg=-Wl,-undefined,dynamic_lookup" \

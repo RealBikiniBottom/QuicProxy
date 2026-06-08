@@ -318,6 +318,27 @@ jobs:
             -o ./src/premium/quicproxy_flutter/android/app/src/main/jniLibs \
             build --release --features "jni,premium" --lib
 
+      - name: Decode signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::KEYSTORE_BASE64 secret is not set"
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > ./src/premium/quicproxy_flutter/android/app/upload-keystore.jks
+          echo "✓ Keystore decoded"
+
+      - name: Generate signing key.properties
+        run: |
+          cat > ./src/premium/quicproxy_flutter/android/key.properties << 'PROPS'
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          storeFile=upload-keystore.jks
+          PROPS
+          echo "✓ key.properties generated"
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
