@@ -54,12 +54,14 @@ impl InterfaceInfoExt for netdev::Interface {
 
     fn is_usable(&self) -> bool {
         let ok = self.is_up() && !self.is_loopback() && (self.has_ipv4() || self.has_ipv6());
-        #[cfg(windows)]
+
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             if ok {
                 return self.gateway.is_some();
             }
         }
+
         ok
     }
 
