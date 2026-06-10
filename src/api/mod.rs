@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use axum::{
     Router,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{get, put},
 };
@@ -26,6 +26,33 @@ use crate::{
     proxy::inbound::create_tcp_listener,
 };
 use serde_json::json;
+
+async fn cors_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> impl IntoResponse {
+    let cors_headers = [
+        (header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*")),
+        (header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, PUT, DELETE, OPTIONS")),
+        (header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type, Authorization")),
+    ];
+
+    // 处理预检请求
+    if request.method() == Method::OPTIONS {
+        let mut response = (StatusCode::NO_CONTENT, ()).into_response();
+        for (k, v) in cors_headers {
+            response.headers_mut().insert(k, v);
+        }
+        response.headers_mut().insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+        return response;
+    }
+
+    let mut response = next.run(request).await;
+    for (k, v) in cors_headers {
+        response.headers_mut().insert(k, v);
+    }
+    response
+}
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -63,6 +90,7 @@ pub async fn init_api(cfg: &Config) -> Result<Option<tokio::sync::mpsc::Receiver
         .route("/request", get(get_request))
         .route("/quit", get(get_quit))
         .route("/traffic", get(get_traffic))
+        .layer(axum::middleware::from_fn(cors_middleware))
         .with_state(ApiState {
             password: api.password,
             shutdown_tx: shutdown_tx,
