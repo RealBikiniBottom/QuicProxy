@@ -49,6 +49,86 @@ jobs:
           name: quicproxy-core-linux-x64
           path: quicproxy-core-linux-x64.tar.gz
 
+  build-linux-arm64:
+    name: Linux arm64 (musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.PRIVATE_KEY }}
+      - run: git clone git@github.com:RealBikiniBottom/premium.git ./src/premium
+
+      - name: Sync Cargo.toml version from git tag
+        run: |
+          VERSION_NUM=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          sed -i "0,/^version = \"[^\"]*\"/s/^version = \"[^\"]*\"/version = \"${VERSION_NUM}\"/" Cargo.toml
+          echo "✓ Synced Cargo.toml version to ${VERSION_NUM}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-arm64-musl-release
+
+      - uses: taiki-e/install-action@cross
+
+      - name: Build
+        run: cross build --release --target aarch64-unknown-linux-musl
+
+      - name: Package
+        run: |
+          cd target/aarch64-unknown-linux-musl/release
+          tar czf ../../../quicproxy-core-linux-arm64.tar.gz quicproxy
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quicproxy-core-linux-arm64
+          path: quicproxy-core-linux-arm64.tar.gz
+
+  build-linux-arm32:
+    name: Linux armv7 (musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.PRIVATE_KEY }}
+      - run: git clone git@github.com:RealBikiniBottom/premium.git ./src/premium
+
+      - name: Sync Cargo.toml version from git tag
+        run: |
+          VERSION_NUM=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          sed -i "0,/^version = \"[^\"]*\"/s/^version = \"[^\"]*\"/version = \"${VERSION_NUM}\"/" Cargo.toml
+          echo "✓ Synced Cargo.toml version to ${VERSION_NUM}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-arm32-musl-release
+
+      - uses: taiki-e/install-action@cross
+
+      - name: Build
+        run: cross build --release --target armv7-unknown-linux-musleabihf
+
+      - name: Package
+        run: |
+          cd target/armv7-unknown-linux-musleabihf/release
+          tar czf ../../../quicproxy-core-linux-arm32.tar.gz quicproxy
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quicproxy-core-linux-arm32
+          path: quicproxy-core-linux-arm32.tar.gz
+
   build-windows:
     name: Windows x64 (MSVC, static CRT)
     runs-on: windows-latest
@@ -391,13 +471,23 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [build-linux, build-windows, build-android]
+    needs: [build-linux, build-linux-arm64, build-linux-arm32, build-windows, build-android]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: quicproxy-core-linux-x64
+          path: release-assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-core-linux-arm64
+          path: release-assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-core-linux-arm32
           path: release-assets
 
       - uses: actions/download-artifact@v4
@@ -425,6 +515,8 @@ jobs:
         with:
           files: |
             release-assets/quicproxy-core-linux-x64.tar.gz
+            release-assets/quicproxy-core-linux-arm64.tar.gz
+            release-assets/quicproxy-core-linux-arm32.tar.gz
             release-assets/quicproxy-core-windows-x64.zip
             release-assets/QuicProxy-Windows-Setup.exe
             release-assets/QuicProxy-Android.apk
@@ -439,6 +531,8 @@ jobs:
             | 🖥️ Windows | `QuicProxy-Windows-Setup.exe` |
             | 📱 Android | `QuicProxy-Android.apk` |
             | 🐧 Linux x64 | `quicproxy-core-linux-x64.tar.gz` |
+            | 🐧 Linux arm64 | `quicproxy-core-linux-arm64.tar.gz` |
+            | 🐧 Linux arm32 | `quicproxy-core-linux-arm32.tar.gz` |
             | 🪟 Windows x64 (Core) | `quicproxy-core-windows-x64.zip` |
 
             > 💡 直接下载链接始终指向最新版:

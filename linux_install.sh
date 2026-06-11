@@ -1,6 +1,19 @@
 #!/bin/bash
 set -euo pipefail
 
+# ────────────────────────────────────────────────────────────
+# QuicProxy Client Installer — 一键安装客户端（管理模式）
+#
+# 用法:
+#   curl -fsSL https://raw.githubusercontent.com/.../linux_install.sh | sudo bash -s -- --password mypass
+#
+# 特性:
+#   - 自动检测 CPU 架构 (x86_64 / aarch64 / armv7l)
+#   - 同时支持 systemd 和 init.d (SysV)
+#   - 以 --manage 模式运行，暴露管理 API + 反向代理
+#   - 可选的 Web UI (通过 --web-dir 指定 Flutter Web 产物目录)
+# ────────────────────────────────────────────────────────────
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -8,14 +21,24 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# ── 默认值 ──
 REPO="RealBikiniBottom/QuicProxy"
-INSTALL_DIR="/opt/quicproxy"
-CONFIG_PATH="${INSTALL_DIR}/server.json5"
-BIN_PATH="${INSTALL_DIR}/quicproxy"
-SERVICE_NAME="quicproxy"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases/latest"
-DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/quicproxy-core-linux-x64.tar.gz"
+INSTALL_DIR="/opt/quicproxy"
+BIN_PATH="${INSTALL_DIR}/quicproxy"
+CONFIG_PATH="${INSTALL_DIR}/config.json"
+PERSIST_PATH="${INSTALL_DIR}/persist.json"
+SERVICE_NAME="quicproxy"
+SYSTEMD_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+INITD_FILE="/etc/init.d/${SERVICE_NAME}"
+
+# 用户可覆盖
+PASSWORD="${PASSWORD:-}"
+PORT="${PORT:-8080}"
+WEB_DIR="${WEB_DIR:-}"
+VERSION="${VERSION:-}"
+WORK_DIR="${WORK_DIR:-${INSTALL_DIR}}"
+HOST="${HOST:-0.0.0.0}"
 
 TMPDIR=""
 
@@ -31,10 +54,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ──────────────────────────────────────────────
+# 基础检查
+# ──────────────────────────────────────────────
+
 check_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
     log_error "请使用 root 权限运行此脚本"
-    log_info "用法: sudo bash linux_install.sh"
+    log_info "用法: curl ... | sudo bash"
     exit 1
   fi
 }
@@ -49,63 +76,59 @@ check_deps() {
 
   if [[ ${#missing[@]} -gt 0 ]]; then
     log_error "缺少依赖: ${missing[*]}"
-    log_info "请先安装: apt install -y curl tar   (Debian/Ubuntu)"
-    log_info "或:        yum install -y curl tar   (CentOS/RHEL)"
+    log_info "Debian/Ubuntu: apt install -y curl tar"
+    log_info "CentOS/RHEL:    yum install -y curl tar"
+    log_info "OpenWrt:        opkg install curl tar"
     exit 1
   fi
 }
 
-stop_existing_process() {
-  log_step "停止已有进程..."
+# ──────────────────────────────────────────────
+# 架构检测与二进制选择
+# ──────────────────────────────────────────────
 
-  local stopped=false
+detect_arch() {
+  log_step "检测 CPU 架构..."
 
-  if [[ -f "$SERVICE_FILE" ]]; then
-    log_info "发现 systemd 服务, 正在停止..."
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
-    stopped=true
-  elif systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${SERVICE_NAME}\." 2>/dev/null; then
-    log_info "systemd 服务已存在, 正在停止..."
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
-    stopped=true
-  fi
+  local machine
+  machine=$(uname -m)
 
-  local pids
-  pids=$(pgrep -f "quicproxy" 2>/dev/null || true)
-  if [[ -n "$pids" ]]; then
-    log_info "发现运行中的 quicproxy 进程 (PID: $(echo $pids | tr '\n' ' ')), 正在终止..."
-    for pid in $pids; do
-      kill "$pid" 2>/dev/null || true
-    done
-    stopped=true
-  fi
+  case "$machine" in
+    x86_64|amd64)
+      ARCH="x64"
+      ARCH_TARGET="linux-x64"
+      ;;
+    aarch64|arm64)
+      ARCH="arm64"
+      ARCH_TARGET="linux-arm64"
+      ;;
+    armv7l|armv6l|arm)
+      ARCH="arm32"
+      ARCH_TARGET="linux-arm32"
+      ;;
+    *)
+      log_error "不支持的 CPU 架构: ${machine}"
+      log_info "支持的架构: x86_64, aarch64, armv7l"
+      exit 1
+      ;;
+  esac
 
-  if [[ "$stopped" == true ]]; then
-    sleep 2
-
-    pids=$(pgrep -f "quicproxy" 2>/dev/null || true)
-    if [[ -n "$pids" ]]; then
-      log_warn "进程未退出, 强制终止..."
-      for pid in $pids; do
-        kill -9 "$pid" 2>/dev/null || true
-      done
-      sleep 1
-    fi
-    log_info "已有进程已全部停止"
-  else
-    log_info "未检测到运行中的 quicproxy 进程 (首次安装)"
-  fi
+  log_info "检测到架构: ${machine} → ${ARCH}"
 }
 
 detect_latest_version() {
   log_step "检测最新版本..."
 
+  if [[ -n "${VERSION}" ]]; then
+    TAG_NAME="$VERSION"
+    log_info "使用指定版本: ${TAG_NAME}"
+    return
+  fi
+
   local api_response
   api_response=$(curl -sfL --connect-timeout 10 --max-time 30 "$GITHUB_API" 2>/dev/null) || {
     log_error "无法访问 GitHub API, 请检查网络连接"
-    log_info "你也可以手动指定版本: VERSION=v1.0.0 sudo bash linux_install.sh"
+    log_info "可用 VERSION=v1.0.0 手动指定版本"
     exit 1
   }
 
@@ -119,14 +142,26 @@ detect_latest_version() {
   log_info "最新版本: ${TAG_NAME}"
 }
 
-download_and_extract() {
-  log_step "下载并解压..."
+# ──────────────────────────────────────────────
+# 下载与安装
+# ──────────────────────────────────────────────
+
+download_and_install() {
+  log_step "下载 QuicProxy (${ARCH_TARGET})..."
+
+  local download_url
+  if [[ -n "${VERSION:-}" ]]; then
+    download_url="https://github.com/${REPO}/releases/download/${VERSION}/quicproxy-core-${ARCH_TARGET}.tar.gz"
+  else
+    download_url="https://github.com/${REPO}/releases/latest/download/quicproxy-core-${ARCH_TARGET}.tar.gz"
+  fi
 
   local tarball="${TMPDIR}/quicproxy.tar.gz"
 
-  log_info "正在下载 quicproxy-core (${TAG_NAME})..."
-  curl -fSL --connect-timeout 10 --max-time 300 -o "$tarball" "$DOWNLOAD_URL" || {
-    log_error "下载失败"
+  log_info "下载地址: ${download_url}"
+  curl -fSL --connect-timeout 10 --max-time 300 -o "$tarball" "$download_url" || {
+    log_error "下载失败, 请检查网络或版本号"
+    log_info "如果 release 中还没有 ${ARCH_TARGET} 产物，请联系开发者"
     exit 1
   }
 
@@ -136,26 +171,19 @@ download_and_extract() {
     exit 1
   fi
 
-  if [[ -d "$INSTALL_DIR" ]]; then
+  # 备份旧版本
+  if [[ -f "$BIN_PATH" ]]; then
     local old_version
     old_version=$("$BIN_PATH" --version 2>/dev/null || echo "unknown")
-
-    if [[ -f "$BIN_PATH" ]]; then
-      log_info "备份旧版本 (${old_version})..."
-      cp "$BIN_PATH" "${BIN_PATH}.bak.$(date +%s)" 2>/dev/null || true
-    fi
-
-    log_info "覆盖安装到 ${INSTALL_DIR} ..."
-  else
-    mkdir -p "$INSTALL_DIR"
-    log_info "首次安装到 ${INSTALL_DIR} ..."
+    log_info "备份旧版本 (${old_version})..."
+    cp "$BIN_PATH" "${BIN_PATH}.bak.$(date +%s)" 2>/dev/null || true
   fi
 
+  mkdir -p "$INSTALL_DIR"
   tar xzf "$tarball" -C "$INSTALL_DIR" --overwrite || {
     log_error "解压失败"
     exit 1
   }
-
   chmod +x "$BIN_PATH"
 
   local installed_version
@@ -163,459 +191,115 @@ download_and_extract() {
   log_info "安装完成: ${installed_version}"
 }
 
-generate_credentials() {
-  if [[ -f "$CONFIG_PATH" ]]; then
-    log_info "检测到已有配置文件, 尝试复用凭据..."
+# ──────────────────────────────────────────────
+# 生成管理配置
+# ──────────────────────────────────────────────
 
-    local existing_user existing_pass
-    existing_user=$(grep -o '"jls_username": *"[^"]*"' "$CONFIG_PATH" 2>/dev/null | head -1 | sed 's/.*"jls_username": *"\([^"]*\)".*/\1/' || true)
-    existing_pass=$(grep -o '"jls_password": *"[^"]*"' "$CONFIG_PATH" 2>/dev/null | head -1 | sed 's/.*"jls_password": *"\([^"]*\)".*/\1/' || true)
+generate_manage_config() {
+  log_step "生成管理配置..."
 
-    if [[ -n "$existing_user" ]] && [[ -n "$existing_pass" ]]; then
-      USERNAME="$existing_user"
-      PASSWORD="$existing_pass"
-      log_info "已复用现有凭据 (用户名: ${USERNAME})"
-      return
-    fi
-
-    log_warn "无法解析已有凭据, 将生成新的"
+  if [[ -z "$PASSWORD" ]]; then
+    PASSWORD=$(openssl rand -hex 12 2>/dev/null || cat /dev/urandom 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 24)
+    log_info "已生成随机 API 密码: ${PASSWORD}"
+    log_info "请保管好此密码! 可在 ${CONFIG_PATH} 中修改"
   fi
 
-  USERNAME=$(openssl rand -hex 6 2>/dev/null || cat /dev/urandom 2>/dev/null | tr -dc 'a-z0-9' | head -c 12)
-  PASSWORD=$(openssl rand -hex 16 2>/dev/null || cat /dev/urandom 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 32)
-  log_info "已生成随机用户名: ${USERNAME}"
-  log_info "已生成随机密码: ${PASSWORD}"
-}
-
-prompt_install_options() {
-  log_step "选择要安装的入站协议"
-
-  local choose_anytls="${INSTALL_ANYTLS:-yes}"
-  local choose_shadowquic="${INSTALL_SHADOWQUIC:-yes}"
-  local choose_trojan="${INSTALL_TROJAN:-yes}"
-
-  if [[ -t 0 ]]; then
-    echo ""
-    echo -e "  ${GREEN}QuicProxy 支持三种入站协议:${NC}"
-    echo ""
-    echo -e "  ${CYAN}1) shadowquic (QUIC + JLS)${NC} — 基于 QUIC 的隧道，延迟更低"
-    echo -e "  ${CYAN}2) anytls (TCP / insecure TLS)${NC}  — 基于 TLS 的伪装隧道，抗封锁更好"
-    echo -e "  ${CYAN}3) trojan (TLS)${NC} — 标准 Trojan 协议，通用性更强"
-    echo ""
-
-    echo -ne "  ${YELLOW}安装 shadowquic (QUIC + JLS)? [Y/n]: ${NC}"
-    read -r input
-    if [[ -n "$input" ]]; then
-      input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
-      case "$input" in
-        n|no|0|false) choose_shadowquic="no" ;;
-        *)            choose_shadowquic="yes" ;;
-      esac
-    fi
-
-    echo -ne "  ${YELLOW}安装 anytls (TCP / insecure TLS)? [Y/n]: ${NC}"
-    read -r input
-    if [[ -n "$input" ]]; then
-      input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
-      case "$input" in
-        n|no|0|false) choose_anytls="no" ;;
-        *)            choose_anytls="yes" ;;
-      esac
-    fi
-
-    echo -ne "  ${YELLOW}安装 trojan (TLS)? [Y/n]: ${NC}"
-    read -r input
-    if [[ -n "$input" ]]; then
-      input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
-      case "$input" in
-        n|no|0|false) choose_trojan="no" ;;
-        *)            choose_trojan="yes" ;;
-      esac
-    fi
-
-    echo ""
-  fi
-
-  if [[ "$choose_anytls" == "no" ]] && [[ "$choose_shadowquic" == "no" ]] && [[ "$choose_trojan" == "no" ]]; then
-    log_error "至少需要选择一种协议"
-    exit 1
-  fi
-
-  ENABLE_SHADOWQUIC="$choose_shadowquic"
-  ENABLE_ANYTLS="$choose_anytls"
-  ENABLE_TROJAN="$choose_trojan"
-
-  local parts=()
-  [[ "$choose_shadowquic" == "yes" ]] && parts+=("shadowquic")
-  [[ "$choose_anytls" == "yes" ]] && parts+=("anytls")
-  [[ "$choose_trojan" == "yes" ]] && parts+=("trojan")
-  log_info "已选择: ${parts[*]}"
-}
-
-check_udp_port_free() {
-  local port=$1
-  if command -v ss &>/dev/null; then
-    ss -uln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
-  elif command -v netstat &>/dev/null; then
-    netstat -uln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
-  fi
-  return 0
-}
-
-check_tcp_port_free() {
-  local port=$1
-  if command -v ss &>/dev/null; then
-    ss -tln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
-  elif command -v netstat &>/dev/null; then
-    netstat -tln 2>/dev/null | grep -q ":${port} " && return 1 || return 0
-  fi
-  return 0
-}
-
-find_free_tcp_port() {
-  # 在候选端口列表中找到首个空闲 TCP 端口，并避开已分配的端口
-  local exclude_a="${1:-}"
-  local exclude_b="${2:-}"
-  local candidates=(443 13431 8443 4443 54321)
-  for port in "${candidates[@]}"; do
-    [[ "$port" == "$exclude_a" ]] && continue
-    [[ "$port" == "$exclude_b" ]] && continue
-    if check_tcp_port_free "$port"; then
-      echo "$port"
-      return 0
-    fi
-  done
-  # 候选耗尽后，从基准端口向后偏移寻找
-  local base="${exclude_a:-443}"
-  for offset in 1 2 3 11 21 31 41 51 101 201; do
-    local candidate=$((base + offset))
-    [[ "$candidate" == "$exclude_a" ]] && continue
-    [[ "$candidate" == "$exclude_b" ]] && continue
-    if check_tcp_port_free "$candidate"; then
-      echo "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
-find_free_udp_port() {
-  local candidates=(443 13431 8443 4443 54321)
-  for port in "${candidates[@]}"; do
-    if check_udp_port_free "$port"; then
-      echo "$port"
-      return 0
-    fi
-  done
-  return 1
-}
-
-detect_available_port() {
-  log_step "检测可用端口..."
-
-  SQ_PORT=""
-  ANYTLS_PORT=""
-  TROJAN_PORT=""
-
-  if [[ -n "${PORT:-}" ]]; then
-    # 手动指定端口时，shadowquic 用 UDP，可与一个 TCP 协议共用；
-    # anytls / trojan 均为 TCP，若都启用则必须分配不同端口
-    if [[ "${ENABLE_SHADOWQUIC:-}" == "yes" ]]; then
-      SQ_PORT="$PORT"
-      log_info "shadowquic(UDP) → ${SQ_PORT} (手动指定)"
-    fi
-    if [[ "${ENABLE_ANYTLS:-}" == "yes" ]]; then
-      ANYTLS_PORT="$PORT"
-      log_info "anytls(TCP) → ${ANYTLS_PORT} (手动指定)"
-    fi
-    if [[ "${ENABLE_TROJAN:-}" == "yes" ]]; then
-      if [[ "${ENABLE_ANYTLS:-}" == "yes" ]]; then
-        # 必须为 trojan 另找一个 TCP 端口，避免与 anytls 冲突
-        local trojan_port
-        trojan_port=$(find_free_tcp_port "$ANYTLS_PORT") || {
-          log_error "无法为 trojan 找到空闲 TCP 端口 (anytls 已占用 ${ANYTLS_PORT})"
-          exit 1
-        }
-        TROJAN_PORT="$trojan_port"
-        log_info "trojan(TCP) → ${TROJAN_PORT} (anytls 与 trojan 不能共用 TCP 端口)"
-      else
-        TROJAN_PORT="$PORT"
-        log_info "trojan(TCP) → ${TROJAN_PORT} (手动指定)"
-      fi
-    fi
-  else
-    # 自动检测：UDP 与 TCP 互不冲突，但 anytls / trojan 必须各自占用不同 TCP 端口
-    if [[ "${ENABLE_SHADOWQUIC:-}" == "yes" ]]; then
-      local sq_port
-      sq_port=$(find_free_udp_port) || {
-        log_error "未找到空闲 UDP 端口, 请手动指定: PORT=12345 sudo bash linux_install.sh"
-        exit 1
-      }
-      SQ_PORT="$sq_port"
-      log_info "shadowquic(UDP) → ${SQ_PORT}"
-    fi
-
-    if [[ "${ENABLE_ANYTLS:-}" == "yes" ]]; then
-      local anytls_port
-      anytls_port=$(find_free_tcp_port) || {
-        log_error "未找到空闲 TCP 端口给 anytls, 请手动指定: PORT=12345 sudo bash linux_install.sh"
-        exit 1
-      }
-      ANYTLS_PORT="$anytls_port"
-      log_info "anytls(TCP) → ${ANYTLS_PORT}"
-    fi
-
-    if [[ "${ENABLE_TROJAN:-}" == "yes" ]]; then
-      local trojan_port
-      trojan_port=$(find_free_tcp_port "$ANYTLS_PORT") || {
-        log_error "未找到空闲 TCP 端口给 trojan, 请手动指定: PORT=12345 sudo bash linux_install.sh"
-        exit 1
-      }
-      TROJAN_PORT="$trojan_port"
-      log_info "trojan(TCP) → ${TROJAN_PORT}"
-    fi
-  fi
-}
-
-detect_server_ip() {
-  log_step "检测公网 IP..."
-
-  if [[ -n "${SERVER_IP:-}" ]]; then
-    log_info "使用手动指定的公网 IP: ${SERVER_IP}"
-    return
-  fi
-
-  local ip=""
-
-  local http_services=(
-    "https://api.ipify.org"
-    "https://ifconfig.me"
-    "https://icanhazip.com"
-    "https://checkip.amazonaws.com"
-    "https://ipinfo.io/ip"
-    "https://api.ip.sb/ip"
-    "https://ip.seeip.org"
-  )
-
-  for svc in "${http_services[@]}"; do
-    ip=$(curl -sf4 --connect-timeout 5 --max-time 10 "$svc" 2>/dev/null | tr -d '[:space:]' || true)
-    if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      SERVER_IP="$ip"
-      log_info "检测到服务器公网 IP: ${SERVER_IP} (来源: ${svc})"
-      return
-    fi
-  done
-
-  if command -v dig &>/dev/null; then
-    ip=$(dig +short +timeout=5 myip.opendns.com @resolver1.opendns.com 2>/dev/null | tr -d '[:space:]' || true)
-    if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      SERVER_IP="$ip"
-      log_info "检测到服务器公网 IP: ${SERVER_IP} (来源: DNS/OpenDNS)"
-      return
-    fi
-
-    ip=$(dig +short +timeout=5 whoami.akamai.net @ns1-1.akamaitech.net 2>/dev/null | tr -d '[:space:]' || true)
-    if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      SERVER_IP="$ip"
-      log_info "检测到服务器公网 IP: ${SERVER_IP} (来源: DNS/Akamai)"
-      return
-    fi
-  fi
-
-  if command -v nslookup &>/dev/null; then
-    ip=$(nslookup myip.opendns.com resolver1.opendns.com 2>/dev/null | grep -A1 "Name:" | grep "Address:" | tail -1 | awk '{print $2}' | tr -d '[:space:]' || true)
-    if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      SERVER_IP="$ip"
-      log_info "检测到服务器公网 IP: ${SERVER_IP} (来源: nslookup/OpenDNS)"
-      return
-    fi
-  fi
-
-  log_error "无法自动检测公网 IP, 请确认服务器能访问外网"
-  log_info "将直接退出, 避免生成无效的订阅链接"
-  log_info "如果你的服务器有固定公网 IP, 可用以下方式手动指定:"
-  log_info "  SERVER_IP=1.2.3.4 sudo bash linux_install.sh"
-  exit 1
-}
-
-detect_server_country() {
-  log_step "检测服务器国家..."
-
-  if [[ -n "${SERVER_COUNTRY:-}" ]]; then
-    log_info "使用手动指定的国家代码: ${SERVER_COUNTRY}"
-    return
-  fi
-
-  local country=""
-
-  # 优先用 ipinfo.io（有免费额度），备选 ip-api.com
-  country=$(curl -sf4 --connect-timeout 5 --max-time 10 "https://ipinfo.io/${SERVER_IP}/country" 2>/dev/null | tr -d '[:space:]' || true)
-  if [[ -z "$country" ]]; then
-    country=$(curl -sf4 --connect-timeout 5 --max-time 10 "http://ip-api.com/line/${SERVER_IP}?fields=countryCode" 2>/dev/null | tr -d '[:space:]' || true)
-  fi
-
-  if [[ -n "$country" ]] && [[ "$country" =~ ^[A-Z]{2}$ ]]; then
-    SERVER_COUNTRY="$country"
-    log_info "检测到服务器国家: ${SERVER_COUNTRY}"
-    return
-  fi
-
-  log_warn "无法自动检测国家代码, 使用 Unknown"
-  SERVER_COUNTRY="UN"
-}
-
-write_server_config() {
-  log_step "生成服务端配置文件..."
-
-  local sni="www.apple.com"
-  local idle_timeout=500
-
-  local sq_enabled=false
-  local anytls_enabled=false
-  local trojan_enabled=false
-  [[ "${ENABLE_SHADOWQUIC:-yes}" == "yes" ]] && sq_enabled=true
-  [[ "${ENABLE_ANYTLS:-yes}" == "yes" ]] && anytls_enabled=true
-  [[ "${ENABLE_TROJAN:-yes}" == "yes" ]] && trojan_enabled=true
-
-  local port="${SQ_PORT}"
-
-  # 计算启用的协议列表，用于逗号控制
-  local enabled=()
-  $sq_enabled && enabled+=("sq")
-  $anytls_enabled && enabled+=("anytls")
-  $trojan_enabled && enabled+=("trojan")
-  local total=${#enabled[@]}
-  local count=0
-
-  cat > "$CONFIG_PATH" << JSON5EOF
+  cat > "$CONFIG_PATH" << JSONEOF
 {
-  "inbounds": {
-JSON5EOF
-
-  if $sq_enabled; then
-    count=$((count + 1))
-    local trailing=""
-    [[ $count -lt $total ]] && trailing=","
-    cat >> "$CONFIG_PATH" << JSON5EOF
-    "shadowquic_inbound": {
-      "type": "shadowquic",
-      "address": "0.0.0.0",
-      "port": ${port},
-      "idle_timeout": ${idle_timeout},
-      "gso": true,
-      "tls": {
-        "enable_jls": true,
-        "jls_username": "${USERNAME}",
-        "jls_password": "${PASSWORD}",
-        "zero_rtt": true,
-        "sni": "${sni}"
-      }
-    }${trailing}
-JSON5EOF
-  fi
-
-  if $anytls_enabled; then
-    count=$((count + 1))
-    local trailing=""
-    [[ $count -lt $total ]] && trailing=","
-    cat >> "$CONFIG_PATH" << JSON5EOF
-    "anytls_inbound": {
-      "type": "anytls",
-      "address": "0.0.0.0",
-      "port": ${ANYTLS_PORT},
-      "password": "${PASSWORD}",
-      "idle_timeout": ${idle_timeout},
-      "tls": {
-        "enable": true,
-        "insecure": true,
-        "sni": "${sni}"
-      }
-    }${trailing}
-JSON5EOF
-  fi
-
-  if $trojan_enabled; then
-    count=$((count + 1))
-    local trailing=""
-    [[ $count -lt $total ]] && trailing=","
-    cat >> "$CONFIG_PATH" << JSON5EOF
-    "trojan_inbound": {
-      "type": "trojan",
-      "address": "0.0.0.0",
-      "port": ${TROJAN_PORT},
-      "password": "${PASSWORD}",
-      "idle_timeout": ${idle_timeout},
-      "transport": {
-        "type": "tcp"
-      },
-      "tls": {
-        "enable": true,
-        "insecure": true
-      }
-    }${trailing}
-JSON5EOF
-  fi
-
-  cat >> "$CONFIG_PATH" << JSON5EOF
-  },
-  "outbounds": {
-    "default_server": "direct",
-    "servers": {
-      "direct": {
-        "type": "direct"
-      }
-    }
-  },
-  "cache": {
-    "all_cache": {
-      "memory_size": 1000,
-      "path": "${INSTALL_DIR}/server_cache.db"
-    }
-  },
-  "router": {
-    "default_mode": "rule"
-  },
-  "dns": {
-    "default_server": "local_dns",
-    "servers": {
-      "local_dns": {
-        "type": "udp",
-        "address": "1.1.1.1",
-        "port": 53,
-        "timeout": 10,
-        "outbound": "direct",
-        "strategy": "ipv4_only",
-        "cache": "all_cache"
-      }
-    }
-  },
-  "log": {
-    "level": "warn",
-    "color": false
-  }
+  "manage": true,
+  "host": "${HOST}",
+  "port": ${PORT},
+  "password": "${PASSWORD}",
+  "work_dir": "${WORK_DIR}",
+  "persist_file": "persist.json"
 }
-JSON5EOF
+JSONEOF
 
-  log_info "配置文件已保存到: ${CONFIG_PATH}"
+  log_info "配置已保存: ${CONFIG_PATH}"
 }
 
-install_systemd_service() {
+# ──────────────────────────────────────────────
+# 停止已有进程
+# ──────────────────────────────────────────────
+
+stop_existing() {
+  log_step "停止已有进程..."
+
+  local stopped=false
+
+  # systemd
+  if [[ -f "$SYSTEMD_FILE" ]]; then
+    log_info "发现 systemd 服务, 正在停止..."
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+    stopped=true
+  fi
+
+  # init.d
+  if [[ -f "$INITD_FILE" ]]; then
+    log_info "发现 init.d 服务, 正在停止..."
+    "$INITD_FILE" stop 2>/dev/null || true
+    update-rc.d -f "${SERVICE_NAME}" remove 2>/dev/null || true
+    chkconfig --del "${SERVICE_NAME}" 2>/dev/null || true
+    stopped=true
+  fi
+
+  # 强制杀残留进程
+  local pids
+  pids=$(pgrep -f "quicproxy" 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    log_info "终止残留进程 (PID: $(echo $pids | tr '\n' ' '))..."
+    for pid in $pids; do
+      kill "$pid" 2>/dev/null || true
+    done
+    sleep 2
+    pids=$(pgrep -f "quicproxy" 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+      for pid in $pids; do
+        kill -9 "$pid" 2>/dev/null || true
+      done
+    fi
+    stopped=true
+  fi
+
+  if [[ "$stopped" == true ]]; then
+    log_info "已有进程已全部停止"
+  else
+    log_info "未检测到运行中的进程 (首次安装)"
+  fi
+}
+
+# ──────────────────────────────────────────────
+# 服务安装：systemd
+# ──────────────────────────────────────────────
+
+install_systemd() {
   log_step "安装 systemd 服务..."
 
-  cat > "$SERVICE_FILE" << UNITEOF
+  local exec_start="${BIN_PATH} --manage"
+  [[ -n "$PASSWORD" ]] && exec_start="${exec_start} --password \"${PASSWORD}\""
+  [[ -n "$PORT" ]] && exec_start="${exec_start} --port ${PORT}"
+  [[ -n "$HOST" ]] && exec_start="${exec_start} --host ${HOST}"
+  [[ -n "$WORK_DIR" ]] && exec_start="${exec_start} --work-dir ${WORK_DIR}"
+  [[ -f "${WORK_DIR}/persist.json" ]] && exec_start="${exec_start} --persist-file ${WORK_DIR}/persist.json"
+
+  # Web UI 可选
+  if [[ -n "$WEB_DIR" ]] && [[ -d "$WEB_DIR" ]]; then
+    exec_start="${exec_start} --web-dir ${WEB_DIR}"
+  fi
+
+  cat > "$SYSTEMD_FILE" << UNITEOF
 [Unit]
-Description=QuicProxy Server
+Description=QuicProxy Client (Manage Mode)
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${INSTALL_DIR}
-ExecStart=${BIN_PATH} -c ${CONFIG_PATH}
+WorkingDirectory=${WORK_DIR}
+ExecStart=${exec_start}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=infinity
-LimitNPROC=infinity
-TasksMax=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -626,104 +310,203 @@ UNITEOF
   systemctl start "${SERVICE_NAME}"
 
   sleep 2
-
   if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-    log_info "✓ 服务运行中"
+    log_info "systemd 服务运行中 ✓"
+    return 0
   else
-    log_warn "服务可能未正常启动, 请检查: journalctl -u ${SERVICE_NAME} -f"
+    log_warn "systemd 服务可能未正常启动, 查看日志: journalctl -u ${SERVICE_NAME} -f"
+    return 1
   fi
 }
 
-generate_subscription_url() {
-  log_step "生成订阅链接..."
+# ──────────────────────────────────────────────
+# 服务安装：init.d (SysV)
+# ──────────────────────────────────────────────
 
-  local host="${SERVER_IP}"
-  local sni="www.apple.com"
+install_initd() {
+  log_step "安装 init.d 服务..."
 
-  local anytls_enabled=false
-  local sq_enabled=false
-  local trojan_enabled=false
-  [[ "${ENABLE_ANYTLS:-yes}" == "yes" ]] && anytls_enabled=true
-  [[ "${ENABLE_SHADOWQUIC:-yes}" == "yes" ]] && sq_enabled=true
-  [[ "${ENABLE_TROJAN:-yes}" == "yes" ]] && trojan_enabled=true
+  local exec_start="${BIN_PATH} --manage"
+  [[ -n "$PASSWORD" ]] && exec_start="${exec_start} --password \"${PASSWORD}\""
+  [[ -n "$PORT" ]] && exec_start="${exec_start} --port ${PORT}"
+  [[ -n "$HOST" ]] && exec_start="${exec_start} --host ${HOST}"
+  [[ -n "$WORK_DIR" ]] && exec_start="${exec_start} --work-dir ${WORK_DIR}"
+  [[ -f "${WORK_DIR}/persist.json" ]] && exec_start="${exec_start} --persist-file ${WORK_DIR}/persist.json"
 
-  local node_num=1
-  local sq_url=""
-  local anytls_url=""
-  local trojan_url=""
-
-  if $sq_enabled; then
-    local sq_tag
-    sq_tag=$(printf "%s-%02d" "${SERVER_COUNTRY}" "${node_num}")
-    node_num=$((node_num + 1))
-    local encoded_tag
-    encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${sq_tag}', safe=''))" 2>/dev/null || echo "${sq_tag}")
-    sq_url="sq://${USERNAME}:${PASSWORD}@${host}:${SQ_PORT}?sni=${sni}&zero_rtt=true&idle_timeout=500#${encoded_tag}"
+  if [[ -n "$WEB_DIR" ]] && [[ -d "$WEB_DIR" ]]; then
+    exec_start="${exec_start} --web-dir ${WEB_DIR}"
   fi
 
-  if $anytls_enabled; then
-    local anytls_tag
-    anytls_tag=$(printf "%s-%02d" "${SERVER_COUNTRY}" "${node_num}")
-    node_num=$((node_num + 1))
-    local anytls_encoded_tag
-    anytls_encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${anytls_tag}', safe=''))" 2>/dev/null || echo "${anytls_tag}")
-    anytls_url="anytls://${PASSWORD}@${host}:${ANYTLS_PORT}?sni=${sni}&insecure=true#${anytls_encoded_tag}"
+  cat > "$INITD_FILE" << INITEOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ${SERVICE_NAME}
+# Required-Start:    \$network \$remote_fs
+# Required-Stop:     \$network \$remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: QuicProxy Client Service
+# Description:       QuicProxy 客户端管理模式
+### END INIT INFO
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+NAME="${SERVICE_NAME}"
+DESC="QuicProxy Client"
+DAEMON="${BIN_PATH}"
+DAEMON_ARGS="--manage --password ${PASSWORD} --port ${PORT} --host ${HOST} --work-dir ${WORK_DIR}"
+PIDFILE="/var/run/\${NAME}.pid"
+
+test -x \${DAEMON} || exit 0
+
+case "\$1" in
+  start)
+    echo -n "Starting \${DESC}: \${NAME}"
+    start-stop-daemon --start --quiet --oknodo --background \\
+      --make-pidfile --pidfile \${PIDFILE} \\
+      --chdir "${WORK_DIR}" \\
+      --exec \${DAEMON} -- \${DAEMON_ARGS}
+    echo "."
+    ;;
+  stop)
+    echo -n "Stopping \${DESC}: \${NAME}"
+    start-stop-daemon --stop --quiet --oknodo --pidfile \${PIDFILE}
+    rm -f \${PIDFILE}
+    echo "."
+    ;;
+  restart|force-reload)
+    \$0 stop
+    sleep 2
+    \$0 start
+    ;;
+  status)
+    if start-stop-daemon --status --pidfile \${PIDFILE} 2>/dev/null; then
+      echo "\${NAME} is running"
+    else
+      echo "\${NAME} is not running"
+      exit 3
+    fi
+    ;;
+  *)
+    echo "Usage: \$0 {start|stop|restart|status}"
+    exit 1
+    ;;
+esac
+
+exit 0
+INITEOF
+
+  chmod +x "$INITD_FILE"
+
+  # 注册到启动项 (根据发行版)
+  if command -v update-rc.d &>/dev/null; then
+    update-rc.d "${SERVICE_NAME}" defaults 2>/dev/null || true
+    update-rc.d "${SERVICE_NAME}" enable 2>/dev/null || true
+  elif command -v chkconfig &>/dev/null; then
+    chkconfig --add "${SERVICE_NAME}" 2>/dev/null || true
+    chkconfig "${SERVICE_NAME}" on 2>/dev/null || true
+  elif command -v rc-update &>/dev/null; then
+    # Alpine / OpenRC
+    rc-update add "${SERVICE_NAME}" default 2>/dev/null || true
   fi
 
-  if $trojan_enabled; then
-    local trojan_tag
-    trojan_tag=$(printf "%s-%02d" "${SERVER_COUNTRY}" "${node_num}")
-    node_num=$((node_num + 1))
-    local trojan_encoded_tag
-    trojan_encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${trojan_tag}', safe=''))" 2>/dev/null || echo "${trojan_tag}")
-    trojan_url="trojan://${PASSWORD}@${host}:${TROJAN_PORT}?sni=${sni}&type=tcp&insecure=true#${trojan_encoded_tag}"
+  # 启动服务
+  "$INITD_FILE" start 2>/dev/null || true
+
+  sleep 2
+  if "$INITD_FILE" status &>/dev/null; then
+    log_info "init.d 服务运行中 ✓"
+    return 0
+  else
+    log_warn "init.d 服务可能未正常启动"
+    return 1
   fi
+}
 
-  # 将订阅写入文件，方便之后查看、systemd 日志也会引用这个路径
-  {
-    if $sq_enabled; then
-      echo "$sq_url"
-    fi
-    if $anytls_enabled; then
-      echo "$anytls_url"
-    fi
-    if $trojan_enabled; then
-      echo "$trojan_url"
-    fi
-  } > "${INSTALL_DIR}/subscription.txt"
+# ──────────────────────────────────────────────
+# 检测与安装服务
+# ──────────────────────────────────────────────
 
-  # 简化输出：直接显示订阅链接
+detect_and_install_service() {
+  log_step "检测 init 系统并安装服务..."
+
+  # 优先 systemd，其次 init.d
+  if command -v systemctl &>/dev/null; then
+    log_info "检测到 systemd"
+    install_systemd
+  elif [[ -d "/etc/init.d" ]] || command -v update-rc.d &>/dev/null || command -v chkconfig &>/dev/null || command -v rc-update &>/dev/null; then
+    log_info "检测到 init.d / SysV"
+    install_initd
+  else
+    log_error "未检测到支持的 init 系统 (systemd / init.d)"
+    log_info "你可以手动运行:"
+    log_info "  ${BIN_PATH} --manage --password ${PASSWORD} --port ${PORT}"
+    exit 1
+  fi
+}
+
+# ──────────────────────────────────────────────
+# 打印完成信息
+# ──────────────────────────────────────────────
+
+print_success() {
   echo ""
-  if $sq_enabled; then
-    echo "$sq_url"
-  fi
-  if $anytls_enabled; then
-    echo "$anytls_url"
-  fi
-  if $trojan_enabled; then
-    echo "$trojan_url"
-  fi
+  echo -e "  ${GREEN}╔══════════════════════════════════════════════════╗${NC}"
+  echo -e "  ${GREEN}║        QuicProxy Client 安装完成!                 ║${NC}"
+  echo -e "  ${GREEN}╚══════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo -e "  ${CYAN}管理面板:${NC} http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_IP"):${PORT}"
+  echo -e "  ${CYAN}API 密码:${NC}  ${PASSWORD}"
+  echo -e "  ${CYAN}配置文件:${NC} ${CONFIG_PATH}"
+  echo -e "  ${CYAN}持久化数据:${NC} ${PERSIST_PATH}"
   echo ""
 
-  log_info "以上订阅链接已备份到 ${INSTALL_DIR}/subscription.txt"
-  log_info "随时用 cat ${INSTALL_DIR}/subscription.txt 查看"
+  if [[ -d "${WEB_DIR:-}" ]]; then
+    echo -e "  ${CYAN}Web UI:${NC}   已启用 (${WEB_DIR})"
+  else
+    echo -e "  ${YELLOW}Web UI:${NC}   未启用。如需 Web 管理界面，请设置 WEB_DIR 重新安装"
+    echo -e "              WEB_DIR=/path/to/web 重新运行本脚本"
+  fi
+
   echo ""
   echo -e "  ${YELLOW}管理命令:${NC}"
-  echo -e "    systemctl status   ${SERVICE_NAME}    # 查看状态"
-  echo -e "    systemctl restart  ${SERVICE_NAME}    # 重启服务"
-  echo -e "    systemctl stop     ${SERVICE_NAME}    # 停止服务"
-  echo -e "    journalctl -u ${SERVICE_NAME} -f      # 查看日志"
-  echo -e "    cat ${INSTALL_DIR}/subscription.txt   # 查看订阅"
+
+  if command -v systemctl &>/dev/null; then
+    echo -e "    systemctl status   ${SERVICE_NAME}    # 查看状态"
+    echo -e "    systemctl restart  ${SERVICE_NAME}    # 重启"
+    echo -e "    systemctl stop     ${SERVICE_NAME}    # 停止"
+    echo -e "    journalctl -u ${SERVICE_NAME} -f      # 查看日志"
+  else
+    echo -e "    service ${SERVICE_NAME} status        # 查看状态"
+    echo -e "    service ${SERVICE_NAME} restart       # 重启"
+    echo -e "    service ${SERVICE_NAME} stop          # 停止"
+  fi
+  echo ""
+  echo -e "  ${GREEN}API 端点:${NC}"
+  echo -e "    POST /api/core/config   — 下发核心配置 JSON"
+  echo -e "    POST /api/core/start    — 启动核心"
+  echo -e "    POST /api/core/stop     — 停止核心"
+  echo -e "    POST /api/core/restart  — 重启核心"
+  echo -e "    GET  /api/core/status   — 查看核心状态"
+  echo -e "    GET  /api/core/logs     — 查看核心日志"
+  echo -e "    GET  /api/health        — 健康检查"
+  echo -e "    GET  /observe           — 代理状态 (反向代理到核心)"
+  echo -e "    GET  /outbounds         — 出站列表 (反向代理到核心)"
+  echo -e "    PUT  /selector          — 切换节点 (反向代理到核心)"
   echo ""
 }
 
 print_banner() {
   echo -e "${BLUE}"
-  echo "  ╔══════════════════════════════════════════╗"
-  echo "  ║        QuicProxy Server Installer        ║"
-  echo "  ╚══════════════════════════════════════════╝"
+  echo "  ╔══════════════════════════════════════════════╗"
+  echo "  ║      QuicProxy Client Installer              ║"
+  echo "  ║      一键安装客户端 (管理模式)               ║"
+  echo "  ╚══════════════════════════════════════════════╝"
   echo -e "${NC}"
 }
+
+# ──────────────────────────────────────────────
+# 主流程
+# ──────────────────────────────────────────────
 
 main() {
   TMPDIR=$(mktemp -d)
@@ -732,31 +515,43 @@ main() {
 
   check_root
   check_deps
+  detect_arch
+  detect_latest_version
 
   log_info "安装目录: ${INSTALL_DIR}"
+  log_info "架构:      ${ARCH_TARGET}"
+  log_info "端口:      ${PORT}"
 
-  stop_existing_process
+  stop_existing
+  download_and_install
+  generate_manage_config
+  detect_and_install_service
+  print_success
 
-  prompt_install_options
-
-  if [[ -n "${VERSION:-}" ]]; then
-    TAG_NAME="$VERSION"
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/quicproxy-core-linux-x64.tar.gz"
-    log_info "使用指定版本: ${VERSION}"
-  else
-    detect_latest_version
-  fi
-
-  download_and_extract
-  generate_credentials
-  detect_available_port
-  detect_server_ip
-  detect_server_country
-  write_server_config
-  install_systemd_service
-  generate_subscription_url
-
-  log_info "安装成功! 🎉"
+  log_info "${GREEN}安装成功!${NC} 🎉"
 }
 
-main "$@"
+# 解析参数
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --password)
+      PASSWORD="$2"; shift 2 ;;
+    --port)
+      PORT="$2"; shift 2 ;;
+    --host)
+      HOST="$2"; shift 2 ;;
+    --web-dir)
+      WEB_DIR="$2"; shift 2 ;;
+    --work-dir)
+      WORK_DIR="$2"; shift 2 ;;
+    --version)
+      VERSION="$2"; shift 2 ;;
+    *)
+      log_error "未知参数: $1"
+      echo "用法: sudo bash linux_install.sh [--password PASS] [--port 8080] [--web-dir /path] [--version v1.0.0]"
+      exit 1
+      ;;
+  esac
+done
+
+main

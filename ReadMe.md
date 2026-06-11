@@ -35,10 +35,10 @@
 在 Linux 服务器上运行以下命令，一键安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/linux_install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/server_install.sh | sudo bash
 ```
 
-脚本会自动完成，输出订阅链接，导入客户端即可使用。
+脚本会自动完成，输出订阅链接，导入客户端即可使用。具体使用教程参考[这里](./doc/server.md)。
 
 ## 支持的协议
 
