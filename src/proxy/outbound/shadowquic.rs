@@ -308,12 +308,13 @@ impl ShadowQuicOutbound {
         let (conn, _state) = self.ensure_connection().await.ok()?;
 
         let stats = conn.stats();
-        let packet_loss_rate =
-            (stats.path.lost_packets as f32) / ((stats.path.sent_packets + 1) as f32) * 100.0;
+        let lost_packets = stats.path.lost_packets;
+        let sent_packets = stats.path.sent_packets;
         let rtt = conn.rtt().as_secs_f32() * 1000.0;
         let mtu = stats.path.current_mtu;
         Some(super::PathState {
-            packet_loss_rate,
+            lost_packets,
+            sent_packets,
             mtu,
             rtt,
         })
@@ -361,9 +362,9 @@ impl ShadowQuicOutbound {
 
         match result {
             Ok(Ok((lost_packets, sent_packets, rtt_ms, mtu))) => {
-                let packet_loss_rate = (lost_packets as f32) / ((sent_packets + 1) as f32) * 100.0;
                 Some(super::PathState {
-                    packet_loss_rate,
+                    lost_packets,
+                    sent_packets,
                     mtu,
                     rtt: rtt_ms as f32,
                 })
@@ -406,14 +407,15 @@ impl AnyOutbound for ShadowQuicOutbound {
         let (conn, send, recv, _state) = self.open_bistream_with_retry().await?;
 
         let stats = conn.stats();
-        let packet_loss_rate =
-            (stats.path.lost_packets as f32) / ((stats.path.sent_packets + 1) as f32) * 100.0;
+        let lost_packets = stats.path.lost_packets;
+        let sent_packets = stats.path.sent_packets;
         let rtt = conn.rtt();
         let mtu = stats.path.current_mtu;
 
         info!(
-            "packet_loss_rate: {:.2}%, rtt: {:?}, mtu: {}",
-            packet_loss_rate,
+            "lost_packets: {}, sent_packets: {}, rtt: {:?}, mtu: {}",
+            lost_packets,
+            sent_packets,
             Some(rtt).map(format_duration),
             mtu,
         );

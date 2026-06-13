@@ -1271,8 +1271,8 @@ async fn test_shadowquic_path_state() {
     );
     let uplink = uplink_state.unwrap();
     println!(
-        "Uplink stats: packet_loss_rate={:.2}%, rtt={:.2}ms, mtu={}",
-        uplink.packet_loss_rate, uplink.rtt, uplink.mtu
+        "Uplink stats: lost_packets={}, sent_packets={}, rtt={:.2}ms, mtu={}",
+        uplink.lost_packets, uplink.sent_packets, uplink.rtt, uplink.mtu
     );
     assert!(
         uplink.rtt > 0.0,
@@ -1281,9 +1281,10 @@ async fn test_shadowquic_path_state() {
     );
     assert!(uplink.mtu > 0, "MTU should be positive, got {}", uplink.mtu);
     assert!(
-        uplink.packet_loss_rate >= 0.0,
-        "Packet loss rate should be non-negative, got {}",
-        uplink.packet_loss_rate
+        uplink.lost_packets <= uplink.sent_packets,
+        "lost_packets should be <= sent_packets, got {} > {}",
+        uplink.lost_packets,
+        uplink.sent_packets
     );
 
     // Test get_downlink_state
@@ -1294,8 +1295,8 @@ async fn test_shadowquic_path_state() {
     );
     let downlink = downlink_state.unwrap();
     println!(
-        "Downlink stats: packet_loss_rate={:.2}%, rtt={:.2}ms, mtu={}",
-        downlink.packet_loss_rate, downlink.rtt, downlink.mtu
+        "Downlink stats: lost_packets={}, sent_packets={}, rtt={:.2}ms, mtu={}",
+        downlink.lost_packets, downlink.sent_packets, downlink.rtt, downlink.mtu
     );
     assert!(
         downlink.rtt > 0.0,
@@ -1308,9 +1309,10 @@ async fn test_shadowquic_path_state() {
         downlink.mtu
     );
     assert!(
-        downlink.packet_loss_rate >= 0.0,
-        "Packet loss rate should be non-negative, got {}",
-        downlink.packet_loss_rate
+        downlink.lost_packets <= downlink.sent_packets,
+        "lost_packets should be <= sent_packets, got {} > {}",
+        downlink.lost_packets,
+        downlink.sent_packets
     );
 
     // Verify MTU values are reasonable (typically between 1200 and 1500 for QUIC)
