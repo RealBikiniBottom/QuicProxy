@@ -7,7 +7,7 @@
 ## 一键搭建
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/main/server_install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/server_install.sh | sudo bash
 ```
 
 脚本会交互式询问需要启用的协议，然后自动完成安装。
