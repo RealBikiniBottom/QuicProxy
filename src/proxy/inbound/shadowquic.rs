@@ -4,6 +4,7 @@ use quinn::VarInt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU16;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::config::InboundConfig;
@@ -12,9 +13,10 @@ use crate::proxy::outbound::UdpMode;
 use crate::proxy::router::Router;
 use crate::proxy::router::get_router;
 use crate::proxy::shadowquic_udp::{
-    PerConnectionState, ShadowQuicUdpPacket, ShadowUdpReceiver, UdpRecvMap, auth_sunnyquic,
-    gen_sunny_auth_hash, read_context_id, read_request_head, run_bistream_recv_listener,
-    start_datagram_loop, start_udp_session_cleaner, start_unistream_listener,
+    ExtensionRequest, PerConnectionState, ShadowQuicUdpPacket, ShadowUdpReceiver, UdpRecvMap,
+    auth_sunnyquic, gen_sunny_auth_hash, read_context_id, read_extension_request,
+    read_request_head, run_bistream_recv_listener, start_datagram_loop, start_udp_session_cleaner,
+    start_unistream_listener, write_conn_stats_response, write_ext_error_not_available,
 };
 use crate::proxy::{QuicTlsConfig, TargetAddr};
 use anyhow::Context;
@@ -294,6 +296,53 @@ impl AnyInbound for ShadowQuicInbound {
                                                 )
                                                 .instrument(span)
                                                 .await?;
+                                            }
+                                            0xFF => {
+                                                // Shadowquic extension protocol
+                                                let ext_req = read_extension_request(
+                                                    &mut bistream,
+                                                    session_timeout_val,
+                                                )
+                                                .await
+                                                .context("read extension request")?;
+
+                                                let mut send = bistream.send;
+                                                match ext_req {
+                                                    ExtensionRequest::GetConnStats => {
+                                                        let stats = conn_clone2.stats();
+                                                        let rtt_ms =
+                                                            conn_clone2.rtt().as_secs_f64()
+                                                                * 1000.0;
+                                                        if let Err(e) = write_conn_stats_response(
+                                                            &mut send,
+                                                            stats.path.lost_packets,
+                                                            stats.path.sent_packets,
+                                                            rtt_ms,
+                                                            stats.path.current_mtu,
+                                                        )
+                                                        .await
+                                                        {
+                                                            debug!(
+                                                                "write conn stats response: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                    ExtensionRequest::UserExtension
+                                                    | ExtensionRequest::Unknown => {
+                                                        if let Err(e) =
+                                                            write_ext_error_not_available(&mut send)
+                                                                .await
+                                                        {
+                                                            debug!(
+                                                                "write ext error response: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                let _ = send.flush().await;
+                                                let _ = send.finish();
                                             }
                                             _ => {
                                                 bail!("wrong bistream cmd.");

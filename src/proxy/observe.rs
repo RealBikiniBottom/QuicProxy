@@ -227,6 +227,8 @@ pub struct OutboundTraceInfo {
     pub ip: String,
     pub loc: String,
     pub latency_us: u64,
+    pub uplink_path_stats: Option<crate::proxy::outbound::PathState>,
+    pub downlink_path_stats: Option<crate::proxy::outbound::PathState>,
 }
 
 use crate::proxy::SessionCloser;
@@ -469,6 +471,8 @@ impl Observer {
         latency_us: u64,
         ip: impl Into<String>,
         loc: impl Into<String>,
+        uplink_path_stats: Option<crate::proxy::outbound::PathState>,
+        downlink_path_stats: Option<crate::proxy::outbound::PathState>,
     ) {
         if let Some(node) = self.outbounds.get(tag) {
             node.stats.record_latency_us(latency_us);
@@ -479,6 +483,8 @@ impl Observer {
                 ip: ip.into(),
                 loc: loc.into(),
                 latency_us,
+                uplink_path_stats,
+                downlink_path_stats,
             },
         );
     }

@@ -11,10 +11,10 @@ use async_trait::async_trait;
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::OutboundConfig;
 use crate::proxy::outbound::{AnyOutbound, AnyStream, UdpMode};
@@ -303,6 +303,81 @@ impl ShadowQuicOutbound {
             }
         }
     }
+
+    async fn get_uplink_stats(&self) -> Option<super::PathState> {
+        let (conn, _state) = self.ensure_connection().await.ok()?;
+
+        let stats = conn.stats();
+        let packet_loss_rate =
+            (stats.path.lost_packets as f32) / ((stats.path.sent_packets + 1) as f32) * 100.0;
+        let rtt = conn.rtt().as_secs_f32() * 1000.0;
+        let mtu = stats.path.current_mtu;
+        Some(super::PathState {
+            packet_loss_rate,
+            mtu,
+            rtt,
+        })
+    }
+
+    /// Query remote server for its path stats via the shadowquic extension protocol.
+    /// Opens a bistream, sends `SQReq::SQExtension(Conn(GetConnStats))`, and decodes
+    /// the `Result<ConnStats, SQExtError>` response. Returns `None` if the query
+    /// times out or any step fails.
+    async fn get_downlink_stats(&self) -> Option<super::PathState> {
+        let (conn, _state) = self.ensure_connection().await.ok()?;
+
+        const DOWNLINK_STATS_TIMEOUT: Duration = Duration::from_secs(3);
+
+        let result = tokio::time::timeout(DOWNLINK_STATS_TIMEOUT, async {
+            let (mut send, mut recv) = conn.open_bi().await?;
+
+            // SQReq::SQExtension tag (u8)
+            // SQExtOpcode::Conn tag (u64 BE, value = 1)
+            // ExtOpcodeConn::GetConnStats tag (u8)
+            let mut req = [0u8; 10];
+            req[0] = 0xFF;
+            req[1..9].copy_from_slice(&1u64.to_be_bytes());
+            req[9] = 0x00;
+            send.write_all(&req).await?;
+            send.flush().await?;
+            let _ = send.finish();
+
+            // Decode Result<ConnStats, SQExtError>
+            let tag = recv.read_u8().await?;
+            if tag != 0 {
+                anyhow::bail!("server returned error tag: {}", tag);
+            }
+
+            // ConnStats is #[size_tag]: u32 BE length prefix followed by fields
+            let _size = recv.read_u32().await?;
+            let lost_packets = recv.read_u64().await?;
+            let sent_packets = recv.read_u64().await?;
+            let rtt_ms = recv.read_f64().await?;
+            let mtu = recv.read_u16().await?;
+
+            anyhow::Ok((lost_packets, sent_packets, rtt_ms, mtu))
+        })
+        .await;
+
+        match result {
+            Ok(Ok((lost_packets, sent_packets, rtt_ms, mtu))) => {
+                let packet_loss_rate = (lost_packets as f32) / ((sent_packets + 1) as f32) * 100.0;
+                Some(super::PathState {
+                    packet_loss_rate,
+                    mtu,
+                    rtt: rtt_ms as f32,
+                })
+            }
+            Ok(Err(e)) => {
+                debug!("downlink stats query failed: {}", e);
+                None
+            }
+            Err(_) => {
+                debug!("downlink stats query timed out after {DOWNLINK_STATS_TIMEOUT:?}");
+                None
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -398,5 +473,13 @@ impl AnyOutbound for ShadowQuicOutbound {
         out_packet.get_send_context_id(target).await?; // init
 
         Ok(out_packet)
+    }
+
+    async fn get_uplink_state(&self) -> Option<super::PathState> {
+        self.get_uplink_stats().await
+    }
+
+    async fn get_downlink_state(&self) -> Option<super::PathState> {
+        self.get_downlink_stats().await
     }
 }

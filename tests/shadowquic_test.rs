@@ -1230,3 +1230,100 @@ mod udp_tests {
             .expect("TCP close no-affect test timed out after 20s");
     }
 }
+
+// ─── Path State Tests ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_shadowquic_path_state() {
+    use quicproxy::proxy::outbound::AnyOutbound;
+    use quicproxy::proxy::outbound::OUTBOUNDS_MAP;
+
+    let mut ctx = TestContext::new().await;
+    ctx.set_timeout(Duration::from_secs(15));
+
+    // Start server
+    let proxy_b_idx = ctx
+        .start_proxy(server_config("user", "testpassword"), "sq_in")
+        .await;
+    let proxy_b_port = ctx.proxies[proxy_b_idx].port;
+
+    // Start client
+    ctx.start_proxy(
+        client_config("user", "testpassword", proxy_b_port, None),
+        "socks_in",
+    )
+    .await;
+
+    // Make a request to establish the QUIC connection
+    ctx.test_http_get().await;
+
+    // Get the outbound from the global map
+    let outbound = OUTBOUNDS_MAP
+        .get("sq_out")
+        .expect("sq_out outbound should be registered")
+        .clone();
+
+    // Test get_uplink_state
+    let uplink_state = outbound.get_uplink_state().await;
+    assert!(
+        uplink_state.is_some(),
+        "get_uplink_state should return Some after connection established"
+    );
+    let uplink = uplink_state.unwrap();
+    println!(
+        "Uplink stats: packet_loss_rate={:.2}%, rtt={:.2}ms, mtu={}",
+        uplink.packet_loss_rate, uplink.rtt, uplink.mtu
+    );
+    assert!(
+        uplink.rtt > 0.0,
+        "RTT should be positive, got {}",
+        uplink.rtt
+    );
+    assert!(uplink.mtu > 0, "MTU should be positive, got {}", uplink.mtu);
+    assert!(
+        uplink.packet_loss_rate >= 0.0,
+        "Packet loss rate should be non-negative, got {}",
+        uplink.packet_loss_rate
+    );
+
+    // Test get_downlink_state
+    let downlink_state = outbound.get_downlink_state().await;
+    assert!(
+        downlink_state.is_some(),
+        "get_downlink_state should return Some after connection established"
+    );
+    let downlink = downlink_state.unwrap();
+    println!(
+        "Downlink stats: packet_loss_rate={:.2}%, rtt={:.2}ms, mtu={}",
+        downlink.packet_loss_rate, downlink.rtt, downlink.mtu
+    );
+    assert!(
+        downlink.rtt > 0.0,
+        "RTT should be positive, got {}",
+        downlink.rtt
+    );
+    assert!(
+        downlink.mtu > 0,
+        "MTU should be positive, got {}",
+        downlink.mtu
+    );
+    assert!(
+        downlink.packet_loss_rate >= 0.0,
+        "Packet loss rate should be non-negative, got {}",
+        downlink.packet_loss_rate
+    );
+
+    // Verify MTU values are reasonable (typically between 1200 and 1500 for QUIC)
+    assert!(
+        uplink.mtu >= 1200 && uplink.mtu <= 1500,
+        "Uplink MTU should be in range [1200, 1500], got {}",
+        uplink.mtu
+    );
+    assert!(
+        downlink.mtu >= 1200 && downlink.mtu <= 1500,
+        "Downlink MTU should be in range [1200, 1500], got {}",
+        downlink.mtu
+    );
+
+    println!("Path state test passed successfully");
+}

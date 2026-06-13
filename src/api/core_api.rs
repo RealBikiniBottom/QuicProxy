@@ -267,10 +267,18 @@ async fn get_outbounds(
 ) -> Result<impl IntoResponse, StatusCode> {
     check_auth(&headers, &state.password)?;
 
+    // Collect all entries first to avoid lifetime issues with DashMap iterator
+    let entries: Vec<_> = OUTBOUNDS_MAP
+        .iter()
+        .map(|entry| {
+            let tag = entry.key().clone();
+            let outbound = entry.value().clone();
+            (tag, outbound)
+        })
+        .collect();
+
     let mut list = Vec::new();
-    for entry in OUTBOUNDS_MAP.iter() {
-        let tag = entry.key().clone();
-        let outbound = entry.value().clone();
+    for (tag, outbound) in entries {
         let default_latency = state
             .observer
             .get_outbound_stats(&tag)
@@ -294,6 +302,9 @@ async fn get_outbounds(
             })
             .unwrap_or((None, None));
 
+        let uplink_path_stats = trace.as_ref().and_then(|t| t.uplink_path_stats.clone());
+        let downlink_path_stats = trace.as_ref().and_then(|t| t.downlink_path_stats.clone());
+
         list.push(OutboundInfo {
             tag,
             protocol: outbound.protocol().to_string(),
@@ -302,6 +313,8 @@ async fn get_outbounds(
             loc,
             outbounds: selector_outbounds,
             selected_node,
+            uplink_path_stats,
+            downlink_path_stats,
         });
     }
 
@@ -357,6 +370,8 @@ pub struct TraceResponse {
     pub ip: String,
     pub loc: String,
     pub duration_ms: u64,
+    pub uplink_path_stats: Option<crate::proxy::outbound::PathState>,
+    pub downlink_path_stats: Option<crate::proxy::outbound::PathState>,
 }
 
 async fn get_trace(
@@ -413,11 +428,23 @@ pub async fn get_outbound_info(
     }
 
     let duration_ms = (start.elapsed().as_millis() / 2) as u64;
-    observer.update_outbound_trace(outbound_tag, duration_ms * 1000, ip.clone(), loc.clone());
+    let uplink_path_stats = outbound.get_uplink_state().await;
+    let downlink_path_stats = outbound.get_downlink_state().await;
+    observer.update_outbound_trace(
+        outbound_tag,
+        duration_ms * 1000,
+        ip.clone(),
+        loc.clone(),
+        uplink_path_stats.clone(),
+        downlink_path_stats.clone(),
+    );
+
     Ok(TraceResponse {
         ip,
         loc,
         duration_ms,
+        uplink_path_stats,
+        downlink_path_stats,
     })
 }
 
@@ -551,4 +578,6 @@ struct OutboundInfo {
     loc: String,
     outbounds: Option<Vec<String>>,
     selected_node: Option<String>,
+    uplink_path_stats: Option<crate::proxy::outbound::PathState>,
+    downlink_path_stats: Option<crate::proxy::outbound::PathState>,
 }

@@ -693,6 +693,11 @@ pub async fn read_request_head(
         bistream.read_exact(&mut cmd_buf).await?;
         let cmd = cmd_buf[0];
 
+        // Extension request: no target address follows
+        if cmd == 0xFF {
+            return Ok((cmd, TargetAddr::dummy()));
+        }
+
         let mut target = TargetAddr::read_from(bistream).await?;
 
         // UDP 协议需要读取 dummy target
@@ -706,4 +711,74 @@ pub async fn read_request_head(
     timeout(duration, handshake)
         .await
         .context("Handshake timeout")?
+}
+
+/// Decoded extension request from the shadowquic extension protocol.
+#[derive(Debug)]
+pub enum ExtensionRequest {
+    /// `ExtOpcodeConn::GetConnStats` (tag 0x00)
+    GetConnStats,
+    /// `SQExtOpcode::User` (tag 0x02) — unsupported, respond with NotAvailable
+    UserExtension,
+    /// Unknown opcode — respond with NotAvailable
+    Unknown,
+}
+
+/// Read an extension request from a bistream. The command byte `0xFF` has already
+/// been consumed by `read_request_head`. This reads:
+/// - `u64` BE: `SQExtOpcode` discriminant (1 = Conn, 2 = User)
+/// - For Conn: `u8` `ExtOpcodeConn` discriminant (0 = GetConnStats)
+pub async fn read_extension_request(
+    bistream: &mut QuinnBistream,
+    duration: Duration,
+) -> anyhow::Result<ExtensionRequest> {
+    timeout(duration, async {
+        let opcode = bistream.read_u64().await?;
+        match opcode {
+            // SQExtOpcode::Conn
+            1 => {
+                let conn_opcode = bistream.read_u8().await?;
+                match conn_opcode {
+                    0x00 => Ok(ExtensionRequest::GetConnStats),
+                    _ => Ok(ExtensionRequest::Unknown),
+                }
+            }
+            // SQExtOpcode::User
+            2 => Ok(ExtensionRequest::UserExtension),
+            _ => Ok(ExtensionRequest::Unknown),
+        }
+    })
+    .await
+    .context("Extension request timeout")?
+}
+
+/// Write a `Result<ConnStats, SQExtError>` response.
+///
+/// Wire format:
+/// - `0x00` (Ok) + ConnStats: `u32` BE size (26) + `u64` lost + `u64` sent + `f64` rtt_ms + `u16` mtu
+/// - `0x01` (Err) + SQExtError tag (`u8`): 0 = NotAvailable, 1 = PermissionDenied, 2 = NotFound
+pub async fn write_conn_stats_response(
+    send: &mut quinn::SendStream,
+    lost_packets: u64,
+    sent_packets: u64,
+    rtt_ms: f64,
+    current_mtu: u16,
+) -> anyhow::Result<()> {
+    // Result::Ok tag
+    send.write_u8(0x00).await?;
+    // ConnStats size tag (#[size_tag]): 8 + 8 + 8 + 2 = 26 bytes
+    send.write_u32(26).await?;
+    send.write_u64(lost_packets).await?;
+    send.write_u64(sent_packets).await?;
+    send.write_f64(rtt_ms).await?;
+    send.write_u16(current_mtu).await?;
+    Ok(())
+}
+
+/// Write an error response: `Result::Err(SQExtError::NotAvailable)`.
+/// Wire format: `0x01` (Err tag) + `0x00` (NotAvailable tag).
+pub async fn write_ext_error_not_available(send: &mut quinn::SendStream) -> anyhow::Result<()> {
+    send.write_u8(0x01).await?; // Result::Err tag
+    send.write_u8(0x00).await?; // SQExtError::NotAvailable
+    Ok(())
 }
