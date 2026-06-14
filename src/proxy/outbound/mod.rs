@@ -395,7 +395,8 @@ pub trait AnyOutbound: Send + Sync {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct PathState {
-    pub packet_loss_rate: f32,
+    pub lost_packets: u64,
+    pub sent_packets: u64,
     pub mtu: u16,
     pub rtt: f32,
 }
