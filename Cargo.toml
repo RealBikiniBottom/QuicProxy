@@ -78,6 +78,7 @@ const-fnv1a-hash = "1.0"
 cfb-mode = "0.8"
 aes = "0.8"
 shadowsocks = { version = "1.23", features = ["aead-cipher-2022", "stream-cipher"] }
+sysinfo = "0.38"
 [target.'cfg(target_os = "android")'.dependencies]
 tracing-android = "0.2.0"
 

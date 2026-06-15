@@ -20,6 +20,7 @@ use quicproxy::api::{
     persist_store::PersistStore,
     reverse_proxy::{self, ProxyState},
     static_files,
+    sysinfo_api::{self, SysInfoState},
 };
 use quicproxy::bootstrap;
 use quicproxy::config::Config;
@@ -238,6 +239,15 @@ async fn run_manage(args: Args) -> Result<()> {
         password: args.password.clone(),
     });
 
+    // 系统信息 API 路由
+    use sysinfo::{Disks, System};
+    use std::sync::{Arc, Mutex};
+    let sysinfo_router = sysinfo_api::router().with_state(SysInfoState {
+        password: args.password.clone(),
+        system: Arc::new(Mutex::new(System::new_all())),
+        disks: Arc::new(Mutex::new(Disks::new_with_refreshed_list())),
+    });
+
     // 健康检查（lambda 捕获 clone）
     let cm = core_manager.clone();
     let ps = persist_store.clone();
@@ -257,6 +267,7 @@ async fn run_manage(args: Args) -> Result<()> {
     let core_api_router = proxy_routes
         .merge(mgmt_router)
         .merge(persist_router)
+        .merge(sysinfo_router)
         .merge(health_route);
 
     // SPA fallback
