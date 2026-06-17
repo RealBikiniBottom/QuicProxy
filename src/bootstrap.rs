@@ -9,7 +9,10 @@ use crate::proxy::router::init_router;
 use crate::utils::interface::InterfaceManager;
 use crate::utils::logging;
 use crate::utils::shutdown;
-use crate::{api::init_api, dns::{init_dns, shutdown_dns}};
+use crate::{
+    api::init_core_api,
+    dns::{init_dns, shutdown_dns},
+};
 use anyhow::{Context, Result};
 use std::future::Future;
 use tracing::{debug, error, info};
@@ -94,5 +97,7 @@ pub async fn init_app(mut config: Config) -> Result<Option<tokio::sync::mpsc::Re
     init_inbounds(&config).context("Failed to init inbounds")?;
     debug!("init_inbounds");
 
-    init_api(&mut config).await.context("Failed to init API")
+    init_core_api(&mut config)
+        .await
+        .context("Failed to init API")
 }
