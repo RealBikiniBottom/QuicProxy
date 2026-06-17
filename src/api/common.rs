@@ -9,7 +9,10 @@ pub async fn cors_middleware(
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
     let cors_headers = [
-        (header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*")),
+        (
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        ),
         (
             header::ACCESS_CONTROL_ALLOW_METHODS,
             HeaderValue::from_static("GET, PUT, DELETE, POST, OPTIONS"),

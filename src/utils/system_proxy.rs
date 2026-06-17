@@ -52,7 +52,12 @@ pub fn set_system_proxy(service: &str, enable: bool, host: &str, port: u16) -> s
 }
 
 #[cfg(target_os = "windows")]
-pub fn set_system_proxy(_service: &str, enable: bool, host: &str, port: u16) -> std::io::Result<()> {
+pub fn set_system_proxy(
+    _service: &str,
+    enable: bool,
+    host: &str,
+    port: u16,
+) -> std::io::Result<()> {
     let hkcu = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
     if enable {
@@ -125,7 +130,12 @@ pub fn set_system_proxy(_service: &str, enable: bool, host: &str, port: u16) -> 
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn set_system_proxy(_service: &str, _enable: bool, _host: &str, _port: u16) -> std::io::Result<()> {
+pub fn set_system_proxy(
+    _service: &str,
+    _enable: bool,
+    _host: &str,
+    _port: u16,
+) -> std::io::Result<()> {
     warn!("System proxy setting is not supported on this platform");
     Ok(())
 }

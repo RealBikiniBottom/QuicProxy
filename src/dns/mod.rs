@@ -99,6 +99,11 @@ pub async fn resolve_domain(domain: &str, dns_server: Arc<dyn AnyDNS>) -> Result
             .realip2domain
             .insert(domain.to_string(), ip.to_string());
     }
+    info!(
+        "resolved ip: {}, cost: {}",
+        ip,
+        format_duration(now.elapsed())
+    );
 
     Ok(ip)
 }
@@ -377,7 +382,7 @@ pub trait AnyDNS: Send + Sync + 'static {
         if let Ok(ip) = IpAddr::from_str(domain) {
             return Ok(vec![ip]);
         }
-        info!(
+        debug!(
             "looking up domain: {} via {}, use ipv6: {}",
             domain,
             self.tag(),

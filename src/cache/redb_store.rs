@@ -51,8 +51,7 @@ impl RedbStore {
         let path_owned = key.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = redb::Builder::new().set_cache_size(0)
-                .create(&path_owned);
+            let result = redb::Builder::new().set_cache_size(0).create(&path_owned);
             let _ = tx.send(result);
         });
 
@@ -67,8 +66,11 @@ impl RedbStore {
                 );
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    format!("redb database {:?} is locked by another process. \
-                             If no other instance is running, delete this file manually.", path),
+                    format!(
+                        "redb database {:?} is locked by another process. \
+                             If no other instance is running, delete this file manually.",
+                        path
+                    ),
                 )));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

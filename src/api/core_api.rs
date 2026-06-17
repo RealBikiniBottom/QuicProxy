@@ -7,7 +7,7 @@ use crate::proxy::{
     observe::{Observer, get_observer},
     router::get_router,
 };
-use crate::utils::http_outbound::request_via_outbound;
+use crate::utils::http_outbound::request_via_outbound_with_dns;
 use crate::{config::RouterMode, proxy::inbound::create_tcp_listener};
 use axum::{
     Router,
@@ -380,7 +380,14 @@ async fn get_trace(
 ) -> Result<impl IntoResponse, StatusCode> {
     check_auth(&headers, &state.password)?;
 
-    match get_outbound_info(&params.tag, state.observer.clone()).await {
+    let outbound = get_outbound_by_tag(&params.tag);
+    match get_outbound_info(
+        &params.tag,
+        state.observer.clone(),
+        outbound.dns_server_name(),
+    )
+    .await
+    {
         Ok(r) => Ok(Json(r)),
         Err(_) => {
             state
@@ -394,12 +401,14 @@ async fn get_trace(
 pub async fn get_outbound_info(
     outbound_tag: &str,
     observer: Arc<Observer>,
+    dns: Option<&str>,
 ) -> Result<TraceResponse> {
     let start = std::time::Instant::now();
     let outbound = get_outbound_by_tag(outbound_tag);
 
-    let response = request_via_outbound(
+    let response = request_via_outbound_with_dns(
         outbound.clone(),
+        dns,
         Method::GET,
         "https://www.cloudflare.com/cdn-cgi/trace",
         outbound.connect_timeout(),
@@ -484,8 +493,9 @@ async fn get_request(
     let start = std::time::Instant::now();
     let outbound = get_outbound_by_tag(&params.tag);
 
-    let response = request_via_outbound(
+    let response = request_via_outbound_with_dns(
         outbound.clone(),
+        outbound.dns_server_name(),
         Method::GET,
         &params.url,
         outbound.connect_timeout(),

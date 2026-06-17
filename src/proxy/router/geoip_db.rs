@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::config::GeoipDBConfig;
 use crate::proxy::outbound::{AnyOutbound, get_default_outbound, get_outbound_by_tag};
 use crate::utils::format_duration;
-use crate::utils::http_outbound::request_via_outbound;
+use crate::utils::http_outbound::request_via_outbound_with_dns;
 use crate::utils::now;
 use crate::utils::now_timestamp;
 use crate::utils::shutdown;
@@ -187,8 +187,9 @@ impl GeoipDB {
             self.download_outbound.tag()
         );
 
-        let response = request_via_outbound(
+        let response = request_via_outbound_with_dns(
             self.download_outbound.clone(),
+            self.download_outbound.dns_server_name(),
             Method::GET,
             url,
             std::time::Duration::from_secs(60),

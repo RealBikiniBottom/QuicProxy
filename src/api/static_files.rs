@@ -26,11 +26,7 @@ pub async fn serve_static(
 }
 
 /// SPA fallback 核心逻辑，接受 web_dir 引用（不依赖 axum State 类型）
-pub async fn serve_static_from(
-    web_dir: &PathBuf,
-    request: axum::extract::Request,
-) -> Response {
-
+pub async fn serve_static_from(web_dir: &PathBuf, request: axum::extract::Request) -> Response {
     if request.method() != axum::http::Method::GET {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
@@ -98,10 +94,7 @@ pub async fn serve_static_from(
                 .unwrap()
         }
         Err(_) => {
-            let has_ext = Path::new(path)
-                .extension()
-                .map(|_| true)
-                .unwrap_or(false);
+            let has_ext = Path::new(path).extension().map(|_| true).unwrap_or(false);
             if has_ext {
                 match tokio::fs::read(web_dir.join("index.html")).await {
                     Ok(data) => Response::builder()

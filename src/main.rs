@@ -5,12 +5,7 @@
 //! 2. 管理模式：`quicproxy --manage --port 8080` — 管理服务器，可启停核心
 
 use anyhow::{Context, Result};
-use axum::{
-    Router,
-    extract::State,
-    response::Json,
-    routing::get,
-};
+use axum::{Router, extract::State, response::Json, routing::get};
 use clap::Parser;
 use quicproxy::api::{
     common::cors_middleware,
@@ -93,9 +88,7 @@ fn main() -> Result<()> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
 
-    let runtime = builder
-        .build()
-        .context("Failed to build tokio runtime")?;
+    let runtime = builder.build().context("Failed to build tokio runtime")?;
     runtime.block_on(async_main())
 }
 
@@ -179,10 +172,7 @@ async fn async_main() -> Result<()> {
 
 async fn run_manage(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "quicproxy=info".into()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "quicproxy=info".into()))
         .init();
 
     let work_dir = args.work_dir.unwrap_or_else(|| {
@@ -218,9 +208,18 @@ async fn run_manage(args: Args) -> Result<()> {
     let proxy_routes = Router::new()
         .route("/observe", get(reverse_proxy::proxy_to_core))
         .route("/outbounds", get(reverse_proxy::proxy_to_core))
-        .route("/mode", get(reverse_proxy::proxy_to_core).put(reverse_proxy::proxy_to_core))
-        .route("/connections", get(reverse_proxy::proxy_to_core).delete(reverse_proxy::proxy_to_core))
-        .route("/selector", get(reverse_proxy::proxy_to_core).put(reverse_proxy::proxy_to_core))
+        .route(
+            "/mode",
+            get(reverse_proxy::proxy_to_core).put(reverse_proxy::proxy_to_core),
+        )
+        .route(
+            "/connections",
+            get(reverse_proxy::proxy_to_core).delete(reverse_proxy::proxy_to_core),
+        )
+        .route(
+            "/selector",
+            get(reverse_proxy::proxy_to_core).put(reverse_proxy::proxy_to_core),
+        )
         .route("/trace", get(reverse_proxy::proxy_to_core))
         .route("/request", get(reverse_proxy::proxy_to_core))
         .route("/quit", get(reverse_proxy::proxy_to_core))
@@ -240,8 +239,8 @@ async fn run_manage(args: Args) -> Result<()> {
     });
 
     // 系统信息 API 路由
-    use sysinfo::{Disks, System};
     use std::sync::{Arc, Mutex};
+    use sysinfo::{Disks, System};
     let sysinfo_router = sysinfo_api::router().with_state(SysInfoState {
         password: args.password.clone(),
         system: Arc::new(Mutex::new(System::new_all())),
@@ -276,7 +275,9 @@ async fn run_manage(args: Args) -> Result<()> {
         web_dir: Option<PathBuf>,
     }
 
-    let fallback_state = FallbackState { web_dir: web_dir.clone() };
+    let fallback_state = FallbackState {
+        web_dir: web_dir.clone(),
+    };
 
     let app = if web_dir.is_some() {
         core_api_router

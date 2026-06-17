@@ -113,7 +113,10 @@ impl SizeLimitedFileAppender {
                 .open(&self.path)?;
             self.file = Some(file);
         }
-        Ok(self.file.as_mut().expect("file should be Some after open_file"))
+        Ok(self
+            .file
+            .as_mut()
+            .expect("file should be Some after open_file"))
     }
 
     fn rotate(&mut self) -> io::Result<()> {
@@ -152,25 +155,39 @@ pub fn init_logging(
     tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>,
     Option<tracing_appender::non_blocking::WorkerGuard>,
 ) {
-    let (log_enabled, log_level, log_path, log_color, log_stdout, log_max_size, backtrace_mode) = match log_config {
-        LogConfig::Level(l) => (true, l.as_str(), None, true, true, None, &crate::config::BacktraceMode::On),
-        LogConfig::Detailed {
-            enable,
-            level,
-            path,
-            color,
-            stdout,
-            max_size,
-            backtrace,
-        } => (*enable, level.as_str(), path.as_deref(), *color, *stdout, *max_size, backtrace),
-    };
+    let (log_enabled, log_level, log_path, log_color, log_stdout, log_max_size, backtrace_mode) =
+        match log_config {
+            LogConfig::Level(l) => (
+                true,
+                l.as_str(),
+                None,
+                true,
+                true,
+                None,
+                &crate::config::BacktraceMode::On,
+            ),
+            LogConfig::Detailed {
+                enable,
+                level,
+                path,
+                color,
+                stdout,
+                max_size,
+                backtrace,
+            } => (
+                *enable,
+                level.as_str(),
+                path.as_deref(),
+                *color,
+                *stdout,
+                *max_size,
+                backtrace,
+            ),
+        };
 
     if !log_enabled {
         let (filter, reload_handle) = reload::Layer::new(EnvFilter::new("off"));
-        tracing_subscriber::registry()
-            .with(filter)
-            .try_init()
-            .ok();
+        tracing_subscriber::registry().with(filter).try_init().ok();
         return (reload_handle, None);
     }
 
@@ -233,7 +250,9 @@ pub fn init_logging(
             .without_time();
 
         #[cfg(target_os = "ios")]
-        let layer = layer.with_ansi(false).with_writer(nslog_writer::NsLogMakeWriter);
+        let layer = layer
+            .with_ansi(false)
+            .with_writer(nslog_writer::NsLogMakeWriter);
 
         #[cfg(not(target_os = "ios"))]
         let layer = layer.with_writer(std::io::stdout);
@@ -243,7 +262,11 @@ pub fn init_logging(
         None
     };
 
-    registry.with(fmt_layer_file).with(fmt_layer_stdout).try_init().ok();
+    registry
+        .with(fmt_layer_file)
+        .with(fmt_layer_stdout)
+        .try_init()
+        .ok();
 
     (reload_handle, file_guard)
 }

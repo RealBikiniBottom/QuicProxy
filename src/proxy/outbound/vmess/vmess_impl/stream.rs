@@ -21,8 +21,8 @@ use super::kdf::{
 };
 use super::user::ID;
 use super::{
-    CHUNK_SIZE, COMMAND_TCP, COMMAND_UDP, MAX_CHUNK_SIZE, OPTION_CHUNK_STREAM, SECURITY_AES_128_GCM,
-    SECURITY_CHACHA20_POLY1305, SECURITY_NONE, VERSION,
+    CHUNK_SIZE, COMMAND_TCP, COMMAND_UDP, MAX_CHUNK_SIZE, OPTION_CHUNK_STREAM,
+    SECURITY_AES_128_GCM, SECURITY_CHACHA20_POLY1305, SECURITY_NONE, VERSION,
 };
 
 pub struct VmessStream<S> {
@@ -333,16 +333,14 @@ where
                             &mut this.read_buf
                         ))?;
 
-                        let aead_response_header_length_encryption_key =
-                            &kdf::vmess_kdf_1_one_shot(
-                                &resp_body_key,
-                                KDF_SALT_CONST_AEAD_RESP_HEADER_LEN_KEY,
-                            )[..16];
-                        let aead_response_header_length_encryption_iv =
-                            &kdf::vmess_kdf_1_one_shot(
-                                &resp_body_iv,
-                                KDF_SALT_CONST_AEAD_RESP_HEADER_LEN_IV,
-                            )[..12];
+                        let aead_response_header_length_encryption_key = &kdf::vmess_kdf_1_one_shot(
+                            &resp_body_key,
+                            KDF_SALT_CONST_AEAD_RESP_HEADER_LEN_KEY,
+                        )[..16];
+                        let aead_response_header_length_encryption_iv = &kdf::vmess_kdf_1_one_shot(
+                            &resp_body_iv,
+                            KDF_SALT_CONST_AEAD_RESP_HEADER_LEN_IV,
+                        )[..12];
 
                         let decrypted_response_header_len = aes_gcm_decrypt(
                             aead_response_header_length_encryption_key,
@@ -359,11 +357,10 @@ where
                             )));
                         }
 
-                        this.read_state = ReadState::AeadWaitingHeader(
-                            u16::from_be_bytes(
-                                decrypted_response_header_len[..2].try_into().unwrap(),
-                            ) as usize,
-                        );
+                        this.read_state = ReadState::AeadWaitingHeader(u16::from_be_bytes(
+                            decrypted_response_header_len[..2].try_into().unwrap(),
+                        )
+                            as usize);
                     }
                 }
 
@@ -379,16 +376,14 @@ where
                     let resp_body_key = this.resp_body_key.clone();
                     let resp_body_iv = this.resp_body_iv.clone();
 
-                    let aead_response_header_payload_encryption_key =
-                        &kdf::vmess_kdf_1_one_shot(
-                            &resp_body_key,
-                            KDF_SALT_CONST_AEAD_RESP_HEADER_PAYLOAD_KEY,
-                        )[..16];
-                    let aead_response_header_payload_encryption_iv =
-                        &kdf::vmess_kdf_1_one_shot(
-                            &resp_body_iv,
-                            KDF_SALT_CONST_AEAD_RESP_HEADER_PAYLOAD_IV,
-                        )[..12];
+                    let aead_response_header_payload_encryption_key = &kdf::vmess_kdf_1_one_shot(
+                        &resp_body_key,
+                        KDF_SALT_CONST_AEAD_RESP_HEADER_PAYLOAD_KEY,
+                    )[..16];
+                    let aead_response_header_payload_encryption_iv = &kdf::vmess_kdf_1_one_shot(
+                        &resp_body_iv,
+                        KDF_SALT_CONST_AEAD_RESP_HEADER_PAYLOAD_IV,
+                    )[..12];
 
                     let buf = aes_gcm_decrypt(
                         aead_response_header_payload_encryption_key,
@@ -424,15 +419,9 @@ where
 
                 ReadState::StreamWaitingLength => {
                     let this = &mut *self;
-                    ready!(poll_read_exact(
-                        &mut this.stream,
-                        cx,
-                        2,
-                        &mut this.read_buf
-                    ))?;
-                    let len = u16::from_be_bytes(
-                        this.read_buf.split().as_ref().try_into().unwrap(),
-                    ) as usize;
+                    ready!(poll_read_exact(&mut this.stream, cx, 2, &mut this.read_buf))?;
+                    let len = u16::from_be_bytes(this.read_buf.split().as_ref().try_into().unwrap())
+                        as usize;
 
                     if len > MAX_CHUNK_SIZE {
                         return Poll::Ready(Err(io::Error::new(
@@ -512,7 +501,8 @@ where
                     let mut piece2 = this.write_buf.split_off(size_bytes);
                     piece2.put_slice(&buf[..consume_len]);
                     if let Some(ref mut cipher) = this.aead_write_cipher {
-                        piece2.extend_from_slice(vec![0u8; cipher.security.overhead_len()].as_ref());
+                        piece2
+                            .extend_from_slice(vec![0u8; cipher.security.overhead_len()].as_ref());
                     }
 
                     let _cur_len = piece2.len();
@@ -613,14 +603,16 @@ fn aes_gcm_decrypt(
 ) -> Result<Vec<u8>, aes_gcm::Error> {
     use aes_gcm::aead::Aead;
 
-    let cipher = aes_gcm::Aes128Gcm::new_from_slice(key)
-        .map_err(|_| aes_gcm::Error)?;
+    let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).map_err(|_| aes_gcm::Error)?;
 
     let nonce = aes_gcm::Nonce::from_slice(nonce);
-    cipher.decrypt(nonce, aes_gcm::aead::Payload {
-        msg: ciphertext,
-        aad: associated_data.unwrap_or_default(),
-    })
+    cipher.decrypt(
+        nonce,
+        aes_gcm::aead::Payload {
+            msg: ciphertext,
+            aad: associated_data.unwrap_or_default(),
+        },
+    )
 }
 
 fn aes_cfb_encrypt(key: &[u8], iv: &[u8], data: &mut [u8]) -> Result<(), anyhow::Error> {
@@ -651,7 +643,7 @@ fn aes_cfb_decrypt(key: &[u8], iv: &[u8], data: &mut [u8]) -> Result<(), anyhow:
 mod tests {
     use super::*;
     use crate::proxy::TargetAddr;
-    use crate::proxy::outbound::vmess::vmess_impl::client::{VmessOption, Builder};
+    use crate::proxy::outbound::vmess::vmess_impl::client::{Builder, VmessOption};
 
     #[test]
     fn test_vmess_builder_new_valid() {

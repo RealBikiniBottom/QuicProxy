@@ -135,7 +135,10 @@ async fn handle_cpu(
         cpus.iter().map(|c| c.usage).sum::<f32>() / cpus.len() as f32
     };
 
-    Ok(Json(CpuResponse { cpus, overall_usage }))
+    Ok(Json(CpuResponse {
+        cpus,
+        overall_usage,
+    }))
 }
 
 async fn handle_memory(
@@ -184,4 +187,3 @@ async fn handle_disks(
 
     Ok(Json(DisksResponse { disks: disk_list }))
 }
-

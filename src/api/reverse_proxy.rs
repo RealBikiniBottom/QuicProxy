@@ -58,7 +58,12 @@ pub async fn proxy_to_core(
 
     let result = match &method {
         m if m == axum::http::Method::GET => {
-            state.client.get(&target_url).headers(req_headers).send().await
+            state
+                .client
+                .get(&target_url)
+                .headers(req_headers)
+                .send()
+                .await
         }
         m if m == axum::http::Method::PUT => {
             state
@@ -70,7 +75,12 @@ pub async fn proxy_to_core(
                 .await
         }
         m if m == axum::http::Method::DELETE => {
-            state.client.delete(&target_url).headers(req_headers).send().await
+            state
+                .client
+                .delete(&target_url)
+                .headers(req_headers)
+                .send()
+                .await
         }
         m if m == axum::http::Method::POST => {
             state
@@ -88,8 +98,8 @@ pub async fn proxy_to_core(
 
     match result {
         Ok(resp) => {
-            let resp_status = StatusCode::from_u16(resp.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let resp_status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
             let mut response_headers = HeaderMap::new();
             for (key, value) in resp.headers() {

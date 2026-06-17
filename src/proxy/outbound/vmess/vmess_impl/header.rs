@@ -4,7 +4,8 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use super::kdf::{
     self, KDF_SALT_CONST_AUTH_ID_ENCRYPTION_KEY, KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_AEAD_IV,
-    KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_AEAD_KEY, KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV,
+    KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_AEAD_KEY,
+    KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV,
     KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY,
 };
 
@@ -96,18 +97,21 @@ fn aes_gcm_encrypt(
     plaintext: &[u8],
     associated_data: Option<&[u8]>,
 ) -> anyhow::Result<Vec<u8>> {
-    use aes_gcm::aead::Aead;
     use aes_gcm::KeyInit;
+    use aes_gcm::aead::Aead;
 
     let cipher = aes_gcm::Aes128Gcm::new_from_slice(key)
         .map_err(|e| new_io_other_error(format!("AES-GCM init: {}", e)))?;
 
     let nonce = aes_gcm::Nonce::from_slice(nonce);
     let ciphertext = cipher
-        .encrypt(nonce, aes_gcm::aead::Payload {
-            msg: plaintext,
-            aad: associated_data.unwrap_or_default(),
-        })
+        .encrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: plaintext,
+                aad: associated_data.unwrap_or_default(),
+            },
+        )
         .map_err(|e| new_io_other_error(format!("AES-GCM encrypt: {}", e)))?;
 
     Ok(ciphertext)
@@ -139,8 +143,8 @@ mod tests {
 
     #[test]
     fn test_aes_gcm_roundtrip() {
-        use aes_gcm::aead::Aead;
         use aes_gcm::KeyInit;
+        use aes_gcm::aead::Aead;
 
         let key = [0u8; 16];
         let nonce = [0u8; 12];
@@ -153,10 +157,13 @@ mod tests {
         let cipher = aes_gcm::Aes128Gcm::new_from_slice(&key).unwrap();
         let nonce = aes_gcm::Nonce::from_slice(&nonce);
         let decrypted = cipher
-            .decrypt(nonce, aes_gcm::aead::Payload {
-                msg: &encrypted,
-                aad: &[1, 2, 3],
-            })
+            .decrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: &encrypted,
+                    aad: &[1, 2, 3],
+                },
+            )
             .unwrap();
         assert_eq!(decrypted, data.to_vec());
     }
@@ -164,8 +171,18 @@ mod tests {
     #[test]
     fn test_kdf_3_one_shot_smoke() {
         // Verify KDF3 produces consistent output
-        let result1 = kdf::vmess_kdf_3_one_shot(b"test", b"key1key1key1key1", b"key2key2key2key2", b"key3key3key3key3");
-        let result2 = kdf::vmess_kdf_3_one_shot(b"test", b"key1key1key1key1", b"key2key2key2key2", b"key3key3key3key3");
+        let result1 = kdf::vmess_kdf_3_one_shot(
+            b"test",
+            b"key1key1key1key1",
+            b"key2key2key2key2",
+            b"key3key3key3key3",
+        );
+        let result2 = kdf::vmess_kdf_3_one_shot(
+            b"test",
+            b"key1key1key1key1",
+            b"key2key2key2key2",
+            b"key3key3key3key3",
+        );
         assert_eq!(result1, result2);
         assert_ne!(result1, [0u8; 32]); // Shouldn't be all zeros
     }

@@ -24,7 +24,7 @@ pub(super) fn enhance_interface(
 
 pub(super) fn set_dns(iface: &InterfaceInfo, dns: &[IpAddr]) -> io::Result<()> {
     let interface_name = iface.friendly_name.as_ref().unwrap_or(&iface.name);
-    
+
     // IPv4
     let v4_dns: Vec<IpAddr> = dns.iter().filter(|ip| ip.is_ipv4()).cloned().collect();
     if !v4_dns.is_empty() {
@@ -91,7 +91,7 @@ pub(super) fn set_dns(iface: &InterfaceInfo, dns: &[IpAddr]) -> io::Result<()> {
                 .output();
         }
     } else {
-        // If no IPv6 DNS is provided, we should probably clear existing ones 
+        // If no IPv6 DNS is provided, we should probably clear existing ones
         // to prevent IPv6 DNS from bypassing our IPv4 DNS hijacking.
         // On Windows, setting it to a dummy static address or loopback can work.
         // Here we try to set it to loopback to force fallback to IPv4.
@@ -112,7 +112,7 @@ pub(super) fn set_dns(iface: &InterfaceInfo, dns: &[IpAddr]) -> io::Result<()> {
 
 pub(super) fn set_metric(iface: &InterfaceInfo, metric: u32) -> io::Result<()> {
     let interface_name = iface.friendly_name.as_ref().unwrap_or(&iface.name);
-    
+
     // Set IPv4 metric
     let output = Command::new("netsh")
         .args(&[
@@ -219,7 +219,7 @@ pub(super) fn get_dns(iface: &InterfaceInfo) -> io::Result<Vec<IpAddr>> {
 
 pub(super) fn restore_dns(iface: &InterfaceInfo) -> io::Result<()> {
     let interface_name = iface.friendly_name.as_ref().unwrap_or(&iface.name);
-    
+
     // Restore IPv4
     let _ = Command::new("netsh")
         .args(&["interface", "ip", "set", "dns", interface_name, "dhcp"])

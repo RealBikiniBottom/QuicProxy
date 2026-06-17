@@ -1,9 +1,9 @@
 use crate::config::InboundConfig;
-use anyhow::Context;
 use crate::proxy::TargetAddr;
 use crate::proxy::inbound::{AnyInbound, create_tcp_listener, setup_system_proxy};
 use crate::proxy::router::get_router;
 use crate::utils::{PrefixedReadStream, format_duration, new_io_other_error, now};
+use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -173,7 +173,8 @@ where
 
         if let Some(method) = method {
             let path = path.ok_or_else(|| new_io_other_error("path missing in parsed request"))?;
-            let offset = headers_offset.ok_or_else(|| new_io_other_error("headers_offset missing in parsed request"))?;
+            let offset = headers_offset
+                .ok_or_else(|| new_io_other_error("headers_offset missing in parsed request"))?;
 
             // Authentication logic
             if let Some(users) = &users {

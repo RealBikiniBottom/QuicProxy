@@ -45,9 +45,8 @@ fn next_id(i: &uuid::Uuid) -> uuid::Uuid {
 mod tests {
     #[test]
     fn test_new_id() {
-        let id = super::new_id(
-            &uuid::Uuid::parse_str("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap(),
-        );
+        let id =
+            super::new_id(&uuid::Uuid::parse_str("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap());
         assert_eq!(id.uuid.to_string(), "b831381d-6324-4d53-ad4f-8cda48b30811");
         assert_eq!(
             id.cmd_key,

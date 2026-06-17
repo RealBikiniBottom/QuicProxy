@@ -35,6 +35,7 @@ pub struct SelectorOutbound {
     cache: Option<Cache<String>>,
     interval: Duration,
     tolerance: u64,
+    dns: Option<String>,
 }
 
 impl SelectorOutbound {
@@ -72,9 +73,7 @@ impl SelectorOutbound {
                     } else {
                         warn!(
                             "selector [{}] cached selection '{}' not found in current outbounds, using default '{}'",
-                            tag,
-                            cached_tag,
-                            default_outbound
+                            tag, cached_tag, default_outbound
                         );
                     }
                 }
@@ -131,6 +130,7 @@ impl SelectorOutbound {
             outbound_tags: outbound_tags.clone(),
             selected_index: AtomicUsize::new(selected_index),
             observer: None,
+            dns: cfg.dns.clone(),
             interval,
             tolerance,
             cache,
@@ -183,9 +183,14 @@ impl SelectorOutbound {
 
         for (i, handler) in self.outbounds.iter().enumerate() {
             let tag = handler.tag().to_string();
+            let dns = self
+                .dns
+                .as_deref()
+                .or_else(|| handler.dns_server_name())
+                .map(str::to_string);
             let observer = observer.clone();
             handles.push(tokio::spawn(async move {
-                let result = get_outbound_info(&tag, observer).await;
+                let result = get_outbound_info(&tag, observer, dns.as_deref()).await;
                 (i, tag, result)
             }));
         }
@@ -400,7 +405,11 @@ impl AnyOutbound for SelectorOutbound {
     }
 
     fn dns_server_name(&self) -> Option<&str> {
-        None
+        if self.dns.is_some() {
+            return self.dns.as_deref();
+        }
+        let idx = self.selected_index.load(Ordering::Relaxed) % self.outbounds.len();
+        self.outbounds[idx].dns_server_name()
     }
 
     fn connect_timeout(&self) -> Duration {

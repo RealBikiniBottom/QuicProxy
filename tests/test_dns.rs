@@ -8,15 +8,15 @@ use quicproxy::dns::*;
 use tempfile::TempDir;
 
 #[cfg(any())]
-use std::sync::{Arc, Mutex};
-#[cfg(any())]
-use rustls::crypto::ring::default_provider;
+use quicproxy::proxy::outbound::AnyOutbound;
 #[cfg(any())]
 use quicproxy::proxy::outbound::direct::DirectOutbound;
 #[cfg(any())]
-use quicproxy::proxy::outbound::AnyOutbound;
+use rustls::crypto::ring::default_provider;
 #[cfg(any())]
 use simple_dns::{Packet, QTYPE, RCODE, TYPE};
+#[cfg(any())]
+use std::sync::{Arc, Mutex};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -49,12 +49,10 @@ async fn test_udp_dns_provider() {
     };
 
     println!("Testing UDP DNS IPv4 query for cloudflare.com...");
-    let ipv4_result = tokio::time::timeout(
-        TEST_TIMEOUT,
-        udp_provider.lookup_ipv4("cloudflare.com"),
-    )
-    .await
-    .expect("UDP IPv4 query timed out");
+    let ipv4_result =
+        tokio::time::timeout(TEST_TIMEOUT, udp_provider.lookup_ipv4("cloudflare.com"))
+            .await
+            .expect("UDP IPv4 query timed out");
     match ipv4_result {
         Ok(ips) => {
             println!("✅ UDP IPv4 query success, got {} IPs:", ips.len());
@@ -70,12 +68,10 @@ async fn test_udp_dns_provider() {
     }
 
     println!("Testing UDP DNS IPv6 query for cloudflare.com...");
-    let ipv6_result = tokio::time::timeout(
-        TEST_TIMEOUT,
-        udp_provider.lookup_ipv6("cloudflare.com"),
-    )
-    .await
-    .expect("UDP IPv6 query timed out");
+    let ipv6_result =
+        tokio::time::timeout(TEST_TIMEOUT, udp_provider.lookup_ipv6("cloudflare.com"))
+            .await
+            .expect("UDP IPv6 query timed out");
     match ipv6_result {
         Ok(ips) => {
             println!("✅ UDP IPv6 query success, got {} IPs:", ips.len());
@@ -107,12 +103,10 @@ async fn test_https_dns_provider() {
     };
 
     println!("Testing HTTPS DNS IPv4 query for cloudflare.com...");
-    let ipv4_result = tokio::time::timeout(
-        TEST_TIMEOUT,
-        https_provider.lookup_ipv4("cloudflare.com"),
-    )
-    .await
-    .expect("HTTPS IPv4 query timed out");
+    let ipv4_result =
+        tokio::time::timeout(TEST_TIMEOUT, https_provider.lookup_ipv4("cloudflare.com"))
+            .await
+            .expect("HTTPS IPv4 query timed out");
     match ipv4_result {
         Ok(ips) => {
             println!("✅ HTTPS IPv4 query success, got {} IPs:", ips.len());
@@ -128,12 +122,10 @@ async fn test_https_dns_provider() {
     }
 
     println!("Testing HTTPS DNS IPv6 query for cloudflare.com...");
-    let ipv6_result = tokio::time::timeout(
-        TEST_TIMEOUT,
-        https_provider.lookup_ipv6("cloudflare.com"),
-    )
-    .await
-    .expect("HTTPS IPv6 query timed out");
+    let ipv6_result =
+        tokio::time::timeout(TEST_TIMEOUT, https_provider.lookup_ipv6("cloudflare.com"))
+            .await
+            .expect("HTTPS IPv6 query timed out");
     match ipv6_result {
         Ok(ips) => {
             println!("✅ HTTPS IPv6 query success, got {} IPs:", ips.len());
@@ -163,12 +155,9 @@ async fn test_fake_ip_dns_provider() {
     };
 
     println!("Testing Fake IP IPv4 query for test.com...");
-    let ipv4_result = tokio::time::timeout(
-        TEST_TIMEOUT,
-        fake_provider.lookup_ipv4("test.com"),
-    )
-    .await
-    .expect("Fake IP IPv4 query timed out");
+    let ipv4_result = tokio::time::timeout(TEST_TIMEOUT, fake_provider.lookup_ipv4("test.com"))
+        .await
+        .expect("Fake IP IPv4 query timed out");
     match ipv4_result {
         Ok(ips) => {
             println!("✅ Fake IP IPv4 query success, got {} IPs:", ips.len());
@@ -190,12 +179,15 @@ async fn test_fake_ip_dns_provider() {
 
 #[cfg(any())]
 fn make_fakeip_manager() -> Arc<Mutex<FakeIpManager>> {
-    Arc::new(Mutex::new(FakeIpManager::new(
-        "",
-        100,
-        Some("198.18.0.0/15".to_string()),
-        Some("fc00::/18".to_string()),
-    ).unwrap()))
+    Arc::new(Mutex::new(
+        FakeIpManager::new(
+            "",
+            100,
+            Some("198.18.0.0/15".to_string()),
+            Some("fc00::/18".to_string()),
+        )
+        .unwrap(),
+    ))
 }
 
 #[cfg(any())]
@@ -232,8 +224,7 @@ async fn test_fakeip_exchange_ipv4() {
         let mgr = make_fakeip_manager();
         let provider = make_provider(mgr.clone(), None, None);
 
-        let query_packet =
-            build_dns_query_packet("example.com", QTYPE::TYPE(TYPE::A)).unwrap();
+        let query_packet = build_dns_query_packet("example.com", QTYPE::TYPE(TYPE::A)).unwrap();
         let query_bytes = query_packet.build_bytes_vec().unwrap();
 
         let response = provider.exchange(&query_bytes).await.unwrap();
@@ -260,8 +251,7 @@ async fn test_fakeip_exchange_ipv6() {
         let mgr = make_fakeip_manager();
         let provider = make_provider(mgr.clone(), None, None);
 
-        let query_packet =
-            build_dns_query_packet("example.com", QTYPE::TYPE(TYPE::AAAA)).unwrap();
+        let query_packet = build_dns_query_packet("example.com", QTYPE::TYPE(TYPE::AAAA)).unwrap();
         let query_bytes = query_packet.build_bytes_vec().unwrap();
 
         let response = provider.exchange(&query_bytes).await.unwrap();
@@ -288,8 +278,7 @@ async fn test_fakeip_exchange_same_domain_returns_same_ip() {
         let mgr = make_fakeip_manager();
         let provider = make_provider(mgr, None, None);
 
-        let query_packet =
-            build_dns_query_packet("test.local", QTYPE::TYPE(TYPE::A)).unwrap();
+        let query_packet = build_dns_query_packet("test.local", QTYPE::TYPE(TYPE::A)).unwrap();
         let query_bytes = query_packet.build_bytes_vec().unwrap();
 
         let response1 = provider.exchange(&query_bytes).await.unwrap();
@@ -310,8 +299,7 @@ async fn test_fakeip_exchange_unsupported_qtype_returns_err() {
         let mgr = make_fakeip_manager();
         let provider = make_provider(mgr, None, None);
 
-        let query_packet =
-            build_dns_query_packet("example.com", QTYPE::TYPE(TYPE::MX)).unwrap();
+        let query_packet = build_dns_query_packet("example.com", QTYPE::TYPE(TYPE::MX)).unwrap();
         let query_bytes = query_packet.build_bytes_vec().unwrap();
 
         let result = provider.exchange(&query_bytes).await;
@@ -334,8 +322,7 @@ async fn test_fakeip_exchange_default_ttl() {
         let mgr = make_fakeip_manager();
         let provider = make_provider(mgr, None, None);
 
-        let query_packet =
-            build_dns_query_packet("ttl.test", QTYPE::TYPE(TYPE::A)).unwrap();
+        let query_packet = build_dns_query_packet("ttl.test", QTYPE::TYPE(TYPE::A)).unwrap();
         let query_bytes = query_packet.build_bytes_vec().unwrap();
 
         let response = provider.exchange(&query_bytes).await.unwrap();
@@ -352,8 +339,7 @@ async fn test_fakeip_exchange_min_ttl_raises_ttl() {
         let mgr = make_fakeip_manager();
         let provider = make_provider(mgr, Some(Duration::from_secs(120)), None);
 
-        let query_packet =
-            build_dns_query_packet("min.ttl.test", QTYPE::TYPE(TYPE::A)).unwrap();
+        let query_packet = build_dns_query_packet("min.ttl.test", QTYPE::TYPE(TYPE::A)).unwrap();
         let query_bytes = query_packet.build_bytes_vec().unwrap();
 
         let response = provider.exchange(&query_bytes).await.unwrap();
@@ -370,8 +356,7 @@ async fn test_fakeip_exchange_max_ttl_caps_ttl() {
         let mgr = make_fakeip_manager();
         let provider = make_provider(mgr, None, Some(Duration::from_secs(30)));
 
-        let query_packet =
-            build_dns_query_packet("max.ttl.test", QTYPE::TYPE(TYPE::A)).unwrap();
+        let query_packet = build_dns_query_packet("max.ttl.test", QTYPE::TYPE(TYPE::A)).unwrap();
         let query_bytes = query_packet.build_bytes_vec().unwrap();
 
         let response = provider.exchange(&query_bytes).await.unwrap();
@@ -392,8 +377,7 @@ async fn test_fakeip_exchange_min_and_max_ttl() {
             Some(Duration::from_secs(300)),
         );
 
-        let query_packet =
-            build_dns_query_packet("both.ttl.test", QTYPE::TYPE(TYPE::A)).unwrap();
+        let query_packet = build_dns_query_packet("both.ttl.test", QTYPE::TYPE(TYPE::A)).unwrap();
         let query_bytes = query_packet.build_bytes_vec().unwrap();
 
         let response = provider.exchange(&query_bytes).await.unwrap();
@@ -457,12 +441,7 @@ fn setup_cache_for_tag(temp_dir: &TempDir, tag: &str, memory_size: u64) {
     cache::init_cache(&config);
 }
 
-fn make_fakeipdns(
-    tag: &str,
-    cache_tag: &str,
-    range_v4: &str,
-    range_v6: Option<&str>,
-) -> FakeIPDNS {
+fn make_fakeipdns(tag: &str, cache_tag: &str, range_v4: &str, range_v6: Option<&str>) -> FakeIPDNS {
     let default_v4 = ipnet::Ipv4Net::from_str("198.18.0.0/16").unwrap();
     let default_v6 = ipnet::Ipv6Net::from_str("fc00::/18").unwrap();
 
@@ -485,11 +464,9 @@ fn make_fakeipdns(
     let ipv4_cidr = v4_found.unwrap_or(default_v4);
     let ipv6_cidr = v6_found.unwrap_or(default_v6);
 
-    let cache: quicproxy::cache::Cache<String> = quicproxy::cache::Cache::new_with_tag(
-        cache_tag,
-        format!("fakeip:{}", tag),
-    )
-    .expect("failed to init cache");
+    let cache: quicproxy::cache::Cache<String> =
+        quicproxy::cache::Cache::new_with_tag(cache_tag, format!("fakeip:{}", tag))
+            .expect("failed to init cache");
 
     let ipv4_cursor = match cache.get("fakeip_ipv4_cursor_index") {
         Ok(Some(r)) => r.0.trim().parse().unwrap_or(0),
@@ -522,12 +499,19 @@ async fn test_fakeipdns_cache_same_domain_returns_same_ip() {
         let dns = make_fakeipdns("test", cache_tag, "198.18.0.0/15", None);
 
         let ip1 = dns.resolve_v4("test.example.com").expect("should resolve");
-        assert!(dns.ipv4_cidr.contains(&ip1), "IP should be in the CIDR range");
+        assert!(
+            dns.ipv4_cidr.contains(&ip1),
+            "IP should be in the CIDR range"
+        );
 
-        let ip2 = dns.resolve_v4("test.example.com").expect("should resolve again");
+        let ip2 = dns
+            .resolve_v4("test.example.com")
+            .expect("should resolve again");
         assert_eq!(ip1, ip2, "same domain should return the same cached IP");
 
-        let ip3 = dns.resolve_v4("other.example.com").expect("should resolve other");
+        let ip3 = dns
+            .resolve_v4("other.example.com")
+            .expect("should resolve other");
         assert_ne!(ip1, ip3, "different domains should get different IPs");
     })
     .await
@@ -543,9 +527,7 @@ async fn test_fakeipdns_cache_multiple_domains() {
 
         let dns = make_fakeipdns("test", cache_tag, "198.18.0.0/15", None);
 
-        let domains: Vec<String> = (0..5)
-            .map(|i| format!("host{}.example.com", i))
-            .collect();
+        let domains: Vec<String> = (0..5).map(|i| format!("host{}.example.com", i)).collect();
 
         let ips: Vec<Ipv4Addr> = domains
             .iter()
@@ -557,7 +539,11 @@ async fn test_fakeipdns_cache_multiple_domains() {
         }
 
         let unique: std::collections::HashSet<_> = ips.iter().collect();
-        assert_eq!(unique.len(), ips.len(), "each domain should get a unique IP");
+        assert_eq!(
+            unique.len(),
+            ips.len(),
+            "each domain should get a unique IP"
+        );
 
         for (domain, expected_ip) in domains.iter().zip(ips.iter()) {
             let cached_ip = dns.resolve_v4(domain).expect("should hit cache");
@@ -581,17 +567,27 @@ async fn test_fakeipdns_cursor_persistence() {
 
         let dns1 = make_fakeipdns(dns_tag, cache_tag, "198.18.0.0/15", None);
 
-        let domains: Vec<String> = (0..5)
-            .map(|i| format!("host{}.persist.com", i))
-            .collect();
+        let domains: Vec<String> = (0..5).map(|i| format!("host{}.persist.com", i)).collect();
 
         let ips_first: Vec<(String, Ipv4Addr)> = domains
             .iter()
             .map(|d| (d.clone(), dns1.resolve_v4(d).expect("should resolve")))
             .collect();
 
-        let _ = dns1.cache.set("fakeip_ipv4_cursor_index", &dns1.ipv4_cursor.load(std::sync::atomic::Ordering::Relaxed).to_string());
-        let _ = dns1.cache.set("fakeip_ipv6_cursor_index", &dns1.ipv6_cursor.load(std::sync::atomic::Ordering::Relaxed).to_string());
+        let _ = dns1.cache.set(
+            "fakeip_ipv4_cursor_index",
+            &dns1
+                .ipv4_cursor
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        );
+        let _ = dns1.cache.set(
+            "fakeip_ipv6_cursor_index",
+            &dns1
+                .ipv6_cursor
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        );
 
         let dns2 = make_fakeipdns(dns_tag, cache_tag, "198.18.0.0/15", None);
 
@@ -605,7 +601,9 @@ async fn test_fakeipdns_cursor_persistence() {
             );
         }
 
-        let new_ip = dns2.resolve_v4("fresh.persist.com").expect("should resolve new");
+        let new_ip = dns2
+            .resolve_v4("fresh.persist.com")
+            .expect("should resolve new");
         for (_, old_ip) in &ips_first {
             assert_ne!(
                 new_ip, *old_ip,
@@ -645,8 +643,7 @@ async fn test_fakeipdns_reverse_lookup() {
         let unknown = dns.reverse_lookup(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         assert_eq!(unknown, None, "unknown IP should return None");
 
-        let unknown_v6 =
-            dns.reverse_lookup(&IpAddr::V6("2001:db8::1".parse().unwrap()));
+        let unknown_v6 = dns.reverse_lookup(&IpAddr::V6("2001:db8::1".parse().unwrap()));
         assert_eq!(unknown_v6, None, "unknown IPv6 should return None");
     })
     .await
@@ -670,8 +667,20 @@ async fn test_fakeipdns_reverse_after_reopen() {
             let ip = dns1.resolve_v4(domain).expect("should resolve");
             ip_map.push((domain.to_string(), ip));
         }
-        let _ = dns1.cache.set("fakeip_ipv4_cursor_index", &dns1.ipv4_cursor.load(std::sync::atomic::Ordering::Relaxed).to_string());
-        let _ = dns1.cache.set("fakeip_ipv6_cursor_index", &dns1.ipv6_cursor.load(std::sync::atomic::Ordering::Relaxed).to_string());
+        let _ = dns1.cache.set(
+            "fakeip_ipv4_cursor_index",
+            &dns1
+                .ipv4_cursor
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        );
+        let _ = dns1.cache.set(
+            "fakeip_ipv6_cursor_index",
+            &dns1
+                .ipv6_cursor
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        );
         drop(dns1);
 
         let dns2 = make_fakeipdns(dns_tag, cache_tag, "198.18.0.0/15", None);
@@ -705,8 +714,7 @@ async fn test_fakeipdns_full_roundtrip_v4_and_v6() {
         let dns_tag = "fakeip_full";
         setup_cache_for_tag(&temp_dir, cache_tag, 100);
 
-        let dns1 =
-            make_fakeipdns(dns_tag, cache_tag, "198.18.0.0/15", Some("fc00::/18"));
+        let dns1 = make_fakeipdns(dns_tag, cache_tag, "198.18.0.0/15", Some("fc00::/18"));
 
         let v4_domain = "v4.full.test";
         let v6_domain = "v6.full.test";
@@ -726,12 +734,23 @@ async fn test_fakeipdns_full_roundtrip_v4_and_v6() {
             Some(v6_domain)
         );
 
-        let _ = dns1.cache.set("fakeip_ipv4_cursor_index", &dns1.ipv4_cursor.load(std::sync::atomic::Ordering::Relaxed).to_string());
-        let _ = dns1.cache.set("fakeip_ipv6_cursor_index", &dns1.ipv6_cursor.load(std::sync::atomic::Ordering::Relaxed).to_string());
+        let _ = dns1.cache.set(
+            "fakeip_ipv4_cursor_index",
+            &dns1
+                .ipv4_cursor
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        );
+        let _ = dns1.cache.set(
+            "fakeip_ipv6_cursor_index",
+            &dns1
+                .ipv6_cursor
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        );
         drop(dns1);
 
-        let dns2 =
-            make_fakeipdns(dns_tag, cache_tag, "198.18.0.0/15", Some("fc00::/18"));
+        let dns2 = make_fakeipdns(dns_tag, cache_tag, "198.18.0.0/15", Some("fc00::/18"));
 
         assert_eq!(
             dns2.resolve_v4(v4_domain).expect("v4 from cache"),
@@ -782,7 +801,11 @@ async fn test_fakeipdns_anydns_reverse_trait() {
 
         let dns = make_fakeipdns("test", cache_tag, "198.18.0.0/15", None);
 
-        let ip = dns.lookup_ipv4("trait.rev.test").await.unwrap().expect("should resolve");
+        let ip = dns
+            .lookup_ipv4("trait.rev.test")
+            .await
+            .unwrap()
+            .expect("should resolve");
         let domain = dns.reverse(&IpAddr::V4(ip)).await;
         assert_eq!(domain.as_deref(), Some("trait.rev.test"));
 

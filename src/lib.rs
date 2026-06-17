@@ -1,10 +1,10 @@
 pub mod api;
 pub mod bootstrap;
+pub mod cache;
 pub mod config;
 pub mod dns;
 pub mod proxy;
 pub mod utils;
-pub mod cache;
 
 pub mod app {
     pub mod net {

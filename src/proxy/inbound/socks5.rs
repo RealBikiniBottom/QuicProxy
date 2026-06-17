@@ -17,8 +17,8 @@ use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{self, Duration};
-use tracing::{debug, field};
 use tracing::{Instrument, error, info, info_span};
+use tracing::{debug, field};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct User {

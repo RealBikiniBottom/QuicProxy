@@ -361,14 +361,12 @@ impl ShadowQuicOutbound {
         .await;
 
         match result {
-            Ok(Ok((lost_packets, sent_packets, rtt_ms, mtu))) => {
-                Some(super::PathState {
-                    lost_packets,
-                    sent_packets,
-                    mtu,
-                    rtt: rtt_ms as f32,
-                })
-            }
+            Ok(Ok((lost_packets, sent_packets, rtt_ms, mtu))) => Some(super::PathState {
+                lost_packets,
+                sent_packets,
+                mtu,
+                rtt: rtt_ms as f32,
+            }),
             Ok(Err(e)) => {
                 debug!("downlink stats query failed: {}", e);
                 None

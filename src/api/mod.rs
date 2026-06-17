@@ -10,5 +10,5 @@ pub mod sysinfo_api;
 
 pub use core_api::init_core_api;
 
-pub use core_api::get_outbound_info;
 pub use core_api::TraceResponse;
+pub use core_api::get_outbound_info;

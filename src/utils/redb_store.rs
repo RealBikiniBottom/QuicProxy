@@ -1,5 +1,8 @@
 use hashbrown::HashMap;
-use redb::{Database, Error, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableError};
+use redb::{
+    Database, Error, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    TableError,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};

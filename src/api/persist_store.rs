@@ -32,23 +32,21 @@ impl PersistStore {
         if let Some(ref path) = self.inner.file_path {
             if path.exists() {
                 match std::fs::read_to_string(path) {
-                    Ok(content) => {
-                        match serde_json::from_str::<Vec<(String, String)>>(&content) {
-                            Ok(entries) => {
-                                for (k, v) in entries {
-                                    self.inner.data.insert(k, v);
-                                }
-                                info!(
-                                    "PersistStore: loaded {} entries from {}",
-                                    self.inner.data.len(),
-                                    path.display()
-                                );
+                    Ok(content) => match serde_json::from_str::<Vec<(String, String)>>(&content) {
+                        Ok(entries) => {
+                            for (k, v) in entries {
+                                self.inner.data.insert(k, v);
                             }
-                            Err(e) => {
-                                warn!("PersistStore: failed to parse persist file: {}", e);
-                            }
+                            info!(
+                                "PersistStore: loaded {} entries from {}",
+                                self.inner.data.len(),
+                                path.display()
+                            );
                         }
-                    }
+                        Err(e) => {
+                            warn!("PersistStore: failed to parse persist file: {}", e);
+                        }
+                    },
                     Err(e) => {
                         warn!("PersistStore: failed to read persist file: {}", e);
                     }

@@ -154,11 +154,10 @@ where
         };
 
         let memory_db = if memory_cache_size > 0 {
-            let cap = NonZeroUsize::new(memory_cache_size)
-                .unwrap_or_else(|| {
-                    tracing::error!("Invalid memory_cache_size: {}", memory_cache_size);
-                    NonZeroUsize::new(1).unwrap()
-                });
+            let cap = NonZeroUsize::new(memory_cache_size).unwrap_or_else(|| {
+                tracing::error!("Invalid memory_cache_size: {}", memory_cache_size);
+                NonZeroUsize::new(1).unwrap()
+            });
             Some(Mutex::new(LruCache::new(cap)))
         } else {
             None
@@ -173,12 +172,10 @@ where
 
     pub fn new_with_tag(tag: &str, table_name: String) -> Result<Self, Error> {
         let (path, memory_size) = {
-            let guard = CACHE_MAP
-                .get(tag)
-                .unwrap_or_else(|| {
-                    tracing::error!("can not find cache config for tag: {}", tag);
-                    std::process::exit(1);
-                });
+            let guard = CACHE_MAP.get(tag).unwrap_or_else(|| {
+                tracing::error!("can not find cache config for tag: {}", tag);
+                std::process::exit(1);
+            });
 
             (guard.path.clone(), guard.memory_size)
         };

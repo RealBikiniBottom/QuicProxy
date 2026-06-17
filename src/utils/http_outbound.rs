@@ -14,7 +14,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls;
 use tracing::debug;
 
-use crate::dns::{get_dns_by_tag, get_default_dns};
+use crate::dns::{get_default_dns, get_dns_by_tag};
 use crate::proxy::TargetAddr;
 use crate::proxy::outbound::{AnyOutbound, AnyStream};
 
@@ -163,8 +163,9 @@ async fn collect_body(response: Response<Incoming>) -> anyhow::Result<Bytes> {
         .map(|c| c.to_bytes())
 }
 
-pub async fn request_via_outbound(
+pub async fn request_via_outbound_with_dns(
     outbound: Arc<dyn AnyOutbound>,
+    dns: Option<&str>,
     method: Method,
     url: &str,
     timeout: Duration,
@@ -176,12 +177,14 @@ pub async fn request_via_outbound(
         let mut current_method = method.clone();
 
         for _ in 0..=max_redirects {
-            let (response, base_url) = request_once(
+            let (response, base_url) = request_once_with_body(
                 outbound.clone(),
+                dns.or_else(|| outbound.dns_server_name()),
                 current_method.clone(),
                 current.clone(),
                 None,
                 headers,
+                Bytes::new(),
             )
             .await?;
 
@@ -308,9 +311,17 @@ pub async fn test_latency_via_outbound(
     timeout: Duration,
 ) -> Option<u64> {
     let start = Instant::now();
-    let response = request_via_outbound(outbound, Method::HEAD, url, timeout, 2, None)
-        .await
-        .ok()?;
+    let response = request_via_outbound_with_dns(
+        outbound.clone(),
+        outbound.dns_server_name(),
+        Method::HEAD,
+        url,
+        timeout,
+        2,
+        None,
+    )
+    .await
+    .ok()?;
 
     if response.status.is_success() || response.status.is_redirection() {
         Some(start.elapsed().as_micros() as u64)

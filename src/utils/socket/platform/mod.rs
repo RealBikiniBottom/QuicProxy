@@ -9,11 +9,7 @@ pub(crate) use apple::must_bind_socket_on_interface;
     target_os = "android"
 ))]
 pub(crate) mod unix;
-#[cfg(any(
-    target_os = "fuchsia",
-    target_os = "linux",
-    target_os = "freebsd"
-))]
+#[cfg(any(target_os = "fuchsia", target_os = "linux", target_os = "freebsd"))]
 pub(crate) use unix::must_bind_socket_on_interface;
 #[cfg(windows)]
 pub(crate) mod win;

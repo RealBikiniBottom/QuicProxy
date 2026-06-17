@@ -1,5 +1,5 @@
-use anyhow::{bail, Result};
 use crate::proxy::TargetAddr;
+use anyhow::{Result, bail};
 
 // ─── Shared Anytls Protocol Constants ─────────────────────────────────────────
 
@@ -51,25 +51,42 @@ pub fn uot_decode_target(data: &[u8]) -> Result<(TargetAddr, usize)> {
         bail!("empty UoT packet");
     }
     match data[0] {
-        0x00 => { // IPv4
+        0x00 => {
+            // IPv4
             if data.len() < 7 {
                 bail!("UoT IPv4 address too short");
             }
             let mut ip = [0u8; 4];
             ip.copy_from_slice(&data[1..5]);
             let port = u16::from_be_bytes([data[5], data[6]]);
-            Ok((TargetAddr::Ip(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(ip), port))), 7))
+            Ok((
+                TargetAddr::Ip(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                    std::net::Ipv4Addr::from(ip),
+                    port,
+                ))),
+                7,
+            ))
         }
-        0x01 => { // IPv6
+        0x01 => {
+            // IPv6
             if data.len() < 19 {
                 bail!("UoT IPv6 address too short");
             }
             let mut ip = [0u8; 16];
             ip.copy_from_slice(&data[1..17]);
             let port = u16::from_be_bytes([data[17], data[18]]);
-            Ok((TargetAddr::Ip(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::from(ip), port, 0, 0))), 19))
+            Ok((
+                TargetAddr::Ip(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                    std::net::Ipv6Addr::from(ip),
+                    port,
+                    0,
+                    0,
+                ))),
+                19,
+            ))
         }
-        0x02 => { // Domain
+        0x02 => {
+            // Domain
             if data.len() < 2 {
                 bail!("UoT domain address too short");
             }
@@ -117,25 +134,42 @@ pub fn socksaddr_decode_target(data: &[u8]) -> Result<(TargetAddr, usize)> {
         bail!("empty socksaddr");
     }
     match data[0] {
-        1 => { // IPv4
+        1 => {
+            // IPv4
             if data.len() < 7 {
                 bail!("socksaddr IPv4 address too short");
             }
             let mut ip = [0u8; 4];
             ip.copy_from_slice(&data[1..5]);
             let port = u16::from_be_bytes([data[5], data[6]]);
-            Ok((TargetAddr::Ip(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::from(ip), port))), 7))
+            Ok((
+                TargetAddr::Ip(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                    std::net::Ipv4Addr::from(ip),
+                    port,
+                ))),
+                7,
+            ))
         }
-        4 => { // IPv6
+        4 => {
+            // IPv6
             if data.len() < 19 {
                 bail!("socksaddr IPv6 address too short");
             }
             let mut ip = [0u8; 16];
             ip.copy_from_slice(&data[1..17]);
             let port = u16::from_be_bytes([data[17], data[18]]);
-            Ok((TargetAddr::Ip(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::from(ip), port, 0, 0))), 19))
+            Ok((
+                TargetAddr::Ip(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                    std::net::Ipv6Addr::from(ip),
+                    port,
+                    0,
+                    0,
+                ))),
+                19,
+            ))
         }
-        3 => { // Domain
+        3 => {
+            // Domain
             if data.len() < 2 {
                 bail!("socksaddr domain address too short");
             }

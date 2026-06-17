@@ -42,10 +42,10 @@ impl VmessOutbound {
             .context(format!("vmess outbound '{}' requires port", tag))?;
         let server = TargetAddr::from_str2(&address, port)?;
 
-        let uuid = cfg.uuid.clone().context(format!(
-            "vmess outbound '{}' requires password (uuid)",
-            tag
-        ))?;
+        let uuid = cfg
+            .uuid
+            .clone()
+            .context(format!("vmess outbound '{}' requires password (uuid)", tag))?;
 
         let alter_id = cfg
             .username
@@ -53,10 +53,7 @@ impl VmessOutbound {
             .and_then(|u| u.parse::<u16>().ok())
             .unwrap_or(0);
 
-        let security = cfg
-            .udp_mod
-            .clone()
-            .unwrap_or_else(|| "auto".to_string());
+        let security = cfg.udp_mod.clone().unwrap_or_else(|| "auto".to_string());
 
         let udp = true;
 
@@ -118,26 +115,20 @@ impl AnyOutbound for VmessOutbound {
         stream: AnyStream,
     ) -> anyhow::Result<AnyStream> {
         let opt = self.build_vmess_option(target, false)?;
-        let builder = Builder::new(&opt)
-            .map_err(|e| new_io_other_error(format!("vmess builder: {}", e)))?;
+        let builder =
+            Builder::new(&opt).map_err(|e| new_io_other_error(format!("vmess builder: {}", e)))?;
 
-        let vmess_stream = timeout(
-            self.connect_timeout(),
-            builder.proxy_stream(stream),
-        )
-        .await
-        .with_context(|| format!("vmess connect timeout after {:?}", self.connect_timeout()))?
-        .map_err(|e| new_io_other_error(format!("vmess connect: {}", e)))?;
+        let vmess_stream = timeout(self.connect_timeout(), builder.proxy_stream(stream))
+            .await
+            .with_context(|| format!("vmess connect timeout after {:?}", self.connect_timeout()))?
+            .map_err(|e| new_io_other_error(format!("vmess connect: {}", e)))?;
 
         Ok(Box::new(vmess_stream))
     }
 
     async fn connect_packet(&self, target: &TargetAddr) -> anyhow::Result<Arc<dyn AnyPacket>> {
         let stream = self.connect_stream(target).await?;
-        Ok(Arc::new(VmessUdpSocket::new(
-            stream,
-            target.clone(),
-        )))
+        Ok(Arc::new(VmessUdpSocket::new(stream, target.clone())))
     }
 }
 
@@ -161,12 +152,7 @@ impl VmessUdpSocket {
 
 #[async_trait]
 impl AnyPacket for VmessUdpSocket {
-    async fn send_to(
-        &self,
-        buf: Bytes,
-        _from: &SourceAddr,
-        _target: &TargetAddr,
-    ) -> Result<usize> {
+    async fn send_to(&self, buf: Bytes, _from: &SourceAddr, _target: &TargetAddr) -> Result<usize> {
         let len = buf.len();
         let mut sink = self.sink.lock().await;
 
@@ -206,7 +192,8 @@ mod tests {
             "gso": false,
             "min_mtu": 1200,
             "initial_mtu": 1200,
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     #[test]

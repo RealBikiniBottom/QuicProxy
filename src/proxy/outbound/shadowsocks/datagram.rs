@@ -6,17 +6,12 @@ use std::task::{Context, Poll};
 use futures::{Sink, Stream, ready};
 use shadowsocks::{
     ProxySocket,
-    relay::udprelay::{
-        DatagramReceive, DatagramSend, options::UdpSocketControlData,
-    },
+    relay::udprelay::{DatagramReceive, DatagramSend, options::UdpSocketControlData},
 };
 use tokio::io::ReadBuf;
 use tracing::debug;
 
-use crate::proxy::{
-    TargetAddr,
-    outbound::PacketInfo,
-};
+use crate::proxy::{TargetAddr, outbound::PacketInfo};
 
 pub struct OutboundDatagramShadowsocks<S> {
     inner: ProxySocket<S>,
@@ -50,10 +45,7 @@ where
 {
     type Error = io::Error;
 
-    fn poll_ready(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if !self.flushed {
             match self.poll_flush(cx)? {
                 Poll::Ready(()) => {}
@@ -63,17 +55,17 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn start_send(self: Pin<&mut Self>, item: (TargetAddr, bytes::Bytes)) -> Result<(), Self::Error> {
+    fn start_send(
+        self: Pin<&mut Self>,
+        item: (TargetAddr, bytes::Bytes),
+    ) -> Result<(), Self::Error> {
         let pin = self.get_mut();
         pin.pkt = Some(item);
         pin.flushed = false;
         Ok(())
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if self.flushed {
             return Poll::Ready(Ok(()));
         }
@@ -95,13 +87,8 @@ where
             let addr: shadowsocks::relay::Address =
                 (dst_addr.host().to_string(), dst_addr.port()).into();
 
-            let n = ready!(inner.poll_send_to_with_ctrl(
-                *remote_addr,
-                &addr,
-                ss_control,
-                data,
-                cx
-            ))?;
+            let n =
+                ready!(inner.poll_send_to_with_ctrl(*remote_addr, &addr, ss_control, data, cx))?;
 
             debug!(
                 "send udp packet to remote ss server, len: {}, remote_addr: {}, dst_addr: {}",
@@ -126,10 +113,7 @@ where
         }
     }
 
-    fn poll_close(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.poll_flush(cx))?;
         Poll::Ready(Ok(()))
     }
@@ -141,10 +125,7 @@ where
 {
     type Item = PacketInfo;
 
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let &mut Self {
             ref mut buf,
             ref inner,

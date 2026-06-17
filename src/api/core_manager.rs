@@ -194,11 +194,8 @@ impl CoreManager {
                         error!("Failed to kill core process: {}", e);
                         let _ = child.start_kill();
                     }
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        child.wait(),
-                    )
-                    .await;
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
                 }
                 Err(e) => {
                     error!("Failed to check core process status: {}", e);
@@ -242,7 +239,12 @@ impl CoreManager {
         CoreStatus {
             running: pid.is_some(),
             pid,
-            core_path: self.inner.core_path.try_read().map(|v| v.clone()).unwrap_or_default(),
+            core_path: self
+                .inner
+                .core_path
+                .try_read()
+                .map(|v| v.clone())
+                .unwrap_or_default(),
             work_dir: self.inner.work_dir.display().to_string(),
             config_api_port,
         }
@@ -267,10 +269,7 @@ impl CoreManager {
             format!("{}", now.as_millis())
         };
         if let Ok(mut logs) = self.inner.logs.try_lock() {
-            logs.push_back(CoreLogEntry {
-                timestamp,
-                message,
-            });
+            logs.push_back(CoreLogEntry { timestamp, message });
             while logs.len() > self.inner.max_log_lines {
                 logs.pop_front();
             }

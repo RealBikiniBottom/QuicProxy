@@ -1,7 +1,7 @@
 use aead::AeadInPlace;
 use aes_gcm::{Aes128Gcm, KeyInit, aes::cipher::Unsigned};
-use chacha20poly1305::ChaCha20Poly1305;
 use bytes::Bytes;
+use chacha20poly1305::ChaCha20Poly1305;
 
 pub trait AeadCipherHelper: AeadInPlace {
     fn new_with_slice(key: &[u8]) -> Self;
@@ -93,12 +93,16 @@ impl AeadCipher {
             VmessSecurity::Aes128Gcm(cipher) => {
                 cipher
                     .decrypt_in_place_with_slice(nonce, &[], &mut buf[..])
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?;
             }
             VmessSecurity::ChaCha20Poly1305(cipher) => {
                 cipher
                     .decrypt_in_place_with_slice(nonce, &[], &mut buf[..])
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?;
             }
         }
 

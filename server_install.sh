@@ -137,14 +137,6 @@ download_and_extract() {
   fi
 
   if [[ -d "$INSTALL_DIR" ]]; then
-    local old_version
-    old_version=$("$BIN_PATH" --version 2>/dev/null || echo "unknown")
-
-    if [[ -f "$BIN_PATH" ]]; then
-      log_info "备份旧版本 (${old_version})..."
-      cp "$BIN_PATH" "${BIN_PATH}.bak.$(date +%s)" 2>/dev/null || true
-    fi
-
     log_info "覆盖安装到 ${INSTALL_DIR} ..."
   else
     mkdir -p "$INSTALL_DIR"
@@ -156,6 +148,7 @@ download_and_extract() {
     exit 1
   }
 
+  rm -f "${BIN_PATH}.bak."* 2>/dev/null || true
   chmod +x "$BIN_PATH"
 
   local installed_version

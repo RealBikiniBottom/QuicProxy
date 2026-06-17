@@ -85,7 +85,10 @@ impl AsyncWrite for AnytlsInboundStream {
         let this = self.get_mut();
         let data = Bytes::copy_from_slice(buf);
         let len = data.len();
-        match this.write_tx.send((this.stream_id, Command::Psh as u8, data)) {
+        match this
+            .write_tx
+            .send((this.stream_id, Command::Psh as u8, data))
+        {
             Ok(_) => std::task::Poll::Ready(Ok(len)),
             Err(_) => std::task::Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -106,7 +109,9 @@ impl AsyncWrite for AnytlsInboundStream {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let _ = this.write_tx.send((this.stream_id, Command::Fin as u8, Bytes::new()));
+        let _ = this
+            .write_tx
+            .send((this.stream_id, Command::Fin as u8, Bytes::new()));
         std::task::Poll::Ready(Ok(()))
     }
 }
@@ -150,8 +155,7 @@ impl AnytlsInboundUdp {
                 if self.is_connect {
                     // Connect mode: length(u16) + data
                     if buf.len() >= 2 {
-                        let payload_len =
-                            u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                        let payload_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
                         let total_needed = 2 + payload_len;
                         if buf.len() >= total_needed {
                             let msg = Bytes::copy_from_slice(&buf[..total_needed]);
@@ -165,7 +169,8 @@ impl AnytlsInboundUdp {
                         if let Ok((_, target_len)) = uot_decode_target(&buf) {
                             if buf.len() >= target_len + 2 {
                                 let payload_len =
-                                    u16::from_be_bytes([buf[target_len], buf[target_len + 1]]) as usize;
+                                    u16::from_be_bytes([buf[target_len], buf[target_len + 1]])
+                                        as usize;
                                 let total_needed = target_len + 2 + payload_len;
                                 if buf.len() >= total_needed {
                                     let msg = Bytes::copy_from_slice(&buf[..total_needed]);
@@ -193,12 +198,7 @@ impl AnytlsInboundUdp {
 
 #[async_trait]
 impl AnyPacket for AnytlsInboundUdp {
-    async fn send_to(
-        &self,
-        buf: Bytes,
-        _from: &SourceAddr,
-        target: &TargetAddr,
-    ) -> Result<usize> {
+    async fn send_to(&self, buf: Bytes, _from: &SourceAddr, target: &TargetAddr) -> Result<usize> {
         let packet = if self.is_connect {
             // Connect mode: length(u16) + data
             let mut p = Vec::with_capacity(2 + buf.len());
@@ -228,8 +228,7 @@ impl AnyPacket for AnytlsInboundUdp {
             if data.len() < 2 {
                 bail!("UoT connect packet too short");
             }
-            let payload_len =
-                u16::from_be_bytes([data[0], data[1]]) as usize;
+            let payload_len = u16::from_be_bytes([data[0], data[1]]) as usize;
             if data.len() < 2 + payload_len {
                 bail!("UoT connect packet too short for payload");
             }
@@ -241,14 +240,12 @@ impl AnyPacket for AnytlsInboundUdp {
             if data.len() < target_len + 2 {
                 bail!("UoT packet too short for length");
             }
-            let payload_len =
-                u16::from_be_bytes([data[target_len], data[target_len + 1]]) as usize;
+            let payload_len = u16::from_be_bytes([data[target_len], data[target_len + 1]]) as usize;
             if data.len() < target_len + 2 + payload_len {
                 bail!("UoT packet too short for payload");
             }
-            let payload = Bytes::copy_from_slice(
-                &data[target_len + 2..target_len + 2 + payload_len],
-            );
+            let payload =
+                Bytes::copy_from_slice(&data[target_len + 2..target_len + 2 + payload_len]);
             Ok((self.client_addr.clone(), target, payload))
         }
     }
@@ -351,7 +348,13 @@ impl InboundSession {
         // Send cmdServerSettings if client version >= 2
         if client_ver >= 2 {
             let settings = format!("v={}\n", PROTOCOL_VERSION);
-            write_frame(&mut tls_write, Command::ServerSettings, 0, settings.as_bytes()).await?;
+            write_frame(
+                &mut tls_write,
+                Command::ServerSettings,
+                0,
+                settings.as_bytes(),
+            )
+            .await?;
         }
 
         // Spawn write loop
@@ -384,19 +387,21 @@ impl InboundSession {
                 }
                 Command::Psh => {
                     // Check stream state
-                    let state_type = self.streams.get(&stream_id).and_then(|e| {
-                        match *e.value() {
-                            StreamState::Pending => Some("pending"),
-                            StreamState::WaitingUotRequest(_) => Some("waiting_uot"),
-                            _ => None,
-                        }
+                    let state_type = self.streams.get(&stream_id).and_then(|e| match *e.value() {
+                        StreamState::Pending => Some("pending"),
+                        StreamState::WaitingUotRequest(_) => Some("waiting_uot"),
+                        _ => None,
                     });
                     if state_type == Some("pending") {
                         let target = match parse_target_from_syn(&data) {
                             Ok(t) => t,
                             Err(e) => {
                                 warn!("Anytls inbound bad target from {}: {:?}", self.peer_addr, e);
-                                let _ = self.write_tx.send((stream_id, Command::Fin as u8, Bytes::new()));
+                                let _ = self.write_tx.send((
+                                    stream_id,
+                                    Command::Fin as u8,
+                                    Bytes::new(),
+                                ));
                                 self.streams.remove(&stream_id);
                                 continue;
                             }
@@ -405,7 +410,8 @@ impl InboundSession {
                         if let TargetAddr::Domain(ref domain, _) = target {
                             if domain == UDP_OVER_TCP_TARGET {
                                 // Wait for UoT Request (SYNACK already sent in SYN handler)
-                                self.streams.insert(stream_id, StreamState::WaitingUotRequest(target));
+                                self.streams
+                                    .insert(stream_id, StreamState::WaitingUotRequest(target));
                                 continue;
                             }
                         }
@@ -462,14 +468,10 @@ impl InboundSession {
         let (data_tx, data_rx) = mpsc::unbounded_channel();
         let write_tx = self.write_tx.clone();
 
-        let stream = Box::new(AnytlsInboundStream::new(
-            stream_id,
-            write_tx,
-            data_rx,
-        )) as crate::proxy::outbound::AnyStream;
+        let stream = Box::new(AnytlsInboundStream::new(stream_id, write_tx, data_rx))
+            as crate::proxy::outbound::AnyStream;
 
-        self.streams
-            .insert(stream_id, StreamState::Active(data_tx));
+        self.streams.insert(stream_id, StreamState::Active(data_tx));
 
         let router = self.router.clone();
         let tag = self.tag.clone();
@@ -483,10 +485,7 @@ impl InboundSession {
         );
         tokio::spawn(
             async move {
-                if let Err(e) = router
-                    .dispatch_stream(stream, &target, &tag)
-                    .await
-                {
+                if let Err(e) = router.dispatch_stream(stream, &target, &tag).await {
                     error!("Anytls inbound TCP routing error: {:?}", e);
                 }
             }
@@ -499,7 +498,9 @@ impl InboundSession {
         // Parse UoT Request: isConnect(u8) + destination(Socksaddr, ATYP 1/3/4)
         if data.is_empty() {
             warn!("Anytls inbound empty UoT request from {}", self.peer_addr);
-            let _ = self.write_tx.send((stream_id, Command::Fin as u8, Bytes::new()));
+            let _ = self
+                .write_tx
+                .send((stream_id, Command::Fin as u8, Bytes::new()));
             self.streams.remove(&stream_id);
             return;
         }
@@ -507,8 +508,13 @@ impl InboundSession {
         let (real_target, addr_len) = match socksaddr_decode_target(&data[1..]) {
             Ok(t) => t,
             Err(e) => {
-                warn!("Anytls inbound bad UoT request from {}: {:?}", self.peer_addr, e);
-                let _ = self.write_tx.send((stream_id, Command::Fin as u8, Bytes::new()));
+                warn!(
+                    "Anytls inbound bad UoT request from {}: {:?}",
+                    self.peer_addr, e
+                );
+                let _ = self
+                    .write_tx
+                    .send((stream_id, Command::Fin as u8, Bytes::new()));
                 self.streams.remove(&stream_id);
                 return;
             }
@@ -538,8 +544,7 @@ impl InboundSession {
         ));
 
         // Transition to Active and consume the WaitingUotRequest entry
-        self.streams
-            .insert(stream_id, StreamState::Active(data_tx));
+        self.streams.insert(stream_id, StreamState::Active(data_tx));
 
         let router = self.router.clone();
         let tag = self.tag.clone();
@@ -587,7 +592,12 @@ async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(Command, u3
     Ok((Command::from(cmd), stream_id, Bytes::from(data)))
 }
 
-async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, cmd: Command, stream_id: u32, data: &[u8]) -> Result<()> {
+async fn write_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    cmd: Command,
+    stream_id: u32,
+    data: &[u8],
+) -> Result<()> {
     let mut header = [0u8; FRAME_HEADER_SIZE];
     header[0] = u8::from(cmd);
     header[1..5].copy_from_slice(&stream_id.to_be_bytes());
@@ -673,7 +683,10 @@ pub struct AnytlsInbound {
 
 impl AnytlsInbound {
     pub fn new(tag: String, cfg: &InboundConfig) -> Result<Self> {
-        let password = cfg.password.clone().context("anytls inbound requires password")?;
+        let password = cfg
+            .password
+            .clone()
+            .context("anytls inbound requires password")?;
         let mut hasher = Sha256::new();
         hasher.update(password.as_bytes());
         let password_hash: [u8; 32] = hasher.finalize().into();
@@ -702,27 +715,28 @@ impl AnytlsInbound {
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let server_config = if let (Some(cert_path), Some(key_path)) = (&self.tls.cert, &self.tls.key) {
-            let certs = load_certs(cert_path)?;
-            let key = load_keys(key_path)?;
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .map_err(|e| new_io_other_error(format!("TLS config error: {}", e)))?
-        } else {
-            info!("Anytls inbound: no TLS cert configured, generating self-signed certificate");
-            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                .map_err(|e| new_io_other_error(format!("Failed to generate cert: {}", e)))?;
-            let cert_der = cert.cert.der().to_vec();
-            let key_der = cert.signing_key.serialize_der();
-            let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
-            let private_key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
-                .map_err(|e| new_io_other_error(format!("Invalid private key: {}", e)))?;
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(cert_chain, private_key)
-                .map_err(|e| new_io_other_error(format!("TLS config error: {}", e)))?
-        };
+        let server_config =
+            if let (Some(cert_path), Some(key_path)) = (&self.tls.cert, &self.tls.key) {
+                let certs = load_certs(cert_path)?;
+                let key = load_keys(key_path)?;
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .map_err(|e| new_io_other_error(format!("TLS config error: {}", e)))?
+            } else {
+                info!("Anytls inbound: no TLS cert configured, generating self-signed certificate");
+                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                    .map_err(|e| new_io_other_error(format!("Failed to generate cert: {}", e)))?;
+                let cert_der = cert.cert.der().to_vec();
+                let key_der = cert.signing_key.serialize_der();
+                let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
+                let private_key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
+                    .map_err(|e| new_io_other_error(format!("Invalid private key: {}", e)))?;
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(cert_chain, private_key)
+                    .map_err(|e| new_io_other_error(format!("TLS config error: {}", e)))?
+            };
 
         let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
@@ -745,22 +759,20 @@ impl AnytlsInbound {
 
             info!("Anytls inbound accept from {}", peer_addr);
             tokio::spawn(async move {
-                let tls_stream = match tokio::time::timeout(
-                    Duration::from_secs(30),
-                    acceptor.accept(socket),
-                )
-                .await
-                {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => {
-                        error!("Anytls inbound TLS error from {}: {}", peer_addr, e);
-                        return;
-                    }
-                    Err(_) => {
-                        error!("Anytls inbound TLS timeout from {}", peer_addr);
-                        return;
-                    }
-                };
+                let tls_stream =
+                    match tokio::time::timeout(Duration::from_secs(30), acceptor.accept(socket))
+                        .await
+                    {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            error!("Anytls inbound TLS error from {}: {}", peer_addr, e);
+                            return;
+                        }
+                        Err(_) => {
+                            error!("Anytls inbound TLS timeout from {}", peer_addr);
+                            return;
+                        }
+                    };
 
                 if let Err(e) = InboundSession::new(
                     tls_stream,
@@ -840,10 +852,7 @@ mod tests {
         data.extend_from_slice(domain);
         data.extend_from_slice(&443u16.to_be_bytes()); // port 443
         let result = parse_target_from_syn(&data).expect("parse domain SYN");
-        assert_eq!(
-            result,
-            TargetAddr::Domain("localhost".to_string(), 443)
-        );
+        assert_eq!(result, TargetAddr::Domain("localhost".to_string(), 443));
     }
 
     #[test]
@@ -870,10 +879,7 @@ mod tests {
         let result = parse_target_from_syn(&data).expect("parse IPv6 SYN");
         assert_eq!(
             result,
-            TargetAddr::Ip(std::net::SocketAddr::new(
-                std::net::IpAddr::V6(ipv6),
-                9000
-            ))
+            TargetAddr::Ip(std::net::SocketAddr::new(std::net::IpAddr::V6(ipv6), 9000))
         );
     }
 

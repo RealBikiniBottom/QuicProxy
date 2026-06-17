@@ -1,9 +1,9 @@
+pub mod anytls;
 pub mod http;
 pub mod mix;
 pub mod shadowquic;
 pub mod socks5;
 pub mod trojan;
-pub mod anytls;
 
 #[cfg(feature = "premium")]
 pub use crate::premium::tun;
@@ -11,12 +11,12 @@ pub use crate::premium::tun;
 use crate::premium::tun::tun::TunInbound;
 
 use crate::config::Config;
+use crate::proxy::inbound::anytls::AnytlsInbound;
 use crate::proxy::inbound::http::HttpInbound;
 use crate::proxy::inbound::mix::MixInbound;
 use crate::proxy::inbound::shadowquic::ShadowQuicInbound;
 use crate::proxy::inbound::socks5::Socks5Inbound;
 use crate::proxy::inbound::trojan::TrojanInbound;
-use crate::proxy::inbound::anytls::AnytlsInbound;
 use crate::proxy::observe::get_observer;
 use crate::utils::interface::InterfaceManager;
 use crate::utils::shutdown;

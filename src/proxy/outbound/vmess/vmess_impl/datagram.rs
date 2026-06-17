@@ -35,10 +35,7 @@ impl OutboundDatagramVmess {
 impl futures::Sink<(TargetAddr, bytes::Bytes)> for OutboundDatagramVmess {
     type Error = io::Error;
 
-    fn poll_ready(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if !self.flushed {
             match self.poll_flush(cx)? {
                 Poll::Ready(()) => {}
@@ -59,10 +56,7 @@ impl futures::Sink<(TargetAddr, bytes::Bytes)> for OutboundDatagramVmess {
         Ok(())
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if self.flushed {
             return Poll::Ready(Ok(()));
         }
@@ -118,10 +112,7 @@ impl futures::Sink<(TargetAddr, bytes::Bytes)> for OutboundDatagramVmess {
         }
     }
 
-    fn poll_close(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.poll_flush(cx))?;
         Poll::Ready(Ok(()))
     }
@@ -130,10 +121,7 @@ impl futures::Sink<(TargetAddr, bytes::Bytes)> for OutboundDatagramVmess {
 impl futures::Stream for OutboundDatagramVmess {
     type Item = PacketInfo;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let Self {
             ref mut buf,
             ref mut inner,
@@ -149,11 +137,7 @@ impl futures::Stream for OutboundDatagramVmess {
             Ok(()) => {
                 let n = read_buf.filled().len();
                 let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                Poll::Ready(Some((
-                    remote_addr.clone(),
-                    TargetAddr::dummy(),
-                    data,
-                )))
+                Poll::Ready(Some((remote_addr.clone(), TargetAddr::dummy(), data)))
             }
             Err(_) => Poll::Ready(None),
         }

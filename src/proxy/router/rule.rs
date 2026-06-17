@@ -138,8 +138,16 @@ impl Rule {
             .transpose()?;
 
         // 6. DNS / Reverse: 直接借用，避免多余 clone
-        let reverse = cfg.reverse.as_ref().map(|tag| get_dns_by_tag(tag)).transpose()?;
-        let dns = cfg.dns.as_ref().map(|tag| get_dns_by_tag(tag)).transpose()?;
+        let reverse = cfg
+            .reverse
+            .as_ref()
+            .map(|tag| get_dns_by_tag(tag))
+            .transpose()?;
+        let dns = cfg
+            .dns
+            .as_ref()
+            .map(|tag| get_dns_by_tag(tag))
+            .transpose()?;
 
         // 7. 字符串/集合字段: 过滤空值并克隆
         let port = cfg.port.as_ref().filter(|v| !v.is_empty()).cloned();

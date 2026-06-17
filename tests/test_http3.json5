@@ -52,7 +52,7 @@
           "real_out",
         ]
       },
-      "real_out2": {
+      "real_out": {
         "type": "shadowquic",
         "address": "127.0.0.1",
         "port": 2344,
@@ -67,7 +67,7 @@
           "sni": "www.apple.com"
         }
       },
-      "real_out": {
+      "real_out2": {
         "type": "anytls",
         "address": "127.0.0.1",
         // "port": 8443,
@@ -245,7 +245,7 @@
   },
   "cache": {
     "all_cache": {
-      "memory_size": 100,
+      "memory_size": 0,
       "path": "test_cache.db"
     }
   },

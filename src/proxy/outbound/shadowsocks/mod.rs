@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 // futures used via Sink/Stream supertrait methods in vmess
 use shadowsocks::{
-    ProxyClientStream, ProxySocket, ServerConfig, config::ServerType, context::Context as SsContext,
-    relay::udprelay::proxy_socket::UdpSocketType,
+    ProxyClientStream, ProxySocket, ServerConfig, config::ServerType,
+    context::Context as SsContext, relay::udprelay::proxy_socket::UdpSocketType,
 };
 
 use crate::config::OutboundConfig;
@@ -40,9 +40,7 @@ fn map_cipher(cipher: &str) -> std::io::Result<shadowsocks::crypto::CipherKind> 
         "chacha20-ietf-poly1305" => Ok(CipherKind::CHACHA20_POLY1305),
         "2022-blake3-aes-128-gcm" => Ok(CipherKind::AEAD2022_BLAKE3_AES_128_GCM),
         "2022-blake3-aes-256-gcm" => Ok(CipherKind::AEAD2022_BLAKE3_AES_256_GCM),
-        "2022-blake3-chacha20-ietf-poly1305" => {
-            Ok(CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305)
-        }
+        "2022-blake3-chacha20-ietf-poly1305" => Ok(CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305),
         "rc4-md5" => Ok(CipherKind::SS_RC4_MD5),
         _ => Err(std::io::Error::other("unsupported cipher")),
     }
@@ -59,10 +57,10 @@ impl ShadowsocksOutbound {
             .context(format!("shadowsocks outbound '{}' requires port", tag))?;
         let server = TargetAddr::from_str2(&address, port)?;
 
-        let password = cfg.password.clone().context(format!(
-            "shadowsocks outbound '{}' requires password",
-            tag
-        ))?;
+        let password = cfg
+            .password
+            .clone()
+            .context(format!("shadowsocks outbound '{}' requires password", tag))?;
 
         let cipher = cfg
             .udp_mod
@@ -128,12 +126,8 @@ impl AnyOutbound for ShadowsocksOutbound {
             .server_config()
             .map_err(|e| new_io_other_error(format!("ss config: {}", e)))?;
 
-        let ss_stream = ProxyClientStream::from_stream(
-            ctx,
-            stream,
-            &cfg,
-            (target.host(), target.port()),
-        );
+        let ss_stream =
+            ProxyClientStream::from_stream(ctx, stream, &cfg, (target.host(), target.port()));
 
         Ok(Box::new(ShadowSocksStream(ss_stream)))
     }
@@ -164,11 +158,18 @@ struct SsUdpSocket<S> {
 
 impl<S> SsUdpSocket<S>
 where
-    S: shadowsocks::relay::udprelay::DatagramSend + shadowsocks::relay::udprelay::DatagramReceive + Unpin,
+    S: shadowsocks::relay::udprelay::DatagramSend
+        + shadowsocks::relay::udprelay::DatagramReceive
+        + Unpin,
 {
     fn new(socket: ProxySocket<S>, remote_addr: std::net::SocketAddr) -> Self {
         Self {
-            inner: Mutex::new(crate::proxy::outbound::shadowsocks::datagram::OutboundDatagramShadowsocks::new(socket, remote_addr)),
+            inner: Mutex::new(
+                crate::proxy::outbound::shadowsocks::datagram::OutboundDatagramShadowsocks::new(
+                    socket,
+                    remote_addr,
+                ),
+            ),
         }
     }
 }
@@ -183,12 +184,7 @@ where
         + Sync
         + 'static,
 {
-    async fn send_to(
-        &self,
-        buf: Bytes,
-        _from: &SourceAddr,
-        target: &TargetAddr,
-    ) -> Result<usize> {
+    async fn send_to(&self, buf: Bytes, _from: &SourceAddr, target: &TargetAddr) -> Result<usize> {
         use futures::SinkExt;
         let len = buf.len();
         let mut inner = self.inner.lock().await;
@@ -226,7 +222,8 @@ mod tests {
             "gso": false,
             "min_mtu": 1200,
             "initial_mtu": 1200,
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     #[test]

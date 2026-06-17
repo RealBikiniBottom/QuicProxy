@@ -1,11 +1,11 @@
 use std::io;
 
+use crate::proxy::TargetAddr;
 use crate::proxy::outbound::vmess::vmess_impl::stream;
 use crate::proxy::outbound::vmess::vmess_impl::user::{self, new_alter_id_list};
 use crate::proxy::outbound::vmess::vmess_impl::{
     SECURITY_AES_128_GCM, SECURITY_CHACHA20_POLY1305, SECURITY_NONE,
 };
-use crate::proxy::TargetAddr;
 
 #[derive(Clone)]
 pub struct VmessOption {
