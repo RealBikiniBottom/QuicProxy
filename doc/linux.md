@@ -10,7 +10,7 @@
 ## 一键安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/main/linux_install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/linux_install.sh | sudo bash
 ```
 
 安装完成后终端会打印随机生成的 API 密码和管理面板地址。打开浏览器输入 web 地址，就可以直接使用了。
