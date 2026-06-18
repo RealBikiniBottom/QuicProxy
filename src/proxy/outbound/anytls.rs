@@ -4,7 +4,7 @@ use std::{
     io::BufReader,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex as SyncMutex,
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -1067,8 +1067,8 @@ struct AnytlsProxyStream {
     stream_id: u32,
     session: Arc<Session>,
     write_tx: tokio::sync::mpsc::UnboundedSender<(u32, u8, Bytes)>,
-    event_rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>>,
-    read_buffer: Mutex<Vec<u8>>,
+    event_rx: SyncMutex<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>>,
+    read_buffer: SyncMutex<Vec<u8>>,
     fin_received: AtomicBool,
     fin_sent: AtomicBool,
 }
@@ -1083,8 +1083,8 @@ impl AnytlsProxyStream {
             stream_id,
             write_tx: session.write_tx.clone(),
             session,
-            event_rx: Mutex::new(event_rx),
-            read_buffer: Mutex::new(Vec::new()),
+            event_rx: SyncMutex::new(event_rx),
+            read_buffer: SyncMutex::new(Vec::new()),
             fin_received: AtomicBool::new(false),
             fin_sent: AtomicBool::new(false),
         }
@@ -1101,14 +1101,7 @@ impl AsyncRead for AnytlsProxyStream {
 
         // Serve from read buffer first
         {
-            let mut rb = match this.read_buffer.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-            };
-
+            let mut rb = this.read_buffer.lock().unwrap();
             if !rb.is_empty() {
                 let to_copy = rb.len().min(buf.remaining());
                 buf.put_slice(&rb[..to_copy]);
@@ -1121,47 +1114,35 @@ impl AsyncRead for AnytlsProxyStream {
             return Poll::Ready(Ok(()));
         }
 
-        // Try to get an event
-        let mut rx = match this.event_rx.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-        };
-
-        match rx.try_recv() {
-            Ok(StreamEvent::Data(data)) => {
+        // Poll the event receiver (properly registers waker)
+        let mut rx = this.event_rx.lock().unwrap();
+        match rx.poll_recv(cx) {
+            Poll::Ready(Some(StreamEvent::Data(data))) => {
                 drop(rx);
-                // Put data into the output buffer first, remainder into read_buffer
                 let to_copy = data.len().min(buf.remaining());
                 buf.put_slice(&data[..to_copy]);
                 if to_copy < data.len() {
-                    if let Ok(mut rb) = this.read_buffer.try_lock() {
-                        rb.extend_from_slice(&data[to_copy..]);
-                    }
+                    let mut rb = this.read_buffer.lock().unwrap();
+                    rb.extend_from_slice(&data[to_copy..]);
                 }
-                return Poll::Ready(Ok(()));
+                Poll::Ready(Ok(()))
             }
-            Ok(StreamEvent::Fin) => {
+            Poll::Ready(Some(StreamEvent::Fin)) => {
                 this.fin_received.store(true, Ordering::Release);
-                return Poll::Ready(Ok(()));
+                Poll::Ready(Ok(()))
             }
-            Ok(StreamEvent::SynAckError(e)) => {
-                return Poll::Ready(Err(std::io::Error::new(
+            Poll::Ready(Some(StreamEvent::SynAckError(e))) => {
+                Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
                     String::from_utf8_lossy(&e).to_string(),
-                )));
+                )))
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            Poll::Ready(None) => {
                 this.fin_received.store(true, Ordering::Release);
-                return Poll::Ready(Ok(()));
+                Poll::Ready(Ok(()))
             }
+            Poll::Pending => Poll::Pending,
         }
-
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 }
 

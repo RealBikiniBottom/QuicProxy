@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
@@ -28,7 +28,7 @@ struct AnytlsInboundStream {
     /// Channel to send data frames to the session's write loop
     write_tx: mpsc::UnboundedSender<(u32, u8, Bytes)>,
     /// Receiver for incoming data
-    data_rx: Mutex<mpsc::UnboundedReceiver<Bytes>>,
+    data_rx: SyncMutex<mpsc::UnboundedReceiver<Bytes>>,
 }
 
 impl AnytlsInboundStream {
@@ -40,7 +40,7 @@ impl AnytlsInboundStream {
         Self {
             stream_id,
             write_tx,
-            data_rx: Mutex::new(data_rx),
+            data_rx: SyncMutex::new(data_rx),
         }
     }
 }
@@ -52,26 +52,17 @@ impl AsyncRead for AnytlsInboundStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let mut rx = match this.data_rx.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                return std::task::Poll::Pending;
-            }
-        };
-        match rx.try_recv() {
-            Ok(data) => {
+        let mut rx = this.data_rx.lock().unwrap();
+        match rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(data)) => {
                 let to_copy = data.len().min(buf.remaining());
                 buf.put_slice(&data[..to_copy]);
                 std::task::Poll::Ready(Ok(()))
             }
-            Err(mpsc::error::TryRecvError::Empty) => {
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-            Err(mpsc::error::TryRecvError::Disconnected) => {
+            std::task::Poll::Ready(None) => {
                 std::task::Poll::Ready(Ok(())) // EOF
             }
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }

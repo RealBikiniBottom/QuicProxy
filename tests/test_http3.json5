@@ -52,7 +52,7 @@
           "real_out",
         ]
       },
-      "real_out": {
+      "real_out2": {
         "type": "shadowquic",
         "address": "127.0.0.1",
         "port": 2344,
@@ -67,7 +67,7 @@
           "sni": "www.apple.com"
         }
       },
-      "real_out2": {
+      "real_out": {
         "type": "anytls",
         "address": "127.0.0.1",
         // "port": 8443,
