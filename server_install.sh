@@ -495,7 +495,6 @@ JSON5EOF
       "address": "0.0.0.0",
       "port": ${port},
       "idle_timeout": ${idle_timeout},
-      "gso": true,
       "tls": {
         "enable_jls": true,
         "jls_username": "${USERNAME}",
