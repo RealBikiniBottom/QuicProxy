@@ -76,7 +76,10 @@ async fn request_once_with_body(
             .context("DNS lookup returned no results")?;
         TargetAddr::Ip(std::net::SocketAddr::new(ip, port))
     };
-    let stream = outbound.connect_stream(&target).await?;
+    let stream = outbound
+        .connect_stream(&target)
+        .await
+        .context("http connect_stream")?;
     let stream = maybe_wrap_tls(&url, host, stream).await?;
 
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream))

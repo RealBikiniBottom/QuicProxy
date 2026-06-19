@@ -333,7 +333,7 @@ impl Rule {
                     let geoip = match get_geoip_by_tag(item) {
                         Ok(g) => g,
                         Err(e) => {
-                            error!("can not find geoip {}: {}", item, e);
+                            error!("can not find geoip tag [{}]", item);
                             continue;
                         }
                     };
@@ -344,7 +344,7 @@ impl Rule {
                                 break;
                             }
                         }
-                        Err(e) => error!("geoip lookup failed for {}: {}", item, e),
+                        Err(e) => error!("can not find geoip [{}]: {:#}", item, e),
                     }
                 }
                 if !is_matched {

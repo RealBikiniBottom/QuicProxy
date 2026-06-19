@@ -500,7 +500,7 @@ impl QuinnClient {
 
         let runtime =
             quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
-        let mut endpoint =
+        let endpoint =
             quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
                 .context("Failed to create QUIC endpoint")?;
         endpoint.set_default_client_config(client_config);

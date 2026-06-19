@@ -482,16 +482,16 @@ pub trait AnyDNS: Send + Sync + 'static {
         None
     }
 
-    async fn exchange(&self, packet_bytes: &[u8]) -> Result<Vec<u8>>;
+    async fn exchange(&self, packet_bytes: &[u8]) -> Result<Vec<u8>> {
+        self.exchange_with_outbound(packet_bytes, self.default_outbound())
+            .await
+    }
 
     async fn exchange_with_outbound(
         &self,
         packet_bytes: &[u8],
         outbound: Arc<dyn AnyOutbound>,
-    ) -> Result<Vec<u8>> {
-        let _ = outbound;
-        self.exchange(packet_bytes).await
-    }
+    ) -> Result<Vec<u8>>;
 
     fn default_outbound(&self) -> Arc<dyn AnyOutbound>;
 
@@ -598,11 +598,6 @@ impl AnyDNS for UdpDns {
         self.reject_ipv6
     }
 
-    async fn exchange(&self, packet_bytes: &[u8]) -> Result<Vec<u8>> {
-        self.exchange_with_outbound(packet_bytes, self.default_outbound())
-            .await
-    }
-
     async fn exchange_with_outbound(
         &self,
         packet_bytes: &[u8],
@@ -705,11 +700,6 @@ impl AnyDNS for HttpsDns {
 
     fn dns_server(&self) -> Option<&str> {
         self.dns_server_name.as_deref()
-    }
-
-    async fn exchange(&self, packet_bytes: &[u8]) -> Result<Vec<u8>> {
-        self.exchange_with_outbound(packet_bytes, self.default_outbound())
-            .await
     }
 
     async fn exchange_with_outbound(
@@ -1058,6 +1048,14 @@ impl AnyDNS for FakeIPDNS {
             IpAddr::V4(ip) => self.ipv4_cidr.contains(ip),
             IpAddr::V6(ip) => self.ipv6_cidr.contains(ip),
         }
+    }
+
+    async fn exchange_with_outbound(
+        &self,
+        packet_bytes: &[u8],
+        _outbound: Arc<dyn AnyOutbound>,
+    ) -> Result<Vec<u8>> {
+        self.exchange(packet_bytes).await
     }
 
     fn default_outbound(&self) -> Arc<dyn AnyOutbound> {
