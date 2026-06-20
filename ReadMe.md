@@ -19,16 +19,16 @@
 
 得益于 JLS，不需要购买域名、不需要自己生成证书；小白友好，不需要任何配置东西：
 
-- 下载
-- 安装
-- 导入订阅
-- 启动
+> 1. 下载
+> 2. 安装
+> 3. 导入订阅
+> 4. 启动
 
 只有 4 步直接使用我们推荐的最佳实践：
 
-- 精确的国内国外分流
-- 不泄露 DNS 查询
-- 自动选择最佳节点
+> - 精确的国内国外分流
+> - 不泄露 DNS 查询
+> - 自动选择最佳节点
 
 ## 三步搭建属于自己的节点
 
@@ -38,7 +38,7 @@
 curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/server_install.sh | sudo bash
 ```
 
-脚本会自动完成，输出[订阅链接](https://github.com/RealBikiniBottom/QuicProxy/discussions/2)，导入客户端即可使用。具体使用教程参考[这里](./doc/server.md)。
+脚本会自动完成，输出[订阅链接](https://github.com/RealBikiniBottom/QuicProxy/discussions/2)，复制粘贴到客户端即可使用。具体使用教程参考[这里](./doc/server.md)。
 
 ## 支持的协议
 
