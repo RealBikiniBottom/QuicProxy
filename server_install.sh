@@ -684,21 +684,32 @@ generate_subscription_url() {
     fi
   } > "${INSTALL_DIR}/subscription.txt"
 
-  # 简化输出：直接显示订阅链接
+  # 突出显示订阅链接
+  local BOLD='\033[1m'
+  local WHITE='\033[1;37m'
+
   echo ""
+  echo -e "  ${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "  ${YELLOW}║${NC}  ${BOLD}${WHITE}📋 订 阅 链 接${NC}                                                 ${YELLOW}║${NC}"
+  echo -e "  ${YELLOW}║${NC}  ${CYAN}请复制下面单独一整行链接，或复制备份文件内容${NC}              ${YELLOW}║${NC}"
+  echo -e "  ${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+
   if $sq_enabled; then
-    echo "$sq_url"
+    echo -e "${GREEN}${BOLD}${sq_url}${NC}"
   fi
+
   if $anytls_enabled; then
-    echo "$anytls_url"
+    echo -e "${GREEN}${BOLD}${anytls_url}${NC}"
   fi
+
   if $trojan_enabled; then
-    echo "$trojan_url"
+    echo -e "${GREEN}${BOLD}${trojan_url}${NC}"
   fi
+
   echo ""
 
   log_info "以上订阅链接已备份到 ${INSTALL_DIR}/subscription.txt"
-  log_info "随时用 cat ${INSTALL_DIR}/subscription.txt 查看"
+  log_info "可以随时用 cat ${INSTALL_DIR}/subscription.txt 查看"
   echo ""
   echo -e "  ${YELLOW}管理命令:${NC}"
   echo -e "    systemctl status   ${SERVICE_NAME}    # 查看状态"
