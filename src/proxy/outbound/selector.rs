@@ -111,8 +111,8 @@ impl SelectorOutbound {
         let interval = match cfg.interval {
             Some(secs) => Duration::from_secs(secs),
             None => match selector_type {
-                SelectorType::Manual => Duration::from_secs(300),
-                SelectorType::UrlTest => parse_duration("5m"),
+                SelectorType::Manual => parse_duration("3h"),
+                SelectorType::UrlTest => parse_duration("3h"),
             },
         };
 
