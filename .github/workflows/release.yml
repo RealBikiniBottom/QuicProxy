@@ -375,45 +375,45 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install web dependencies
-        working-directory: ./src/premium/web
-        run: npm install
-
       - name: Prepare web download assets directory
-        run: mkdir -p src/premium/web/static/downloads
+        run: mkdir -p src/premium/web/static/assets
 
       - uses: actions/download-artifact@v4
         with:
           name: quicproxy-core-linux-x64
-          path: src/premium/web/static/downloads
+          path: src/premium/web/static/assets
 
       - uses: actions/download-artifact@v4
         with:
           name: quicproxy-core-linux-arm64
-          path: src/premium/web/static/downloads
+          path: src/premium/web/static/assets
 
       - uses: actions/download-artifact@v4
         with:
           name: quicproxy-core-linux-arm32
-          path: src/premium/web/static/downloads
+          path: src/premium/web/static/assets
 
       - uses: actions/download-artifact@v4
         with:
           name: quicproxy-core-windows-x64
-          path: src/premium/web/static/downloads
+          path: src/premium/web/static/assets
 
       - uses: actions/download-artifact@v4
         with:
           name: quicproxy-flutter-windows-setup
-          path: src/premium/web/static/downloads
+          path: src/premium/web/static/assets
 
       - uses: actions/download-artifact@v4
         with:
           name: quicproxy-flutter-android
-          path: src/premium/web/static/downloads
+          path: src/premium/web/static/assets
 
       - name: List web download assets
-        run: ls -la src/premium/web/static/downloads/
+        run: ls -la src/premium/web/static/assets/
+
+      - name: Install web dependencies
+        working-directory: ./src/premium/web
+        run: npm install
 
       - name: Build web
         working-directory: ./src/premium/web
@@ -606,7 +606,3 @@ jobs:
             | 🐧 Linux arm64 | `quicproxy-core-linux-arm64.tar.gz` |
             | 🐧 Linux arm32 | `quicproxy-core-linux-arm32.tar.gz` |
             | 🪟 Windows x64 (Core) | `quicproxy-core-windows-x64.zip` |
-
-            > 💡 直接下载链接始终指向最新版:
-            > - https://github.com/RealBikiniBottom/QuicProxy/releases/latest/download/QuicProxy-Windows-Setup.exe
-            > - https://github.com/RealBikiniBottom/QuicProxy/releases/latest/download/QuicProxy-Android.apk
