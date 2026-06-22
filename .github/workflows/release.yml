@@ -373,9 +373,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: src/premium/web/package-lock.json
+          node-version: "24"
 
       - name: Install web dependencies
         working-directory: ./src/premium/web
