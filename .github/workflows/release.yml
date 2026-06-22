@@ -373,13 +373,47 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: src/premium/web/package-lock.json
+          node-version: "24"
 
       - name: Install web dependencies
         working-directory: ./src/premium/web
-        run: npm ci
+        run: npm install
+
+      - name: Prepare web download assets directory
+        run: mkdir -p src/premium/web/static/downloads
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-core-linux-x64
+          path: src/premium/web/static/downloads
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-core-linux-arm64
+          path: src/premium/web/static/downloads
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-core-linux-arm32
+          path: src/premium/web/static/downloads
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-core-windows-x64
+          path: src/premium/web/static/downloads
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-flutter-windows-setup
+          path: src/premium/web/static/downloads
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-flutter-android
+          path: src/premium/web/static/downloads
+
+      - name: List web download assets
+        run: ls -la src/premium/web/static/downloads/
 
       - name: Build web
         working-directory: ./src/premium/web
