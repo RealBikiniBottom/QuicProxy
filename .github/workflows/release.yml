@@ -606,7 +606,3 @@ jobs:
             | 🐧 Linux arm64 | `quicproxy-core-linux-arm64.tar.gz` |
             | 🐧 Linux arm32 | `quicproxy-core-linux-arm32.tar.gz` |
             | 🪟 Windows x64 (Core) | `quicproxy-core-windows-x64.zip` |
-
-            > 💡 直接下载链接始终指向最新版:
-            > - https://github.com/RealBikiniBottom/QuicProxy/releases/latest/download/QuicProxy-Windows-Setup.exe
-            > - https://github.com/RealBikiniBottom/QuicProxy/releases/latest/download/QuicProxy-Android.apk
