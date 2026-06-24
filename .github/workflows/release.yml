@@ -369,7 +369,6 @@ jobs:
       - uses: webfactory/ssh-agent@v0.9.1
         with:
           ssh-private-key: ${{ secrets.PRIVATE_KEY }}
-      - run: git clone git@github.com:RealBikiniBottom/premium.git ./src/premium
 
       - uses: actions/setup-node@v4
         with:
@@ -415,9 +414,42 @@ jobs:
         working-directory: ./src/premium/web
         run: npm install
 
+      - name: Generate web release metadata
+        run: |
+          VERSION_TAG="${{ github.ref_name }}"
+          echo "RELEASE_VERSION=${VERSION_TAG}" >> $GITHUB_ENV
+          echo "RELEASE_PUBLISHED_AT=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+          echo "✓ Release metadata: version=${VERSION_TAG}"
+
+          # 确保 data 目录存在
+          mkdir -p src/premium/web/src/data
+
+          # 生成版本元数据文件，供 web 构建时使用
+          cat > src/premium/web/src/data/release-metadata.json << EOF
+          {
+            "version": "${VERSION_TAG}",
+            "publishedAt": "$(date -u '+%Y-%m-%d %H:%M:%S UTC')",
+            "assets": [
+              { "platform": "Windows", "file": "QuicProxy-Windows-Setup.exe", "type": "installer" },
+              { "platform": "Android", "file": "QuicProxy-Android.apk", "type": "apk" },
+              { "platform": "Linux x64", "file": "quicproxy-core-linux-x64.tar.gz", "type": "core" },
+              { "platform": "Linux arm64", "file": "quicproxy-core-linux-arm64.tar.gz", "type": "core" },
+              { "platform": "Linux arm32", "file": "quicproxy-core-linux-arm32.tar.gz", "type": "core" },
+              { "platform": "Windows x64 (Core)", "file": "quicproxy-core-windows-x64.zip", "type": "core" }
+            ]
+          }
+          EOF
+          echo "✓ Generated release-metadata.json"
+
       - name: Build web
         working-directory: ./src/premium/web
-        run: npm run build
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          # 使用当前 UTC 时间作为发布时间（Docusaurus 通过环境变量读取）
+          export RELEASE_PUBLISHED_AT="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Building web with RELEASE_VERSION=${RELEASE_VERSION}, RELEASE_PUBLISHED_AT=${RELEASE_PUBLISHED_AT}"
+          npm run build
 
       - name: Push web build
         run: |
