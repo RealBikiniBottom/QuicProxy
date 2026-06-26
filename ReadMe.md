@@ -74,13 +74,15 @@ curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/s
 
 **弱网高可用**，尤其合适网络经常变化的地方，比如说在高铁上信号基站经常切换，Shadowquic 丝滑切换，用户感受不到切换重连的卡顿
 
-<!-- ## 先进的拥塞算法 -->
+## 先进的拥塞算法
 
-<!-- 使用 BBRv3，更快的启动延迟、稳定的发送窗口、在移动端（信号强弱经常变化）的表现更加亮眼！ -->
+> 正在等待上游适配
+
+使用 BBRv3，更快的启动延迟、稳定的发送窗口、在移动端（信号强弱经常变化）的表现更加亮眼！
 
 ## UDP 友好
 
-Full Cone，使用 UDP Extension，完美解决代理 QUIC 速度慢等历史遗留问题，加密且链接传输 UDP，对游戏更加友好。
+Full Cone 且使用 UDP Extension，完美解决代理 QUIC 速度慢等历史遗留问题，加密且无序传输 UDP，更加符合 UDP 的特点，对游戏更加友好。
 
 ## 低内存
 
