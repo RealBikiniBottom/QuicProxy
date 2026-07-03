@@ -12,8 +12,8 @@
 | 📱 **Android** | [⬇ 下载 APK](https://github.com/RealBikiniBottom/QuicProxy/releases/latest/download/QuicProxy-Android.apk)         | `.apk` APP                                                 |
 |  🐧 **Linux**  | [安装教程](./doc/linux.md) 和 [搭建节点](#三步搭建属于自己的节点)                                                   | 有无 gui 的 Linux 都可以用                                 |
 | 🛜 **软路由**  | 参考[安装教程](./doc/linux.md)                                                                                      | 包含 [Web 面板](https://github.com/spongebob888/quicboard) |
+|   📱 **iOS**   | [App Store](https://apps.apple.com/us/app/quicproxy/id6775813506?l=zh-Hans-CN)                                      | 仅对非中国大陆区苹果 ID 开放                               |
 |  🍎 **macOS**  | _即将发布_                                                                                                          |                                                            |
-|   📱 **iOS**   | _即将发布_                                                                                                          |                                                            |
 
 ## 简单易用(Out of the box)
 
