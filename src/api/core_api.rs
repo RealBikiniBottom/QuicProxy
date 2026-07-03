@@ -388,7 +388,12 @@ async fn get_trace(
     )
     .await
     {
-        Ok(r) => Ok(Json(r)),
+        Ok(r) => {
+            if let Some(sel) = outbound.as_selector() {
+                sel.try_url_test_reselect();
+            }
+            Ok(Json(r))
+        }
         Err(_) => {
             state
                 .observer

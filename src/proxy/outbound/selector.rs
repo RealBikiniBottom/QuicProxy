@@ -232,43 +232,80 @@ impl SelectorOutbound {
                 warn!("UrlTest [{}] all outbounds failed latency test", self.tag);
                 return;
             }
+            self.apply_url_test_selection(&results);
+        }
+    }
 
-            let min_latency = results.iter().map(|(_, l)| *l).min().unwrap_or(0);
+    /// Trigger UrlTest reselection based on cached latency data from the observer.
+    /// Called when a child outbound's latency is updated (e.g., via get_trace API).
+    pub fn try_url_test_reselect(&self) {
+        if self.selector_type != SelectorType::UrlTest {
+            return;
+        }
 
-            // Find the first outbound (in list order) that is within tolerance
-            let mut best_idx = results[0].0;
-            for (idx, latency) in results {
-                if latency <= min_latency + self.tolerance {
-                    best_idx = idx;
-                    break;
+        let Some(observer) = self.observer.clone().or_else(get_observer) else {
+            debug!(
+                "UrlTest [{}] skipped reselect: observer not ready",
+                self.tag
+            );
+            return;
+        };
+
+        let mut results = Vec::with_capacity(self.outbounds.len());
+        for (i, child) in self.outbounds.iter().enumerate() {
+            let tag = child.tag();
+            if let Some(trace) = observer.get_outbound_trace(tag) {
+                results.push((i, trace.latency_us));
+            }
+        }
+
+        if results.is_empty() {
+            warn!(
+                "UrlTest [{}] all outbounds have no latency data, skipping reselect",
+                self.tag
+            );
+            return;
+        }
+
+        self.apply_url_test_selection(&results);
+    }
+
+    fn apply_url_test_selection(&self, results: &[(usize, u64)]) {
+        let min_latency = results.iter().map(|(_, l)| *l).min().unwrap_or(0);
+
+        // Find the first outbound (in list order) that is within tolerance
+        let mut best_idx = results[0].0;
+        for (idx, latency) in results {
+            if *latency <= min_latency + self.tolerance {
+                best_idx = *idx;
+                break;
+            }
+        }
+
+        let old_idx = self.selected_index.load(Ordering::Relaxed);
+        if old_idx != best_idx {
+            info!(
+                "UrlTest [{}] switching from {} to {} (min latency: {} us, tolerance: {} us)",
+                self.tag,
+                self.outbounds[old_idx].tag(),
+                self.outbounds[best_idx].tag(),
+                min_latency,
+                self.tolerance
+            );
+            self.selected_index.store(best_idx, Ordering::Relaxed);
+
+            if let Some(ref cache) = self.cache {
+                if let Err(e) = cache.set("selected", &self.outbound_tags[best_idx]) {
+                    warn!("UrlTest [{}] failed to persist selection: {}", self.tag, e);
                 }
             }
-
-            let old_idx = self.selected_index.load(Ordering::Relaxed);
-            if old_idx != best_idx {
-                info!(
-                    "UrlTest [{}] switching from {} to {} (min latency: {} us, tolerance: {} us)",
-                    self.tag,
-                    self.outbounds[old_idx].tag(),
-                    self.outbounds[best_idx].tag(),
-                    min_latency,
-                    self.tolerance
-                );
-                self.selected_index.store(best_idx, Ordering::Relaxed);
-
-                if let Some(ref cache) = self.cache {
-                    if let Err(e) = cache.set("selected", &self.outbound_tags[best_idx]) {
-                        warn!("UrlTest [{}] failed to persist selection: {}", self.tag, e);
-                    }
-                }
-            } else {
-                debug!(
-                    "UrlTest [{}] keeping {} (min latency: {} us)",
-                    self.tag,
-                    self.outbounds[old_idx].tag(),
-                    min_latency
-                );
-            }
+        } else {
+            debug!(
+                "UrlTest [{}] keeping {} (min latency: {} us)",
+                self.tag,
+                self.outbounds[old_idx].tag(),
+                min_latency
+            );
         }
     }
 

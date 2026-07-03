@@ -145,6 +145,7 @@ impl CoreManager {
                 let reader = tokio::io::BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    println!("[core] {}", line);
                     cm.push_log(line);
                 }
             });
@@ -158,6 +159,7 @@ impl CoreManager {
                 let reader = tokio::io::BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    eprintln!("[core] {}", line);
                     cm.push_log(line);
                 }
             });

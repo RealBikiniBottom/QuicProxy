@@ -65,13 +65,12 @@ impl AnyPacket for DnsUdpOutbound {
         let current_span = tracing::Span::current();
         tokio::spawn(
             async move {
-                debug!("send dns query for {}", target);
                 match dns_server.hijack_exchange(&buf.to_vec()).await {
                     Ok(response) => {
                         let _ = tx.send((target, from, Bytes::from(response))).await;
                     }
                     Err(e) => {
-                        error!("failed to send dns query: {}", e);
+                        error!("failed to send dns query: {:#}", e);
                         closer.close();
                     }
                 }

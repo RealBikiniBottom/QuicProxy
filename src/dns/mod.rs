@@ -507,7 +507,7 @@ pub trait AnyDNS: Send + Sync + 'static {
                     for question in &packet.questions {
                         reply.questions.push(question.clone());
                     }
-                    debug!("rejected ipv6 with empty reply");
+                    debug!("rejected ipv6 query with empty reply");
                     return reply
                         .build_bytes_vec()
                         .map(|b| b.to_vec())

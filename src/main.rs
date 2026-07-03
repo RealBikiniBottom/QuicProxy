@@ -1,4 +1,4 @@
-//! quicproxy 入口
+//! quicproxy 桌面端入口
 //!
 //! 两种运行模式：
 //! 1. 核心模式（默认）：`quicproxy -c config.json` — 运行代理核心
@@ -302,11 +302,11 @@ async fn run_manage(args: Args) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     info!("Manage server listening on {}", addr);
-    info!("  core_path: {}", core_path_display);
-    info!("  work_dir: {}", work_dir_display);
-    info!("  persist file: {}", persist_path_display);
+    info!("core_path: {}", core_path_display);
+    info!("work_dir: {}", work_dir_display);
+    info!("persist file: {}", persist_path_display);
     if let Some(ref dir) = web_dir {
-        info!("  web_dir: {}", dir.display());
+        info!("web_dir: {}", dir.display());
     }
 
     axum::serve(listener, app).await?;
