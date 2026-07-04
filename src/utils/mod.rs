@@ -28,6 +28,11 @@ pub fn format_duration(duration: Duration) -> String {
     return format!("{:.2?}", duration);
 }
 
+pub fn format_ms(ms: u64) -> String {
+    let duration = std::time::Duration::from_millis(ms);
+    return format_duration(duration);
+}
+
 pub fn format_us(us: u64) -> String {
     let duration = std::time::Duration::from_micros(us);
     return format_duration(duration);

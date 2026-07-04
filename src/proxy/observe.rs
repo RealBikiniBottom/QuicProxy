@@ -9,7 +9,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::proxy::outbound;
-use crate::utils::format_us;
+use crate::utils::{format_ms, format_us};
 use crate::utils::now_timestamp;
 use crate::utils::shutdown;
 use crate::utils::system::get_memory_usage;
@@ -95,7 +95,7 @@ pub struct Stats {
     route_total_time_us: AtomicU64,
     route_match_count: AtomicU64,
     // Latency (for outbounds)
-    latency_total_us: AtomicU64,
+    latency_total_ms: AtomicU64,
     latency_count: AtomicU64,
 }
 
@@ -116,24 +116,24 @@ impl Default for Stats {
             route_total_time_us: AtomicU64::new(0),
             route_match_count: AtomicU64::new(0),
 
-            latency_total_us: AtomicU64::new(0),
+            latency_total_ms: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
         }
     }
 }
 
 impl Stats {
-    pub fn get_latency_us(&self) -> u64 {
+    pub fn get_latency_ms(&self) -> u64 {
         let count = self.latency_count.load(Ordering::Relaxed);
         if count == 0 {
             0
         } else {
-            self.latency_total_us.load(Ordering::Relaxed) / count
+            self.latency_total_ms.load(Ordering::Relaxed) / count
         }
     }
 
-    pub fn record_latency_us(&self, us: u64) {
-        self.latency_total_us.fetch_add(us, Ordering::Relaxed);
+    pub fn record_latency_ms(&self, ms: u64) {
+        self.latency_total_ms.fetch_add(ms, Ordering::Relaxed);
         self.latency_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -227,7 +227,7 @@ pub struct NodeStats {
 pub struct OutboundTraceInfo {
     pub ip: String,
     pub loc: String,
-    pub latency_us: u64,
+    pub latency_ms: i64,
     pub uplink_path_stats: Option<outbound::PathState>,
     pub downlink_path_stats: Option<outbound::PathState>,
 }
@@ -460,30 +460,34 @@ impl Observer {
         }
     }
 
-    pub fn update_outbound_latency(&self, tag: &str, latency_us: u64) {
+    pub fn update_outbound_latency(&self, tag: &str, latency_ms: i64) {
         if let Some(node) = self.outbounds.get(tag) {
-            node.stats.record_latency_us(latency_us);
+            if latency_ms > 0 {
+                node.stats.record_latency_ms(latency_ms as u64);
+            }
         }
     }
 
     pub fn update_outbound_trace(
         &self,
         tag: &str,
-        latency_us: u64,
+        latency_ms: i64,
         ip: impl Into<String>,
         loc: impl Into<String>,
         uplink_path_stats: Option<outbound::PathState>,
         downlink_path_stats: Option<outbound::PathState>,
     ) {
         if let Some(node) = self.outbounds.get(tag) {
-            node.stats.record_latency_us(latency_us);
+            if latency_ms > 0 {
+                node.stats.record_latency_ms(latency_ms as u64);
+            }
         }
         self.outbound_traces.insert(
             tag.to_string(),
             OutboundTraceInfo {
                 ip: ip.into(),
                 loc: loc.into(),
-                latency_us,
+                latency_ms,
                 uplink_path_stats,
                 downlink_path_stats,
             },
@@ -531,7 +535,7 @@ impl Observer {
                         node.stats.get_active_udp_sessions(),
                         ByteSize(node.stats.get_upload_bytes()),
                         ByteSize(node.stats.get_download_bytes()),
-                        format_us(node.stats.get_latency_us())
+                        format_ms(node.stats.get_latency_ms())
                     );
                 }
             }

@@ -186,8 +186,8 @@ async fn get_observe(
         let trace = state.observer.get_outbound_trace(&tag);
         let latency = trace
             .as_ref()
-            .map(|t| t.latency_us)
-            .unwrap_or_else(|| node.stats.get_latency_us());
+            .map(|t| t.latency_ms)
+            .unwrap_or_else(|| node.stats.get_latency_ms() as i64);
         let ip = trace.as_ref().map(|t| t.ip.clone()).unwrap_or_default();
         let loc = trace.as_ref().map(|t| t.loc.clone()).unwrap_or_default();
         let (selector_outbounds, selected_node) = OUTBOUNDS_MAP
@@ -281,13 +281,13 @@ async fn get_outbounds(
         let default_latency = state
             .observer
             .get_outbound_stats(&tag)
-            .map(|n| n.stats.get_latency_us())
+            .map(|n| n.stats.get_latency_ms() as i64)
             .unwrap_or(0);
 
         let trace = state.observer.get_outbound_trace(&tag);
         let latency = trace
             .as_ref()
-            .map(|t| t.latency_us)
+            .map(|t| t.latency_ms)
             .unwrap_or(default_latency);
         let ip = trace.as_ref().map(|t| t.ip.clone()).unwrap_or_default();
         let loc = trace.as_ref().map(|t| t.loc.clone()).unwrap_or_default();
@@ -397,7 +397,7 @@ async fn get_trace(
         Err(_) => {
             state
                 .observer
-                .update_outbound_trace(&params.tag, 0, "", "", None, None);
+                .update_outbound_trace(&params.tag, -1, "", "", None, None);
             Err(StatusCode::BAD_GATEWAY)
         }
     }
@@ -450,7 +450,7 @@ pub async fn get_outbound_info(
     let downlink_path_stats = outbound.get_downlink_state().await;
     observer.update_outbound_trace(
         outbound_tag,
-        duration_ms * 1000,
+        (duration_ms) as i64,
         ip.clone(),
         loc.clone(),
         uplink_path_stats.clone(),
@@ -557,7 +557,7 @@ struct StatsData {
     udp_sessions: u64,
     upload: u64,
     download: u64,
-    latency: u64,
+    latency: i64,
     ip: String,
     loc: String,
     outbounds: Option<Vec<String>>,
@@ -592,7 +592,7 @@ struct ObserveResponse {
 struct OutboundInfo {
     tag: String,
     protocol: String,
-    latency: u64,
+    latency: i64,
     ip: String,
     loc: String,
     outbounds: Option<Vec<String>>,

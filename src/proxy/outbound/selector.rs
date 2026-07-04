@@ -10,7 +10,7 @@ use crate::api::get_outbound_info;
 use crate::cache::Cache;
 use crate::config::OutboundConfig;
 use crate::proxy::TargetAddr;
-use crate::proxy::observe::{Observer, get_observer};
+use crate::proxy::observe::{OutboundTraceInfo, get_observer};
 use crate::proxy::outbound::{AnyOutbound, AnyStream};
 use crate::utils::time::parse_duration;
 
@@ -31,7 +31,6 @@ pub struct SelectorOutbound {
     outbounds_count: usize,
     outbound_tags: Vec<String>,
     selected_index: AtomicUsize,
-    observer: Option<Arc<Observer>>,
     cache: Option<Cache<String>>,
     interval: Duration,
     tolerance: u64,
@@ -118,7 +117,7 @@ impl SelectorOutbound {
 
         let tolerance = match selector_type {
             SelectorType::Manual => 0,
-            SelectorType::UrlTest => cfg.tolerance.unwrap_or(50) * 1000,
+            SelectorType::UrlTest => cfg.tolerance.unwrap_or(50),
         };
 
         let outbound = Arc::new(Self {
@@ -129,7 +128,6 @@ impl SelectorOutbound {
             outbounds: outbounds_vec,
             outbound_tags: outbound_tags.clone(),
             selected_index: AtomicUsize::new(selected_index),
-            observer: None,
             dns: cfg.dns.clone(),
             interval,
             tolerance,
@@ -153,9 +151,6 @@ impl SelectorOutbound {
             "{} [{}] started latency test loop with interval {:?}",
             mode, self.tag, self.interval
         );
-        // Give other components (DNS, etc.) time to initialize before the first check.
-        // init_dns runs after init_outbounds in the bootstrap sequence,
-        // and the spawned test loop may execute before DNS is ready.
         tokio::time::sleep(Duration::from_secs(3)).await;
         loop {
             self.check_all().await;
@@ -164,7 +159,7 @@ impl SelectorOutbound {
     }
 
     async fn check_all(&self) {
-        let Some(observer) = self.observer.clone().or_else(get_observer) else {
+        let Some(observer) = get_observer() else {
             debug!(
                 "{} [{}] skipped outbound info check: observer not ready",
                 self.protocol(),
@@ -201,17 +196,24 @@ impl SelectorOutbound {
             if let Ok((i, tag, result)) = handle.await {
                 match result {
                     Ok(trace) => {
-                        let us = trace.duration_ms.saturating_mul(1000);
-                        results.push((i, us));
+                        let latency_ms = trace.duration_ms as i64;
+                        let info = OutboundTraceInfo {
+                            ip: trace.ip,
+                            loc: trace.loc,
+                            latency_ms,
+                            uplink_path_stats: trace.uplink_path_stats,
+                            downlink_path_stats: trace.downlink_path_stats,
+                        };
                         debug!(
                             "{} [{}] outbound [{}] trace ip={} loc={} latency={} ms",
                             self.protocol(),
                             self.tag,
                             tag,
-                            trace.ip,
-                            trace.loc,
+                            info.ip,
+                            info.loc,
                             trace.duration_ms
                         );
+                        results.push((i, info));
                     }
                     Err(err) => {
                         debug!(
@@ -226,24 +228,15 @@ impl SelectorOutbound {
             }
         }
 
-        // UrlTest mode: auto-select best node based on tolerance
-        if self.selector_type == SelectorType::UrlTest {
-            if results.is_empty() {
-                warn!("UrlTest [{}] all outbounds failed latency test", self.tag);
-                return;
-            }
-            self.apply_url_test_selection(&results);
-        }
+        self.reselect_node(&results);
     }
 
-    /// Trigger UrlTest reselection based on cached latency data from the observer.
-    /// Called when a child outbound's latency is updated (e.g., via get_trace API).
     pub fn try_url_test_reselect(&self) {
         if self.selector_type != SelectorType::UrlTest {
             return;
         }
 
-        let Some(observer) = self.observer.clone().or_else(get_observer) else {
+        let Some(observer) = get_observer() else {
             debug!(
                 "UrlTest [{}] skipped reselect: observer not ready",
                 self.tag
@@ -255,7 +248,7 @@ impl SelectorOutbound {
         for (i, child) in self.outbounds.iter().enumerate() {
             let tag = child.tag();
             if let Some(trace) = observer.get_outbound_trace(tag) {
-                results.push((i, trace.latency_us));
+                results.push((i, trace));
             }
         }
 
@@ -267,46 +260,32 @@ impl SelectorOutbound {
             return;
         }
 
-        self.apply_url_test_selection(&results);
+        self.reselect_node(&results);
     }
 
-    fn apply_url_test_selection(&self, results: &[(usize, u64)]) {
-        let min_latency = results.iter().map(|(_, l)| *l).min().unwrap_or(0);
+    fn reselect_node(&self, results: &[(usize, OutboundTraceInfo)]) {
+        if self.selector_type != SelectorType::UrlTest {
+            return;
+        }
 
-        // Find the first outbound (in list order) that is within tolerance
-        let mut best_idx = results[0].0;
-        for (idx, latency) in results {
-            if *latency <= min_latency + self.tolerance {
+        // 负数表示不通，只保留可达的节点
+        let reachable: Vec<_> = results.iter().filter(|(_, t)| t.latency_ms > 0).collect();
+        if reachable.is_empty() {
+            warn!("UrlTest [{}] all outbounds failed latency test", self.tag);
+            return;
+        }
+
+        let min_latency = reachable.iter().map(|(_, t)| t.latency_ms).min().unwrap();
+
+        let mut best_idx = reachable[0].0;
+        for (idx, trace) in &reachable {
+            if trace.latency_ms <= min_latency + self.tolerance as i64 {
                 best_idx = *idx;
                 break;
             }
         }
 
-        let old_idx = self.selected_index.load(Ordering::Relaxed);
-        if old_idx != best_idx {
-            info!(
-                "UrlTest [{}] switching from {} to {} (min latency: {} us, tolerance: {} us)",
-                self.tag,
-                self.outbounds[old_idx].tag(),
-                self.outbounds[best_idx].tag(),
-                min_latency,
-                self.tolerance
-            );
-            self.selected_index.store(best_idx, Ordering::Relaxed);
-
-            if let Some(ref cache) = self.cache {
-                if let Err(e) = cache.set("selected", &self.outbound_tags[best_idx]) {
-                    warn!("UrlTest [{}] failed to persist selection: {}", self.tag, e);
-                }
-            }
-        } else {
-            debug!(
-                "UrlTest [{}] keeping {} (min latency: {} us)",
-                self.tag,
-                self.outbounds[old_idx].tag(),
-                min_latency
-            );
-        }
+        self.update_selected_by_index(best_idx);
     }
 
     pub fn get_selected_tag(&self) -> Option<&str> {
@@ -333,29 +312,7 @@ impl SelectorOutbound {
 
     pub fn select_by_tag(&self, tag: &str) -> bool {
         if let Some(idx) = self.outbound_tags.iter().position(|t| t == tag) {
-            let old_idx = self.selected_index.load(Ordering::Relaxed);
-            if old_idx != idx {
-                self.selected_index.store(idx, Ordering::Relaxed);
-                info!(
-                    "Selector [{}] switched from {} to {}",
-                    self.tag, self.outbound_tags[old_idx], tag
-                );
-
-                // Persist selection to cache
-                if let Some(ref cache) = self.cache {
-                    // Use the pre-computed tag to avoid allocation
-                    if let Err(e) = cache.set("selected", &tag.to_string()) {
-                        warn!("Selector [{}] failed to persist selection: {}", self.tag, e);
-                    } else {
-                        info!(
-                            "Selector [{}] persisted selection to disk: {}",
-                            self.tag, tag
-                        );
-                    }
-                }
-            } else {
-                info!("Selector [{}] already selected: {}", self.tag, tag);
-            }
+            self.update_selected_by_index(idx);
             true
         } else {
             warn!("Selector [{}] outbound '{}' not found", self.tag, tag);
@@ -363,62 +320,27 @@ impl SelectorOutbound {
         }
     }
 
-    pub fn select_by_index(&self, index: usize) -> bool {
-        if index < self.outbound_tags.len() {
-            let old_idx = self.selected_index.load(Ordering::Relaxed);
-            if old_idx != index {
-                self.selected_index.store(index, Ordering::Relaxed);
-                let new_tag = &self.outbound_tags[index];
-                info!(
-                    "Selector [{}] switched from {} to {}",
-                    self.tag, self.outbound_tags[old_idx], new_tag
-                );
-
-                // Persist selection to cache
-                if let Some(ref cache) = self.cache {
-                    if let Err(e) = cache.set("selected", &new_tag.to_string()) {
-                        warn!("Selector [{}] failed to persist selection: {}", self.tag, e);
-                    } else {
-                        info!(
-                            "Selector [{}] persisted selection to disk: {}",
-                            self.tag, new_tag
-                        );
-                    }
-                }
-            } else {
-                info!("Selector [{}] already selected index: {}", self.tag, index);
-            }
-            true
-        } else {
-            warn!(
-                "Selector [{}] index {} out of bounds (max: {})",
-                self.tag,
-                index,
-                self.outbound_tags.len().saturating_sub(1)
-            );
-            false
-        }
-    }
-
-    fn update_selected_index(&self, new_idx: usize) {
+    fn update_selected_by_index(&self, new_idx: usize) {
         let old_idx = self.selected_index.swap(new_idx, Ordering::Relaxed);
-        if old_idx != new_idx {
-            info!(
-                "{} [{}] updated selected_index from [{}] to [{}]",
-                self.protocol(),
-                self.tag,
-                self.outbounds[old_idx].tag(),
-                self.outbounds[new_idx].tag()
-            );
-            if let Some(ref cache) = self.cache {
-                if let Err(e) = cache.set("selected", &self.outbound_tags[new_idx]) {
-                    warn!(
-                        "{} [{}] failed to persist fallback selection: {}",
-                        self.protocol(),
-                        self.tag,
-                        e
-                    );
-                }
+        if old_idx == new_idx {
+            return;
+        }
+
+        info!(
+            "{} [{}] updated selected from [{}] to [{}]",
+            self.protocol(),
+            self.tag,
+            self.outbounds[old_idx].tag(),
+            self.outbounds[new_idx].tag()
+        );
+        if let Some(ref cache) = self.cache {
+            if let Err(e) = cache.set("selected", &self.outbound_tags[new_idx]) {
+                warn!(
+                    "{} [{}] failed to persist fallback selection: {}",
+                    self.protocol(),
+                    self.tag,
+                    e
+                );
             }
         }
     }
@@ -492,20 +414,13 @@ impl AnyOutbound for SelectorOutbound {
                     match handler.connect_stream(target).await {
                         Ok(stream) => {
                             if idx != start_idx {
-                                info!(
-                                    "urltest [{}] fallback from [{}] to [{}]",
-                                    self.tag,
-                                    self.outbounds[start_idx].tag(),
-                                    handler.tag()
-                                );
-                                self.update_selected_index(idx);
-                            } else {
-                                info!(
-                                    "Urltest [{}] using [{}] to connect_stream",
-                                    self.tag(),
-                                    handler.tag()
-                                );
+                                self.update_selected_by_index(idx);
                             }
+                            info!(
+                                "Urltest [{}] using [{}] to connect_stream",
+                                self.tag(),
+                                handler.tag()
+                            );
                             return Ok(stream);
                         }
                         Err(e) => {
@@ -540,13 +455,7 @@ impl AnyOutbound for SelectorOutbound {
                     match handler.connect_packet(target).await {
                         Ok(socket) => {
                             if idx != start_idx {
-                                info!(
-                                    "Urltest [{}] UDP fallback from [{}] to [{}]",
-                                    self.tag,
-                                    self.outbounds[start_idx].tag(),
-                                    handler.tag()
-                                );
-                                self.update_selected_index(idx);
+                                self.update_selected_by_index(idx);
                             }
                             return Ok(socket);
                         }

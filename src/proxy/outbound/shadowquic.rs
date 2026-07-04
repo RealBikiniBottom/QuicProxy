@@ -137,10 +137,18 @@ impl ShadowQuicOutbound {
             let lock = self.cached_client.lock().await;
             if let Some((ref conn, _, ref state)) = *lock {
                 if conn.close_reason().is_none() {
-                    info!("reuse quic connection {}", conn.stable_id());
+                    debug!(
+                        "[{}] reuse quic connection {}",
+                        self.tag(),
+                        conn.stable_id()
+                    );
                     return Ok((conn.clone(), state.clone()));
                 }
-                info!("exists connection closed: {:?}", conn.close_reason());
+                info!(
+                    "[{}] exists connection closed: {:?}",
+                    self.tag(),
+                    conn.close_reason()
+                );
             }
         }
 
@@ -168,8 +176,12 @@ impl ShadowQuicOutbound {
             )
             .with_context(|| {
                 format!(
-                    "Failed to create QuinnClient (addr={} sni={:?} jls={} cert={:?})",
-                    remote_addr, self.tls.sni, self.tls.enable_jls, self.tls.cert,
+                    "[{}] Failed to create QuinnClient (addr={} sni={:?} jls={} cert={:?})",
+                    self.tag(),
+                    remote_addr,
+                    self.tls.sni,
+                    self.tls.enable_jls,
+                    self.tls.cert,
                 )
             })?,
         );
@@ -188,8 +200,6 @@ impl ShadowQuicOutbound {
                     remote_addr, e
                 ))
             })?;
-
-        info!("new quic connection");
 
         let state = Arc::new(PerConnectionState::new());
         start_udp_session_cleaner(
@@ -236,6 +246,8 @@ impl ShadowQuicOutbound {
             let mut lock = self.cached_client.lock().await;
             *lock = Some((conn.clone(), client, state.clone()));
         }
+
+        info!("[{}] new quic connection", self.tag());
 
         Ok((conn, state))
     }
@@ -410,8 +422,9 @@ impl AnyOutbound for ShadowQuicOutbound {
         let rtt = conn.rtt();
         let mtu = stats.path.current_mtu;
 
-        info!(
-            "lost_packets: {}, sent_packets: {}, rtt: {:?}, mtu: {}",
+        debug!(
+            "[{}] lost_packets: {}, sent_packets: {}, rtt: {:?}, mtu: {}",
+            self.tag(),
             lost_packets,
             sent_packets,
             Some(rtt).map(format_duration),
