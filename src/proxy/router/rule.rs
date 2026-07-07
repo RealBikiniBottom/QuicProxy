@@ -344,7 +344,7 @@ impl Rule {
                                 break;
                             }
                         }
-                        Err(e) => error!("can not find geoip [{}]: {:#}", item, e),
+                        Err(e) => error!("can not find geoip [{}]: {:?}", item, e),
                     }
                 }
                 if !is_matched {
