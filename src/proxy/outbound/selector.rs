@@ -228,7 +228,7 @@ impl SelectorOutbound {
             }
         }
 
-        self.reselect_node(&results);
+        self.reselect_node_by_info(&results);
     }
 
     pub fn try_url_test_reselect(&self) {
@@ -260,10 +260,10 @@ impl SelectorOutbound {
             return;
         }
 
-        self.reselect_node(&results);
+        self.reselect_node_by_info(&results);
     }
 
-    fn reselect_node(&self, results: &[(usize, OutboundTraceInfo)]) {
+    fn reselect_node_by_info(&self, results: &[(usize, OutboundTraceInfo)]) {
         if self.selector_type != SelectorType::UrlTest {
             return;
         }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tracing::{Instrument, debug, error, warn};
+use tracing::{Instrument, error, warn};
 
 pub struct DnsOutbound {
     tag: String,
