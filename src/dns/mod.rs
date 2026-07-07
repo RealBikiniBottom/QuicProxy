@@ -13,6 +13,7 @@ use simple_dns::rdata::RData;
 use simple_dns::{
     CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, ResourceRecord, TYPE,
 };
+use rand::seq::SliceRandom;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -91,7 +92,7 @@ pub async fn resolve_domain(domain: &str, dns_server: Arc<dyn AnyDNS>) -> Result
     let res = dns_server.lookup(domain, false, &outbound).await?;
 
     let ip = res
-        .first()
+        .choose(&mut rand::thread_rng())
         .copied()
         .with_context(|| format!("DNS lookup failed for: {domain}"))?;
 
@@ -99,7 +100,7 @@ pub async fn resolve_domain(domain: &str, dns_server: Arc<dyn AnyDNS>) -> Result
         observer.record_dns_time(now.elapsed().as_micros() as u64);
         observer
             .realip2domain
-            .insert(domain.to_string(), ip.to_string());
+            .insert(ip.to_string(), domain.to_string());
     }
     info!(
         "resolved ip: {}, cost: {}",

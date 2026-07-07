@@ -288,9 +288,8 @@ impl Observer {
                         let ip_str = addr.ip().to_string();
                         ip = addr.to_string();
                         self.realip2domain
-                            .iter()
-                            .find(|r| r.value() == &ip_str)
-                            .map(|r| format!("{}:{}", r.key().clone(), addr.port()))
+                            .get(&ip_str)
+                            .map(|r| format!("{}:{}", r.value().clone(), addr.port()))
                             .unwrap_or_else(|| "".to_string())
                     }
                     TargetAddr::Domain(..) => conn.final_target.to_string(),
