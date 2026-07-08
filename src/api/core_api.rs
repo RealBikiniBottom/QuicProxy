@@ -362,6 +362,7 @@ async fn get_quit(
 #[derive(Deserialize)]
 struct TraceParams {
     tag: String,
+    dns: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -381,13 +382,8 @@ async fn get_trace(
     check_auth(&headers, &state.password)?;
 
     let outbound = get_outbound_by_tag(&params.tag);
-    match get_outbound_info(
-        &params.tag,
-        state.observer.clone(),
-        outbound.dns_server_name(),
-    )
-    .await
-    {
+    let dns = params.dns.as_deref().or_else(|| outbound.dns_server_name());
+    match get_outbound_info(&params.tag, state.observer.clone(), dns).await {
         Ok(r) => {
             if let Some(sel) = outbound.as_selector() {
                 sel.try_url_test_reselect();

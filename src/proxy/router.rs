@@ -511,14 +511,14 @@ impl Router {
                                     t
                                 );
                                 if let Err(e) = t1_out.send_to(buf.clone(), &t1_source, t).await {
-                                    error!("UDP session quit because [outbound err: {:#}]", e);
+                                    error!("UDP session quit because [outbound err: {:?}]", e);
                                     break;
                                 }
                             }
                             *t1_activity.lock().unwrap() = Instant::now();
                         }
                         Err(e) => {
-                            info!("UDP session quit because [inbound err: {:#}]", e);
+                            info!("UDP session quit because [inbound err: {:?}]", e);
                             break;
                         }
                     }
@@ -786,7 +786,7 @@ pub async fn start_udp_loop(
                             )
                             .await
                         {
-                            error!("Session {} handler error: {:#}", src, err);
+                            error!("Session {} handler error: {:?}", src, err);
                         }
                         sessions.remove(&key);
                     }
@@ -794,7 +794,7 @@ pub async fn start_udp_loop(
                 );
             }
             Err(e) => {
-                error!("inbound_packet.recv_from error: {}", e);
+                error!("inbound_packet.recv_from error: {:?}", e);
                 break;
             }
         }
