@@ -461,7 +461,6 @@ write_server_config() {
   log_step "生成服务端配置文件..."
 
   local sni="www.apple.com"
-  local idle_timeout=500
 
   local sq_enabled=false
   local anytls_enabled=false
@@ -494,7 +493,6 @@ JSON5EOF
       "type": "shadowquic",
       "address": "0.0.0.0",
       "port": ${port},
-      "idle_timeout": ${idle_timeout},
       "tls": {
         "enable_jls": true,
         "jls_username": "${USERNAME}",
@@ -516,7 +514,6 @@ JSON5EOF
       "address": "0.0.0.0",
       "port": ${ANYTLS_PORT},
       "password": "${PASSWORD}",
-      "idle_timeout": ${idle_timeout},
       "tls": {
         "enable": true,
         "insecure": true,
@@ -536,7 +533,6 @@ JSON5EOF
       "address": "0.0.0.0",
       "port": ${TROJAN_PORT},
       "password": "${PASSWORD}",
-      "idle_timeout": ${idle_timeout},
       "transport": {
         "type": "tcp"
       },
@@ -650,7 +646,7 @@ generate_subscription_url() {
     node_num=$((node_num + 1))
     local encoded_tag
     encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${sq_tag}', safe=''))" 2>/dev/null || echo "${sq_tag}")
-    sq_url="sq://${USERNAME}:${PASSWORD}@${host}:${SQ_PORT}?sni=${sni}&zero_rtt=true&idle_timeout=500#${encoded_tag}"
+    sq_url="sq://${USERNAME}:${PASSWORD}@${host}:${SQ_PORT}?sni=${sni}&zero_rtt=true#${encoded_tag}"
   fi
 
   if $anytls_enabled; then
