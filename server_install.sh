@@ -269,7 +269,7 @@ find_free_tcp_port() {
   # 在候选端口列表中找到首个空闲 TCP 端口，并避开已分配的端口
   local exclude_a="${1:-}"
   local exclude_b="${2:-}"
-  local candidates=(443 13431 8443 4443 54321)
+  local candidates=(443 8443 5443)
   for port in "${candidates[@]}"; do
     [[ "$port" == "$exclude_a" ]] && continue
     [[ "$port" == "$exclude_b" ]] && continue
@@ -293,7 +293,7 @@ find_free_tcp_port() {
 }
 
 find_free_udp_port() {
-  local candidates=(443 13431 8443 4443 54321)
+  local candidates=(443 8443 5443)
   for port in "${candidates[@]}"; do
     if check_udp_port_free "$port"; then
       echo "$port"

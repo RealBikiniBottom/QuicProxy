@@ -22,7 +22,6 @@
       "address": "127.0.0.1",
       "idle_timeout": 500,
       "port": 2344,
-      "gso": true,
       "tls": {
         "enable_jls": true,
         "jls_username": "user",
@@ -30,6 +29,15 @@
         "alpn": [],
         "zero_rtt": true,
         "sni": "www.apple.com"
+      }
+    },
+    "trojan_inbound": {
+      "type": "trojan",
+      "password": "testpassword123",
+      "address": "127.0.0.1",
+      "port": 2234,
+      "tls": {
+        "enable": true,
       }
     },
     "anytls_inbound": {
@@ -67,11 +75,21 @@
           "sni": "www.apple.com"
         }
       },
-      "real_out": {
+      "real_out3": {
         "type": "anytls",
         "address": "127.0.0.1",
         // "port": 8443,
         "port": 2343,
+        "password": "testpassword123",
+        "tls": {
+          "enable": true,
+          "insecure": true,
+        }
+      },
+      "real_out": {
+        "type": "trojan",
+        "address": "127.0.0.1",
+        "port": 2234,
         "password": "testpassword123",
         "tls": {
           "enable": true,
@@ -142,6 +160,7 @@
       {
         "inbounds": [
           "sq_inbound",
+          "trojan_inbound",
           "anytls_inbound",
         ],
         "outbound": "direct"
