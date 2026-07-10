@@ -119,7 +119,9 @@ impl InterfaceManager {
     }
 
     pub fn list_ifaces() -> Vec<Arc<netdev::Interface>> {
-        netdev::get_interfaces().into_iter().map(Arc::new).collect()
+        let mut interfaces = netdev::get_interfaces();
+        interfaces.sort_by_key(|iface| !iface.default);
+        interfaces.into_iter().map(Arc::new).collect()
     }
 
     pub fn init() {
@@ -161,11 +163,12 @@ impl InterfaceManager {
 
             if changed {
                 info!(
-                    "Selected iface: {} (IPv4: {:?}, IPv6: {:?}, DNS: {:?})",
+                    "Selected iface: {} (IPv4: {:?}, IPv6: {:?}, DNS: {:?}, Gateway: {:?})",
                     iface.display_name(),
                     iface.ipv4,
                     iface.ipv6,
-                    iface.get_dns()
+                    iface.dns_servers,
+                    iface.gateway,
                 );
                 *writer = Some(iface.clone());
                 Self::notify_change();

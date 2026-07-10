@@ -9,11 +9,11 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use hyper::header::HeaderMap;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use rand::seq::SliceRandom;
 use simple_dns::rdata::RData;
 use simple_dns::{
     CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, ResourceRecord, TYPE,
 };
-use rand::seq::SliceRandom;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1019,7 +1019,7 @@ impl FakeIPDNS {
             }
             Ok(None) => None,
             Err(e) => {
-                error!("{}", e);
+                error!("{:?}", e);
                 None
             }
         }
