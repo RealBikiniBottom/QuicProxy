@@ -53,7 +53,12 @@ impl InterfaceInfoExt for netdev::Interface {
     }
 
     fn is_usable(&self) -> bool {
-        let ok = self.is_up() && !self.is_loopback() && (self.has_ipv4() || self.has_ipv6());
+        let ok = self.is_up()
+            && !self.is_loopback()
+            && (self.has_ipv4() || self.has_ipv6())
+            && !self.is_tun()
+            && self.is_physical()
+            && self.is_running();
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
@@ -163,12 +168,13 @@ impl InterfaceManager {
 
             if changed {
                 info!(
-                    "Selected iface: {} (IPv4: {:?}, IPv6: {:?}, DNS: {:?}, Gateway: {:?})",
+                    "Selected iface: {} (IPv4: {:?}, IPv6: {:?}, DNS: {:?}, Gateway: {:?}, Default: {:?})",
                     iface.display_name(),
                     iface.ipv4,
                     iface.ipv6,
                     iface.dns_servers,
                     iface.gateway,
+                    iface.default,
                 );
                 *writer = Some(iface.clone());
                 Self::notify_change();
