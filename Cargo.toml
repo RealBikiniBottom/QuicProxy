@@ -38,7 +38,7 @@ serde_json5 = "0.2.1"
 serde_path_to_error = "0.1"
 sha2 = "0.10.9"
 socket2 = "0.6.1"
-tokio = { version = "1.49.0", features = ["full", "test-util"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 quinn = { package = "quinn", git = "https://github.com/spongebob888/quinn-jls", tag = "jls-0.3.6", default-features = false, features = ["runtime-tokio", "rustls-ring"]}
@@ -47,22 +47,22 @@ rustls-pemfile = "2.1"
 webpki-roots = "0.26"
 futures = "0.3.31"
 bytesize = "2.3.1"
-dashmap = "6.1.0"
-maxminddb = { version = "0.27.1", features = ["mmap"] }
+dashmap = "6"
+maxminddb = { version = "0.29", features = ["mmap"] }
 memmap2 = "0.9.9"
 tracing-appender = "0.2.4"
 hashbrown = { version = "0.15.2", features = ["serde"] }
 ipnet = "2.11.0"
 netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip" }
-tun-rs = { version = "2", features = ["async", "async_framed", "utun_fd"], optional = true, git = "https://github.com/tun-rs/tun-rs", tag = "2.8.5" }
-netdev = "0.43"
+tun-rs = { version = "2", features = ["async", "async_framed", "utun_fd"], optional = true, git = "https://github.com/tun-rs/tun-rs", tag = "2.8.7" }
+netdev = "0.45"
 etherparse = "0.13"
 libc = "0.2.180"
 tokio-rustls = "0.26.4"
-anyhow = { version = "1.0.101", features = ["backtrace"] }
+anyhow = { version = "1", features = ["backtrace"] }
 tracing-error = "0.2"
 redb = "4.1.0"
-axum = "0.8.8"
+axum = "0.8.9"
 uuid = { version = "1.21.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
 rcgen = "0.14.7"
 tokio-util = "0.7.18"
@@ -76,7 +76,7 @@ aead = "0.5"
 const-fnv1a-hash = "1.0"
 cfb-mode = "0.8"
 aes = "0.8"
-shadowsocks = { version = "1.23", features = ["aead-cipher-2022", "stream-cipher"] }
+shadowsocks = { version = "1.24", features = ["aead-cipher-2022", "stream-cipher"] }
 sysinfo = "0.38"
 [target.'cfg(target_os = "android")'.dependencies]
 tracing-android = "0.2.0"
