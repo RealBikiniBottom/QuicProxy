@@ -125,3 +125,10 @@ build-ios:
 		-library target/aarch64-apple-ios/release/libquicproxy.a \
 		-library target/ios-simulator-fat/libquicproxy.a \
 		-output src/premium/quicproxy_flutter/ios/tunnel/QuicProxyCore.xcframework
+
+CODE_MMDB_URL ?= https://cdn.jsdelivr.net/gh/Hackl0us/GeoIP2-CN@release/Country.mmdb
+CODE_MMDB_PATH ?= assets/code.mmdb
+
+.PHONY: update_code_mmdb
+update_code_mmdb:
+	curl --fail --location --output "$(CODE_MMDB_PATH)" "$(CODE_MMDB_URL)"
