@@ -16,13 +16,13 @@ use hyper::http::Method;
 use memmap2::Mmap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 pub type GeoIpReader = maxminddb::Reader<Mmap>;
-pub type SharedGeoIpReader = Arc<RwLock<Option<Arc<GeoIpReader>>>>;
+pub type SharedGeoIpReader = Mutex<Arc<Option<GeoIpReader>>>;
 
 pub static GEOIP_DB_MAP: LazyLock<DashMap<String, Arc<GeoipDB>>> = LazyLock::new(DashMap::new);
 
@@ -31,9 +31,7 @@ pub async fn init_geoip_db(cfg: &Config) -> Result<()> {
         let name_clone = tag.clone();
         let db = Arc::new(GeoipDB::new(name_clone.clone(), db_cfg)?);
         db.ensure_db().await?;
-        if db.url.is_some() {
-            db.spawn_updater();
-        }
+        db.spawn_updater();
         GEOIP_DB_MAP.insert(name_clone, db);
     }
     Ok(())
@@ -48,6 +46,15 @@ pub fn get_geoip_db_by_tag(tag: &str) -> Result<Arc<GeoipDB>> {
         Some(r) => Ok(r.clone()),
         None => bail!("can not find db: {}", tag),
     }
+}
+
+pub fn load_db_file(path: &str) -> Result<Arc<Option<GeoIpReader>>> {
+    if !Path::new(path).exists() {
+        bail!("path does not exists.")
+    }
+    let reader = unsafe { maxminddb::Reader::open_mmap(&path) }
+        .context(format!("failed to load db:{}", path))?;
+    return Ok(Arc::new(Some(reader)));
 }
 
 pub struct GeoipDB {
@@ -88,15 +95,44 @@ impl GeoipDB {
             download_outbound,
             cache,
             url: cfg.url.clone(),
-            reader: Arc::new(RwLock::new(None)),
+            reader: Mutex::new(Arc::new(None)),
         })
     }
 
-    pub async fn lookup(&self, ip: std::net::IpAddr) -> Option<String> {
+    pub async fn ensure_db(&self) -> Result<bool> {
+        let start = now();
+        match load_db_file(&self.path) {
+            Ok(reader) => {
+                *self.reader.lock().await = reader;
+            }
+            Err(e) => {
+                if self.url.is_some() {
+                    warn!(
+                        "GeoIP db '{}' at {} is missing or invalid: {}; downloading it now",
+                        self.tag, self.path, e
+                    );
+                    self.update_db().await?;
+                }
+            }
+        }
+
+        info!(
+            "Loaded GeoIP db '{}' from {} (cost: {})",
+            self.tag,
+            self.path,
+            format_duration(start.elapsed())
+        );
+        Ok(true)
+    }
+
+    pub async fn lookup(&self, ip: std::net::IpAddr) -> Result<String> {
         let start = now();
 
-        let lock = self.reader.read().await;
-        let reader = lock.as_ref()?;
+        let shared_reader = self.reader.lock().await.clone();
+        let reader = shared_reader
+            .as_ref()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GeoIP db '{}' is not loaded", self.tag))?;
 
         let result = match reader
             .lookup(ip)
@@ -109,13 +145,12 @@ impl GeoipDB {
                 .unwrap_or_else(|| "unknown".to_string()),
             Ok(None) => "unknown".to_string(),
             Err(e) => {
-                error!(
+                bail!(
                     "GeoIP lookup failed for IP {} (took {:?}): {}",
                     ip,
                     start.elapsed(),
                     e
                 );
-                return None;
             }
         };
 
@@ -126,55 +161,101 @@ impl GeoipDB {
             format_duration(start.elapsed())
         );
 
-        Some(result)
+        Ok(result)
     }
 
-    pub fn validate_db_file(&self) -> bool {
-        if !Path::new(&self.path).exists() {
-            return false;
+    pub async fn close_reader(&self) -> Result<()> {
+        let mut lock = self.reader.lock().await;
+        *lock = Arc::new(None); // 用一个新的 Arc(None) 替换旧的
+        Ok(())
+    }
+
+    fn record_update_success(&self) {
+        if let (Some(cache), Some(url)) = (&self.cache, &self.url) {
+            let key = format!("tag:{},url:{},path:{}", self.tag, url, self.path);
+            let now_secs = now_timestamp();
+            if let Err(e) = cache.set(&key, &now_secs) {
+                warn!(
+                    "Failed to persist GeoIP '{}' update timestamp: {}",
+                    self.tag, e
+                );
+            }
         }
-        match unsafe { maxminddb::Reader::open_mmap(&self.path) } {
-            Ok(_) => true,
+        info!("GeoIP update for '{}' succeeded", self.tag);
+    }
+
+    fn next_update_delay(&self) -> Duration {
+        let Some(cache) = &self.cache else {
+            return self.update_interval;
+        };
+
+        let key = self.get_key();
+
+        match cache.get(&key) {
+            Ok(Some((last_update, _))) => {
+                let elapsed = Duration::from_secs(now_timestamp().saturating_sub(last_update));
+                self.update_interval.saturating_sub(elapsed)
+            }
+            Ok(None) => {
+                let now_secs = now_timestamp();
+                if let Err(e) = cache.set(&key, &now_secs) {
+                    warn!(
+                        "Failed to persist initial GeoIP '{}' update timestamp: {}",
+                        self.tag, e
+                    );
+                }
+                self.update_interval
+            }
             Err(e) => {
                 warn!(
-                    "GeoIP db '{}' file '{}' is invalid: {}",
-                    self.tag, self.path, e
+                    "Failed to read GeoIP '{}' update timestamp: {}",
+                    self.tag, e
                 );
-                false
+                self.update_interval
             }
         }
     }
 
-    pub async fn ensure_db(&self) -> Result<()> {
-        if self.validate_db_file() {
-            let reader = unsafe { maxminddb::Reader::open_mmap(&self.path) }
-                .context("failed to open_mmap")?;
-            *self.reader.write().await = Some(Arc::new(reader));
-            info!("Loaded GeoIP db '{}' from {}", self.tag, self.path);
-            return Ok(());
-        }
-
-        match &self.url {
-            Some(url) => {
-                info!(
-                    "GeoIP db '{}' not found or invalid at {}, downloading from {}",
-                    self.tag, self.path, url
-                );
-                if Path::new(&self.path).exists() {
-                    let _ = tokio::fs::remove_file(&self.path).await;
-                }
-                self.download_db().await?;
-                Ok(())
-            }
-            None => bail!(
-                "Local GeoIP db '{}' not found or invalid at {}",
-                self.tag,
-                self.path
-            ),
-        }
+    fn get_key(&self) -> String {
+        return format!("tag:{},url:{:?},path:{}", self.tag, self.url, self.path);
     }
 
-    pub async fn download_db(&self) -> Result<()> {
+    pub async fn update_db(&self) -> Result<()> {
+        if self.url.is_none() {
+            bail!("missing url for remote db")
+        }
+        self.record_update_success();
+        let tmp_path = format!("{}.tmp", self.path);
+
+        if let Err(e) = self.download_db(&tmp_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e);
+        }
+
+        info!("Verifying downloaded GeoIP db '{}'...", self.tag);
+        let reader = match load_db_file(&tmp_path) {
+            Ok(reader) => reader,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                bail!("Downloaded GeoIP db '{}' is invalid: {}", self.tag, e);
+            }
+        };
+        drop(reader);
+
+        if let Err(e) = tokio::fs::rename(&tmp_path, &self.path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e).context(format!(
+                "failed to replace GeoIP db '{}' at {}",
+                self.tag, self.path
+            ));
+        }
+
+        let reader = load_db_file(&self.path)?;
+        *self.reader.lock().await = reader;
+        Ok(())
+    }
+
+    pub async fn download_db(&self, path: &str) -> Result<()> {
         let url = self
             .url
             .as_ref()
@@ -206,51 +287,23 @@ impl GeoipDB {
             );
         }
 
-        let tmp_path = format!("{}.tmp", self.path);
-        let mut file = tokio::fs::File::create(&tmp_path).await?;
+        let mut file = tokio::fs::File::create(path).await?;
         file.write_all(&response.body).await?;
-        let bytes_written = response.body.len() as u64;
         file.flush().await?;
         file.sync_all().await?;
-        drop(file);
 
-        if bytes_written == 0 {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
+        if response.body.is_empty() {
             bail!("Downloaded GeoIP db '{}' is empty", self.tag);
         }
 
-        info!("Verifying downloaded GeoIP db '{}'...", self.tag);
-        match unsafe { maxminddb::Reader::open_mmap(&tmp_path) } {
-            Ok(_) => {
-                tokio::fs::rename(&tmp_path, &self.path).await?;
-                info!(
-                    "GeoIP db '{}' updated successfully to {}",
-                    self.tag, self.path
-                );
-
-                match unsafe { maxminddb::Reader::open_mmap(&self.path) } {
-                    Ok(new_reader) => {
-                        *self.reader.write().await = Some(Arc::new(new_reader));
-                        info!("GeoIP db '{}' reader reloaded.", self.tag);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        bail!("Failed to reload GeoIP db '{}' reader: {:?}", self.tag, e)
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                bail!("Downloaded GeoIP db '{}' is invalid: {:?}", self.tag, e)
-            }
-        }
+        info!("Downloaded GeoIP db '{}' to {}", self.tag, path);
+        Ok(())
     }
 
     pub fn spawn_updater(self: &Arc<Self>) {
-        let url = match &self.url {
-            Some(u) => u.clone(),
-            None => return,
-        };
+        if self.url.is_none() {
+            return;
+        }
 
         if self.update_interval.is_zero() {
             warn!(
@@ -260,47 +313,26 @@ impl GeoipDB {
             return;
         }
 
-        let tag = self.tag.clone();
-        let interval = self.update_interval;
-        let cache = self.cache.clone();
-        let db = self.clone();
-        let key = format!("tag:{},url:{},path:{}", self.tag, url, self.path);
+        let db = Arc::clone(self);
 
         shutdown::spawn(async move {
+            let mut wait = db.next_update_delay();
+
             loop {
-                tokio::time::sleep(interval).await;
-
-                let last_update = cache.as_ref().and_then(|c| c.get(&key).ok());
-                if let Some(Some((secs, _))) = last_update {
-                    let last = UNIX_EPOCH + Duration::from_secs(secs);
-                    if let Ok(elapsed) = SystemTime::now().duration_since(last)
-                        && elapsed < interval
-                    {
-                        let wait = interval - elapsed;
-                        info!(
-                            "GeoIP db '{}' is up to date. Next update in {}",
-                            tag,
-                            format_duration(wait)
-                        );
-                        tokio::time::sleep(wait).await;
-                        continue;
-                    }
+                if !wait.is_zero() {
+                    info!(
+                        "Next GeoIP db '{}' update in {}",
+                        db.tag,
+                        format_duration(wait)
+                    );
+                    tokio::time::sleep(wait).await;
                 }
 
-                info!("Starting scheduled GeoIP update for '{}'...", tag);
-                match db.download_db().await {
-                    Ok(_) => {
-                        if let Some(c) = &cache {
-                            let now_secs = now_timestamp();
-                            if let Err(e) = c.set(&key, &now_secs) {
-                                warn!("Failed to persist GeoIP '{}' update timestamp: {}", tag, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to update GeoIP db '{}': {}", tag, e);
-                    }
+                info!("Starting GeoIP update for '{}'...", db.tag);
+                if let Err(e) = db.update_db().await {
+                    error!("Failed to update GeoIP db '{}': {}", db.tag, e);
                 }
+                wait = db.update_interval;
             }
         });
     }
