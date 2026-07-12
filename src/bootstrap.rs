@@ -1,11 +1,11 @@
 use crate::cache::{init_cache, shutdown_cache};
 use crate::config::Config;
 use crate::proxy::inbound::init_inbounds;
-use crate::proxy::observe::init_observer;
-use crate::proxy::outbound::init_outbounds;
+use crate::proxy::observe::{init_observer, shutdown_observer};
+use crate::proxy::outbound::{init_outbounds, shutdown_outbounds};
 use crate::proxy::router::geoip::{init_geoip, shutdown_geoip};
 use crate::proxy::router::geoip_db::{init_geoip_db, shutdown_geoip_db};
-use crate::proxy::router::init_router;
+use crate::proxy::router::{init_router, shutdown_router};
 use crate::utils::interface::InterfaceManager;
 use crate::utils::logging;
 use crate::utils::shutdown;
@@ -29,7 +29,15 @@ where
 
     InterfaceManager::init();
 
-    let mut shutdown_rx = init_app(config).await?;
+    let mut shutdown_rx = match init_app(config).await {
+        Ok(shutdown_rx) => shutdown_rx,
+        Err(error) => {
+            // Initialization can fail after some global components have already been installed.
+            // Tear them down so a later Android start can retry in the same process.
+            shutdown_app().await;
+            return Err(error);
+        }
+    };
 
     let api_shutdown = async {
         if let Some(ref mut rx) = shutdown_rx {
@@ -41,33 +49,43 @@ where
 
     info!("Init ok. Running...");
 
-    tokio::select! {
+    let run_result = tokio::select! {
         res = signal => {
             if let Err(e) = res {
                 error!("Error waiting for signal: {}", e);
-                return Err(e);
+                Err(e)
+            } else {
+                info!("Received external signal, shutting down...");
+                Ok(())
             }
-            info!("Received external signal, shutting down...");
         }
         _ = api_shutdown => {
             info!("Received API shutdown signal, shutting down...");
+            Ok(())
         }
-    }
+    };
     info!("Stopping inbound listeners...");
 
+    shutdown_app().await;
+
+    run_result?;
+
+    info!("All Exited.");
+    Ok(())
+}
+
+async fn shutdown_app() {
     InterfaceManager::shutdown();
 
     shutdown::abort_all_and_wait().await;
 
-    // 先清空所有持有 RedbStore → Arc<Database> 引用的静态变量
+    shutdown_router();
     shutdown_dns();
     shutdown_geoip();
     shutdown_geoip_db();
-    // 再清空 REDB_CACHE，此时 Database 引用计数归零，flock 释放
+    shutdown_outbounds();
+    shutdown_observer();
     shutdown_cache();
-
-    info!("All Exited.");
-    Ok(())
 }
 
 pub async fn init_app(mut config: Config) -> Result<Option<tokio::sync::mpsc::Receiver<()>>> {

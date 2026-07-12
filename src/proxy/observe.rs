@@ -1,18 +1,16 @@
 use bytesize::ByteSize;
 use dashmap::DashMap;
 use serde::{Serialize, Serializer};
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::OnceCell;
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::proxy::outbound;
-use crate::utils::{format_ms, format_us};
 use crate::utils::now_timestamp;
 use crate::utils::shutdown;
 use crate::utils::system::get_memory_usage;
+use crate::utils::{format_ms, format_us};
 
 fn serialize_atomic_u64<S>(val: &AtomicU64, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -580,19 +578,32 @@ impl Observer {
     }
 }
 
-static GLOBAL_OBSERVER: OnceCell<Arc<Observer>> = OnceCell::const_new();
+static GLOBAL_OBSERVER: LazyLock<RwLock<Option<Arc<Observer>>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 pub fn init_observer(cfg: &crate::config::Config) -> anyhow::Result<()> {
     if let Some(obs_cfg) = cfg.observe.as_ref() {
         if obs_cfg.enabled {
             let observer = Arc::new(Observer::new());
             observer.spawn_periodic_log(obs_cfg.log_interval);
-            let _ = GLOBAL_OBSERVER.set(observer);
+            *GLOBAL_OBSERVER
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
         }
     }
     Ok(())
 }
 
 pub fn get_observer() -> Option<Arc<Observer>> {
-    GLOBAL_OBSERVER.get().cloned()
+    GLOBAL_OBSERVER
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+pub fn shutdown_observer() {
+    GLOBAL_OBSERVER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
 }

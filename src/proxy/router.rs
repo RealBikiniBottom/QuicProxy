@@ -10,7 +10,7 @@ use bytes::Bytes;
 use bytesize::ByteSize;
 use dashmap::DashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::time::sleep;
@@ -21,13 +21,14 @@ pub use rule::{Rule, RuleAction};
 
 use super::outbound::SessionMap;
 
-use tokio::sync::OnceCell;
-
-pub static GLOBAL_ROUTER: OnceCell<Arc<Router>> = OnceCell::const_new();
+static GLOBAL_ROUTER: LazyLock<StdRwLock<Option<Arc<Router>>>> =
+    LazyLock::new(|| StdRwLock::new(None));
 
 pub fn get_router() -> Arc<Router> {
     GLOBAL_ROUTER
-        .get()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
         .unwrap_or_else(|| {
             tracing::error!("Router not set");
             std::process::exit(1);
@@ -38,8 +39,19 @@ pub fn get_router() -> Arc<Router> {
 pub fn init_router(cfg: &Config) -> anyhow::Result<()> {
     let r = Router::new(cfg)?;
 
-    let _ = GLOBAL_ROUTER.set(Arc::new(r));
+    *GLOBAL_ROUTER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(r));
     Ok(())
+}
+
+/// Release the router and everything it owns, including DNS and outbound handles.
+/// This must run before the shared cache databases are closed.
+pub fn shutdown_router() {
+    GLOBAL_ROUTER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
 }
 
 pub mod geoip;

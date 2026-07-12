@@ -115,6 +115,12 @@ pub fn init_outbounds(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Release all outbound instances before closing shared cache databases.
+/// Selectors may own persistent cache handles.
+pub fn shutdown_outbounds() {
+    OUTBOUNDS_MAP.clear();
+}
+
 pub fn try_get_outbound_by_tag(tag: &str) -> Arc<dyn AnyOutbound> {
     match OUTBOUNDS_MAP.get(tag) {
         Some(r) => return r.clone(),
