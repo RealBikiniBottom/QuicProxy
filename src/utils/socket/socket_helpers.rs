@@ -1,5 +1,4 @@
 use crate::utils::interface::InterfaceInfo;
-use crate::utils::interface::InterfaceInfoExt;
 use std::sync::Arc;
 
 #[cfg(not(target_os = "android"))]

@@ -91,13 +91,6 @@ windows = { version = "0.62.1", features = ["Win32_Foundation", "Win32_NetworkMa
 windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
 
 
-# [profile.release]
-# panic = "unwind"
-# lto = true
-# codegen-units = 1
-# opt-level = 3
-# strip = true
-
 [profile.dev]
 panic = "unwind"
 

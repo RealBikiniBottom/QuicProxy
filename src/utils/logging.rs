@@ -241,30 +241,44 @@ pub fn init_logging(
         None
     };
 
-    let fmt_layer_stdout = if log_stdout {
-        let layer = fmt::layer()
-            .with_ansi(log_color)
-            .with_file(true)
-            .with_line_number(true)
-            .with_target(false)
-            .without_time();
+    let stdout_layer = if log_stdout {
+        #[cfg(target_os = "android")]
+        {
+            match tracing_android::layer("quicproxy") {
+                Ok(layer) => Some(layer),
+                Err(error) => {
+                    eprintln!("failed to create Android logcat layer: {error}");
+                    None
+                }
+            }
+        }
 
-        #[cfg(target_os = "ios")]
-        let layer = layer
-            .with_ansi(false)
-            .with_writer(nslog_writer::NsLogMakeWriter);
+        #[cfg(not(target_os = "android"))]
+        {
+            let layer = fmt::layer()
+                .with_ansi(log_color)
+                .with_file(true)
+                .with_line_number(true)
+                .with_target(false)
+                .without_time();
 
-        #[cfg(not(target_os = "ios"))]
-        let layer = layer.with_writer(std::io::stdout);
+            #[cfg(target_os = "ios")]
+            let layer = layer
+                .with_ansi(false)
+                .with_writer(nslog_writer::NsLogMakeWriter);
 
-        Some(layer)
+            #[cfg(not(target_os = "ios"))]
+            let layer = layer.with_writer(std::io::stdout);
+
+            Some(layer)
+        }
     } else {
         None
     };
 
     registry
         .with(fmt_layer_file)
-        .with(fmt_layer_stdout)
+        .with(stdout_layer)
         .try_init()
         .ok();
 
