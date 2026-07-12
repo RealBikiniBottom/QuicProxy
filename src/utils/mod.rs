@@ -16,6 +16,7 @@ pub mod interface;
 pub mod keyed_notify;
 pub mod logging;
 pub mod net_monitor;
+pub mod os;
 pub mod quic_wrap;
 pub mod redb_store;
 pub mod shutdown;

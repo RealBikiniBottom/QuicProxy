@@ -1,0 +1,28 @@
+name: Cleanup old releases
+
+on:
+  schedule:
+    # Every Monday at 02:00 Asia/Shanghai (Sunday 18:00 UTC).
+    - cron: "0 18 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cleanup-old-releases
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Keep the latest 10 releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Delete old releases
+        uses: dev-drprasad/delete-older-releases@v0.3.4
+        with:
+          keep_latest: 10
+          delete_tags: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
