@@ -276,8 +276,8 @@ impl QuinnServer {
         }
         transport_config.datagram_receive_buffer_size(Some(MAX_DATAGRAM_WINDOW as usize));
         transport_config.datagram_send_buffer_size(MAX_DATAGRAM_WINDOW.try_into().unwrap());
-        transport_config.max_concurrent_bidi_streams(5000u32.into());
-        transport_config.max_concurrent_uni_streams(5000u32.into());
+        transport_config.max_concurrent_bidi_streams(500u32.into());
+        transport_config.max_concurrent_uni_streams(500u32.into());
         transport_config.enable_segmentation_offload(enable_gso);
         transport_config.initial_mtu(initial_mtu);
         transport_config.min_mtu(min_mtu);

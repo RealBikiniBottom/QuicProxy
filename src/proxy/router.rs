@@ -293,7 +293,6 @@ impl Router {
         );
 
         let copy_fut = async move {
-            // 1. 执行第一次转发尝试
             match copy_bidirectional(&mut inbound_stream, &mut outbound_stream).await {
                 Ok(counts) => Ok(counts),
                 Err(e) => {

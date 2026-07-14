@@ -10,6 +10,7 @@ mimalloc = ["dep:mimalloc"]
 snmalloc = ["dep:snmalloc-rs"]
 jni = ["dep:jni"]
 premium = ["dep:tun-rs"]
+apple-network-extension = ["premium"]
 
 [lib]
 name = "quicproxy"

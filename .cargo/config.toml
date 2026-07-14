@@ -5,3 +5,10 @@ ar = "x86_64-w64-mingw32-ar"
 [target.i686-pc-windows-gnu]
 linker = "i686-w64-mingw32-gcc"
 ar = "i686-w64-mingw32-ar"
+
+# lwIP defines large tentative C arrays. On macOS, compiling them as common
+# symbols makes the linker request 32 KiB alignment for __DATA,__common even
+# though Mach-O segments support at most 16 KiB. Emit regular BSS symbols.
+[env]
+CFLAGS_aarch64_apple_darwin = { value = "-fno-common", force = false }
+CFLAGS_x86_64_apple_darwin = { value = "-fno-common", force = false }

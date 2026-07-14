@@ -30,11 +30,15 @@ pub const fn is_apple() -> bool {
 
 /// Returns whether the current compilation target is a mobile platform.
 pub const fn is_mobile() -> bool {
-    is_android() || is_ios()
+    is_android()
+        || is_ios()
+        || cfg!(all(
+            target_os = "macos",
+            feature = "apple-network-extension"
+        ))
 }
 
 /// Returns whether the current compilation target is a supported desktop platform.
 pub const fn is_desktop() -> bool {
     is_macos() || is_windows() || is_linux()
 }
-

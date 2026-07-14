@@ -109,11 +109,11 @@ apk-verify:
 
 build-ios:
 	rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-	RUSTFLAGS="-C link-arg=-Wl,-undefined,dynamic_lookup" \
+	IPHONEOS_DEPLOYMENT_TARGET=14.0 \
 	cargo build --release --target aarch64-apple-ios --features "premium" --lib
-	RUSTFLAGS="-C link-arg=-Wl,-undefined,dynamic_lookup" \
+	IPHONEOS_DEPLOYMENT_TARGET=14.0 \
 	cargo build --release --target aarch64-apple-ios-sim --features "premium" --lib
-	RUSTFLAGS="-C link-arg=-Wl,-undefined,dynamic_lookup" \
+	IPHONEOS_DEPLOYMENT_TARGET=14.0 \
 	cargo build --release --target x86_64-apple-ios --features "premium" --lib
 	mkdir -p target/ios-simulator-fat
 	lipo -create \

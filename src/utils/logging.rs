@@ -4,13 +4,23 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*, reload};
 
-#[cfg(target_os = "ios")]
+#[cfg(any(
+    target_os = "ios",
+    all(target_os = "macos", feature = "apple-network-extension")
+))]
 mod nslog_writer {
     use std::ffi::CString;
     use std::io::{self, Write};
     use std::sync::Mutex;
 
     static LINE_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    type LogCallback = extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char);
+    static LOG_CALLBACK: Mutex<Option<LogCallback>> = Mutex::new(None);
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn quicproxy_set_log_callback(callback: Option<LogCallback>) {
+        *LOG_CALLBACK.lock().unwrap() = callback;
+    }
 
     pub struct NsLogMakeWriter;
 
@@ -78,14 +88,18 @@ mod nslog_writer {
         let Ok(c_msg) = CString::new(msg.as_bytes()) else {
             return;
         };
-        unsafe {
-            unsafe extern "C" {
-                fn ios_rust_log(level: *const std::ffi::c_char, message: *const std::ffi::c_char);
-            }
-            ios_rust_log(c_level.as_ptr(), c_msg.as_ptr());
+        let callback = *LOG_CALLBACK.lock().unwrap();
+        if let Some(callback) = callback {
+            callback(c_level.as_ptr(), c_msg.as_ptr());
         }
     }
 }
+
+#[cfg(any(
+    target_os = "ios",
+    all(target_os = "macos", feature = "apple-network-extension")
+))]
+pub use nslog_writer::quicproxy_set_log_callback;
 
 struct SizeLimitedFileAppender {
     path: PathBuf,
@@ -262,12 +276,18 @@ pub fn init_logging(
                 .with_target(false)
                 .without_time();
 
-            #[cfg(target_os = "ios")]
+            #[cfg(any(
+                target_os = "ios",
+                all(target_os = "macos", feature = "apple-network-extension")
+            ))]
             let layer = layer
                 .with_ansi(false)
                 .with_writer(nslog_writer::NsLogMakeWriter);
 
-            #[cfg(not(target_os = "ios"))]
+            #[cfg(not(any(
+                target_os = "ios",
+                all(target_os = "macos", feature = "apple-network-extension")
+            )))]
             let layer = layer.with_writer(std::io::stdout);
 
             Some(layer)
