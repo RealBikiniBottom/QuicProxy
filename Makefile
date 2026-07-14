@@ -107,24 +107,32 @@ apk-verify:
 	@echo "--- Certificate details ---"
 	keytool -printcert -jarfile $(APK_OUTPUT) 2>/dev/null || echo "keytool not available"
 
-build-ios:
-	rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+build-xcframework:
+	rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin
+	@# iOS device
 	IPHONEOS_DEPLOYMENT_TARGET=14.0 \
 	cargo build --release --target aarch64-apple-ios --features "premium" --lib
+	@# iOS simulator
 	IPHONEOS_DEPLOYMENT_TARGET=14.0 \
 	cargo build --release --target aarch64-apple-ios-sim --features "premium" --lib
 	IPHONEOS_DEPLOYMENT_TARGET=14.0 \
 	cargo build --release --target x86_64-apple-ios --features "premium" --lib
+	@# macOS (arm64 only for now)
+	MACOSX_DEPLOYMENT_TARGET=11.0 \
+	cargo build --release --target aarch64-apple-darwin --features "apple-network-extension" --lib
+	@# Merge iOS simulator fat binary
 	mkdir -p target/ios-simulator-fat
 	lipo -create \
 		target/aarch64-apple-ios-sim/release/libquicproxy.a \
 		target/x86_64-apple-ios/release/libquicproxy.a \
 		-output target/ios-simulator-fat/libquicproxy.a
-	rm -rf src/premium/quicproxy_flutter/ios/tunnel/QuicProxyCore.xcframework
+	@# Unified xcframework (iOS + macOS)
+	rm -rf src/premium/quicproxy_flutter/apple/PacketTunnelShared/QuicProxyCore.xcframework
 	xcodebuild -create-xcframework \
 		-library target/aarch64-apple-ios/release/libquicproxy.a \
 		-library target/ios-simulator-fat/libquicproxy.a \
-		-output src/premium/quicproxy_flutter/ios/tunnel/QuicProxyCore.xcframework
+		-library target/aarch64-apple-darwin/release/libquicproxy.a \
+		-output src/premium/quicproxy_flutter/apple/PacketTunnelShared/QuicProxyCore.xcframework
 
 CODE_MMDB_URL ?= https://cdn.jsdelivr.net/gh/Hackl0us/GeoIP2-CN@release/Country.mmdb
 CODE_MMDB_PATH ?= assets/code.mmdb
