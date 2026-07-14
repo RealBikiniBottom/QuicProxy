@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use crate::{
     config::OutboundConfig,
     proxy::{
-        QuicTlsConfig, SessionCloser, SourceAddr, TargetAddr,
+        TlsConfig, SessionCloser, SourceAddr, TargetAddr,
         anytls_proto::*,
         outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo, select_outbound_interface},
     },
@@ -583,7 +583,7 @@ impl AnytlsClient {
     pub fn new(
         address: TargetAddr,
         password: &str,
-        tls: &QuicTlsConfig,
+        tls: &TlsConfig,
         connect_timeout: Duration,
         bind_interface: Option<String>,
         dns_server_name: Option<String>,
@@ -631,7 +631,7 @@ impl AnytlsClient {
         })
     }
 
-    fn build_tls_client_config(tls: &QuicTlsConfig) -> Result<rustls::ClientConfig> {
+    fn build_tls_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         if !tls.insecure {
@@ -943,7 +943,7 @@ impl AnytlsOutbound {
             .clone()
             .context(format!("anytls outbound '{}' requires password", tag))?;
 
-        let tls = QuicTlsConfig::from_outbound(cfg)?;
+        let tls = TlsConfig::from_outbound(cfg)?;
         let connect_timeout = Duration::from_secs(cfg.connect_timeout.unwrap_or(30));
 
         let client = AnytlsClient::new(
@@ -1260,7 +1260,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::QuicTlsConfig;
+    use crate::proxy::TlsConfig;
     use sha2::{Digest, Sha256};
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -1480,8 +1480,8 @@ mod tests {
 
     /// Create a TLS client config for testing
     #[allow(dead_code)]
-    fn test_tls_client_config(_client_cfg: rustls::ClientConfig) -> QuicTlsConfig {
-        QuicTlsConfig {
+    fn test_tls_client_config(_client_cfg: rustls::ClientConfig) -> TlsConfig {
+        TlsConfig {
             enable: true,
             insecure: false,
             zero_rtt: false,
@@ -1607,7 +1607,7 @@ mod tests {
 
         // Create AnytlsClient
         let address = TargetAddr::Ip(server_addr);
-        let tls_cfg = QuicTlsConfig {
+        let tls_cfg = TlsConfig {
             enable: true,
             insecure: false,
             zero_rtt: false,

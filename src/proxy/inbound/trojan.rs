@@ -1,5 +1,5 @@
 use crate::config::InboundConfig;
-use crate::proxy::QuicTlsConfig;
+use crate::proxy::TlsConfig;
 use crate::proxy::outbound::{AnyPacket, AnyStream, PacketInfo};
 use crate::proxy::router::{Router, get_router};
 use crate::proxy::{SourceAddr, TargetAddr, inbound};
@@ -82,7 +82,7 @@ pub struct TrojanInbound {
     address: SocketAddr,
     idle_timeout: Duration,
     password_hash: String,
-    tls: QuicTlsConfig,
+    tls: TlsConfig,
 }
 
 #[derive(Debug)]
@@ -99,7 +99,7 @@ impl TrojanInbound {
         let result = hasher.finalize();
         let password_hash = hex::encode(result);
 
-        let tls = QuicTlsConfig::from_inbound(cfg)?;
+        let tls = TlsConfig::from_inbound(cfg)?;
 
         let address: SocketAddr = format!(
             "{}:{}",

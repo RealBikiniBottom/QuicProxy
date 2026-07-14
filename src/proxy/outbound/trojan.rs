@@ -15,7 +15,7 @@ use tokio_rustls::{TlsConnector, rustls};
 use crate::config::OutboundConfig;
 use crate::proxy::outbound::pool::PoolOutbound;
 use crate::proxy::{
-    QuicTlsConfig, SourceAddr, TargetAddr,
+    TlsConfig, SourceAddr, TargetAddr,
     outbound::{AnyOutbound, AnyPacket, AnyStream, LazyHandshakeStream, PacketInfo},
 };
 use crate::utils::new_io_other_error;
@@ -25,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub struct TrojanOutbound {
     pub address: TargetAddr,
     pub password: String,
-    pub tls: QuicTlsConfig,
+    pub tls: TlsConfig,
     pub connect_timeout: Duration,
     pub dns_server_name: Option<String>,
     pub bind_interface: Option<String>,
@@ -52,7 +52,7 @@ impl TrojanOutbound {
             .clone()
             .context(format!("trojan outbound '{}' requires password", tag))?;
 
-        let tls = QuicTlsConfig::from_outbound(cfg)?;
+        let tls = TlsConfig::from_outbound(cfg)?;
         let connect_timeout = Duration::from_secs(cfg.connect_timeout.unwrap_or(30));
         let pool_size = cfg.pool_size.unwrap_or(0);
 
