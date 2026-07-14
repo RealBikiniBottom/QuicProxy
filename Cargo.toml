@@ -42,7 +42,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 quinn = { package = "quinn", git = "https://github.com/spongebob888/quinn-jls", tag = "jls-0.3.6", default-features = false, features = ["runtime-tokio", "rustls-ring"]}
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls = { git = "https://github.com/spongebob888/rustls-jls", branch = "jls-main", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 rustls-pemfile = "2.1"
 webpki-roots = "0.26"
 futures = "0.3.31"
@@ -58,7 +58,7 @@ tun-rs = { version = "2", features = ["async", "async_framed", "utun_fd"], optio
 netdev = "0.45"
 etherparse = "0.13"
 libc = "0.2.180"
-tokio-rustls = "0.26.4"
+tokio-rustls = { git = "https://github.com/spongebob888/tokio-rustls", branch = "main", default-features = false, features = ["ring", "logging", "tls12"] }
 anyhow = { version = "1", features = ["backtrace"] }
 tracing-error = "0.2"
 redb = "4.1.0"
@@ -78,6 +78,11 @@ cfb-mode = "0.8"
 aes = "0.8"
 shadowsocks = { version = "1.24", features = ["aead-cipher-2022", "stream-cipher"] }
 sysinfo = "0.38"
+
+[patch.crates-io]
+# Keep tokio-rustls and other TLS consumers on the JLS-capable rustls fork.
+rustls = { git = "https://github.com/spongebob888/rustls-jls", branch = "jls-main" }
+
 [target.'cfg(target_os = "android")'.dependencies]
 tracing-android = "0.2.0"
 

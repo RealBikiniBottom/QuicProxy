@@ -186,6 +186,28 @@ fn validate_jls(enable: bool, username: &str, password: &str) -> Result<()> {
     Ok(())
 }
 
+/// Apply the shared JLS client settings used by TCP-based TLS protocols.
+pub(crate) fn configure_jls_client(config: &mut rustls::ClientConfig, tls: &TlsConfig) {
+    if tls.enable_jls {
+        config.jls_config = rustls::jls::JlsClientConfig::new(&tls.jls_password, &tls.jls_username);
+    }
+}
+
+/// Apply the shared JLS server settings used by TCP-based TLS protocols.
+pub(crate) fn configure_jls_server(config: &mut rustls::ServerConfig, tls: &TlsConfig) {
+    if !tls.enable_jls {
+        return;
+    }
+
+    let mut jls_config = rustls::jls::JlsServerConfig::default()
+        .enable(true)
+        .add_user(tls.jls_password.clone(), tls.jls_username.clone());
+    if let Some(server_name) = tls.sni.as_ref() {
+        jls_config = jls_config.with_server_name(server_name.clone());
+    }
+    config.jls_config = jls_config.into();
+}
+
 impl TlsConfig {
     pub fn from_inbound(config: &InboundConfig) -> Result<Self> {
         let tls = config.tls.as_ref();
@@ -282,5 +304,73 @@ impl SessionCloser {
     /// 检查是否已关闭
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod jls_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    #[tokio::test]
+    async fn tcp_tls_jls_authenticates_both_peers() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let tls = TlsConfig {
+            enable_jls: true,
+            jls_username: "jls-user".into(),
+            jls_password: "jls-password".into(),
+            sni: Some("localhost".into()),
+            ..TlsConfig::default()
+        };
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_chain = vec![cert.cert.der().clone()];
+        let private_key =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, private_key)
+            .unwrap();
+        configure_jls_server(&mut server_config, &tls);
+
+        let mut client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        configure_jls_client(&mut client_config, &tls);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = TlsAcceptor::from(Arc::new(server_config))
+                .accept(stream)
+                .await
+                .unwrap();
+            assert!(matches!(
+                stream.get_ref().1.jls_state(),
+                rustls::jls::JlsState::AuthSuccess(_)
+            ));
+            stream.write_all(b"ok").await.unwrap();
+        });
+
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+            .unwrap()
+            .to_owned();
+        let mut stream = TlsConnector::from(Arc::new(client_config))
+            .connect(server_name, tcp)
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.get_ref().1.jls_state(),
+            rustls::jls::JlsState::AuthSuccess(_)
+        ));
+        let mut response = [0; 2];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"ok");
+        server.await.unwrap();
     }
 }

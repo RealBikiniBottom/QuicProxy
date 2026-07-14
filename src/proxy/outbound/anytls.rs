@@ -643,9 +643,11 @@ impl AnytlsClient {
             } else {
                 root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             }
-            Ok(rustls::ClientConfig::builder()
+            let mut config = rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
-                .with_no_client_auth())
+                .with_no_client_auth();
+            crate::proxy::configure_jls_client(&mut config, tls);
+            Ok(config)
         } else {
             let mut config = rustls::ClientConfig::builder()
                 .with_root_certificates(rustls::RootCertStore::empty())
@@ -653,6 +655,7 @@ impl AnytlsClient {
             config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(SkipServerVerification));
+            crate::proxy::configure_jls_client(&mut config, tls);
             Ok(config)
         }
     }
@@ -2223,6 +2226,7 @@ mod tests {
             dns: None,
             idle_timeout: None,
             username: None,
+            uuid: None,
             udp_mod: None,
             congestion_controller: None,
             pool_size: None,
@@ -2317,6 +2321,7 @@ mod tests {
             dns: None,
             idle_timeout: None,
             username: None,
+            uuid: None,
             udp_mod: None,
             congestion_controller: None,
             pool_size: None,

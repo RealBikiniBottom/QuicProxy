@@ -706,7 +706,7 @@ impl AnytlsInbound {
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let server_config =
+        let mut server_config =
             if let (Some(cert_path), Some(key_path)) = (&self.tls.cert, &self.tls.key) {
                 let certs = load_certs(cert_path)?;
                 let key = load_keys(key_path)?;
@@ -728,6 +728,8 @@ impl AnytlsInbound {
                     .with_single_cert(cert_chain, private_key)
                     .map_err(|e| new_io_other_error(format!("TLS config error: {}", e)))?
             };
+
+        crate::proxy::configure_jls_server(&mut server_config, &self.tls);
 
         let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 

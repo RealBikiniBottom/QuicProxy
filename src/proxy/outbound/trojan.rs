@@ -15,7 +15,7 @@ use tokio_rustls::{TlsConnector, rustls};
 use crate::config::OutboundConfig;
 use crate::proxy::outbound::pool::PoolOutbound;
 use crate::proxy::{
-    TlsConfig, SourceAddr, TargetAddr,
+    SourceAddr, TargetAddr, TlsConfig, configure_jls_client,
     outbound::{AnyOutbound, AnyPacket, AnyStream, LazyHandshakeStream, PacketInfo},
 };
 use crate::utils::new_io_other_error;
@@ -120,9 +120,11 @@ impl TrojanOutbound {
                 root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             }
 
-            Ok(rustls::ClientConfig::builder()
+            let mut config = rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
-                .with_no_client_auth())
+                .with_no_client_auth();
+            configure_jls_client(&mut config, &self.tls);
+            Ok(config)
         } else {
             let config = rustls::ClientConfig::builder()
                 .with_root_certificates(rustls::RootCertStore::empty())
@@ -131,6 +133,7 @@ impl TrojanOutbound {
             config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(SkipServerVerification));
+            configure_jls_client(&mut config, &self.tls);
             Ok(config)
         }
     }
