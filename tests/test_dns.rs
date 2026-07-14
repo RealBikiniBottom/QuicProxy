@@ -3,8 +3,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use quicproxy::cache;
-use quicproxy::config::{CacheConfig, Config, DnsServerConfig};
+use quicproxy::config::{CacheConfig, Config, OutboundConfig};
 use quicproxy::dns::*;
+use quicproxy::proxy::outbound::direct::DirectOutbound;
 use tempfile::TempDir;
 
 #[cfg(any())]
@@ -438,7 +439,7 @@ fn setup_cache_for_tag(temp_dir: &TempDir, tag: &str, memory_size: u64) {
             path: Some(db_path.to_string_lossy().to_string()),
         },
     );
-    cache::init_cache(&config);
+    cache::init_cache(&config).expect("failed to initialize test cache");
 }
 
 fn make_fakeipdns(tag: &str, cache_tag: &str, range_v4: &str, range_v6: Option<&str>) -> FakeIPDNS {
@@ -477,9 +478,16 @@ fn make_fakeipdns(tag: &str, cache_tag: &str, range_v4: &str, range_v6: Option<&
         _ => 0,
     };
 
+    let outbound_config: OutboundConfig =
+        serde_json::from_value(serde_json::json!({ "type": "direct" }))
+            .expect("failed to build direct outbound config");
+    let default_outbound = DirectOutbound::new("test_direct".to_string(), &outbound_config)
+        .expect("failed to build direct outbound");
+
     FakeIPDNS {
         tag: tag.to_string(),
         min_ttl: None,
+        default_outbound,
         ipv4_cidr,
         ipv6_cidr,
         cache,
@@ -800,9 +808,10 @@ async fn test_fakeipdns_anydns_reverse_trait() {
         setup_cache_for_tag(&temp_dir, cache_tag, 100);
 
         let dns = make_fakeipdns("test", cache_tag, "198.18.0.0/15", None);
+        let outbound = dns.default_outbound();
 
         let ip = dns
-            .lookup_ipv4("trait.rev.test")
+            .lookup_ipv4("trait.rev.test", &outbound)
             .await
             .unwrap()
             .expect("should resolve");

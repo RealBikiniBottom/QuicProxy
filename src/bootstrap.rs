@@ -74,7 +74,7 @@ where
     Ok(())
 }
 
-async fn shutdown_app() {
+pub async fn shutdown_app() {
     InterfaceManager::shutdown();
 
     shutdown::abort_all_and_wait().await;

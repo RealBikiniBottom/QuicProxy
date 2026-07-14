@@ -154,7 +154,6 @@ async fn test_shadowquic_tcp_echo() {
 #[tokio::test]
 async fn test_shadowquic_jls_full_chain() {
     let mut ctx = TestContext::new().await;
-    let password = "testpassword";
     let jls_user = "user";
     let jls_pwd = "pwd";
 
@@ -1235,7 +1234,6 @@ mod udp_tests {
 
 #[tokio::test]
 async fn test_shadowquic_path_state() {
-    use quicproxy::proxy::outbound::AnyOutbound;
     use quicproxy::proxy::outbound::OUTBOUNDS_MAP;
 
     let mut ctx = TestContext::new().await;

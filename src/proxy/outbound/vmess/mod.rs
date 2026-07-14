@@ -45,7 +45,7 @@ impl VmessOutbound {
         let uuid = cfg
             .uuid
             .clone()
-            .context(format!("vmess outbound '{}' requires password (uuid)", tag))?;
+            .context(format!("vmess outbound '{}' requires uuid", tag))?;
 
         let alter_id = cfg
             .username
@@ -184,7 +184,7 @@ mod tests {
             "type": "vmess",
             "address": "127.0.0.1",
             "port": 10086,
-            "password": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
             "username": "0",
             "udp_mod": "auto",
             "connect_timeout": 5,
@@ -207,9 +207,9 @@ mod tests {
     }
 
     #[test]
-    fn test_vmess_outbound_missing_password() {
+    fn test_vmess_outbound_missing_uuid() {
         let mut cfg = make_config();
-        cfg.password = None;
+        cfg.uuid = None;
         let result = VmessOutbound::new("test-vmess".to_string(), &cfg);
         assert!(result.is_err());
     }

@@ -21,6 +21,17 @@ async fn test_mix_inbound_direct_outbound() {
                     "port": 0
                 }
             },
+            "dns": {
+                "default_server": "local_dns",
+                "servers": {
+                    "local_dns": {
+                        "type": "udp",
+                        "address": "8.8.8.8",
+                        "port": 53,
+                        "outbound": "direct_out"
+                    }
+                }
+            },
             "outbounds": {
                 "default_server": "direct_out",
                 "servers": {
@@ -85,6 +96,17 @@ async fn test_socks5_inbound_direct_outbound() {
                     "type": "socks5",
                     "address": "127.0.0.1",
                     "port": 0
+                }
+            },
+            "dns": {
+                "default_server": "local_dns",
+                "servers": {
+                    "local_dns": {
+                        "type": "udp",
+                        "address": "8.8.8.8",
+                        "port": 53,
+                        "outbound": "direct_out"
+                    }
                 }
             },
             "outbounds": {

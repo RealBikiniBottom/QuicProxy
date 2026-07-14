@@ -23,7 +23,7 @@ run_test_config: build
 	./target/release/quicproxy --elevate -c ./tests/test_http3.json5
 
 test:
-	cargo test --test socks5_udp_test
+	cargo test
 
 check:
 	cargo check --features "premium"

@@ -6,6 +6,17 @@
       "port": 0
     }
   },
+  "dns": {
+    "default_server": "local_dns",
+    "servers": {
+      "local_dns": {
+        "type": "udp",
+        "address": "8.8.8.8",
+        "port": 53,
+        "outbound": "direct_out"
+      }
+    }
+  },
   "outbounds": {
     "default_server": "direct_out",
     "servers": {

@@ -1,17 +1,19 @@
+#![allow(dead_code)]
+
 use quicproxy::bootstrap;
 use quicproxy::config::Config;
 use std::fs::File;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::oneshot;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 
 pub struct ProxyInstance {
@@ -30,11 +32,8 @@ impl Drop for ProxyInstance {
     }
 }
 
-static LOG_INIT: Once = Once::new();
-
 pub struct Watchdog {
     done: Arc<AtomicBool>,
-    name: String,
 }
 
 impl Watchdog {
@@ -54,10 +53,7 @@ impl Watchdog {
             }
         });
 
-        Self {
-            done,
-            name: name.to_string(),
-        }
+        Self { done }
     }
 }
 
@@ -71,6 +67,7 @@ pub struct TestContext {
     pub mock_server_http_addr: SocketAddr,
     pub mock_server_tcp_addr: SocketAddr,
     pub mock_server_udp_addr: SocketAddr,
+    pub mock_server_dns_addr: SocketAddr,
 
     // We can hold multiple proxies.
     // But for backward compatibility with existing tests, we can keep the "main" one accessible or just store them in a list/map.
@@ -81,10 +78,17 @@ pub struct TestContext {
     pub default_timeout: Duration,
     // Keep log guard to prevent logs from being dropped
     _log_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    // Proxy bootstrap uses process-global registries, so test contexts in the
+    // same integration-test binary must not run concurrently.
+    _test_guard: OwnedMutexGuard<()>,
 }
+
+static TEST_CONTEXT_LOCK: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
 
 impl TestContext {
     pub async fn new() -> Self {
+        let test_guard = TEST_CONTEXT_LOCK.clone().lock_owned().await;
+        bootstrap::shutdown_app().await;
         let mut handles = Vec::new();
 
         let (tx_http, rx_http) = oneshot::channel();
@@ -141,19 +145,51 @@ impl TestContext {
         handles.push(h_udp);
         let mock_server_udp_addr = rx_udp.await.unwrap();
 
+        let (tx_dns, rx_dns) = oneshot::channel();
+        let h_dns = tokio::spawn(async move {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            tx_dns.send(socket.local_addr().unwrap()).unwrap();
+            let mut buf = [0u8; 2048];
+            loop {
+                if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
+                    if len < 12 {
+                        continue;
+                    }
+
+                    let mut response = buf[..len].to_vec();
+                    response[2] |= 0x80; // QR: response
+                    response[3] |= 0x80; // RA: recursion available
+                    response[6..8].copy_from_slice(&1u16.to_be_bytes()); // ANCOUNT
+                    response.extend_from_slice(&[
+                        0xc0, 0x0c, // compressed query name
+                        0x00, 0x01, // A
+                        0x00, 0x01, // IN
+                        0x00, 0x00, 0x00, 0x3c, // TTL: 60 seconds
+                        0x00, 0x04, // RDLENGTH
+                        203, 0, 113, 1, // TEST-NET-3 address
+                    ]);
+                    let _ = socket.send_to(&response, addr).await;
+                }
+            }
+        });
+        handles.push(h_dns);
+        let mock_server_dns_addr = rx_dns.await.unwrap();
+
         println!(
-            "Mock Servers: HTTP={}, TCP={}, UDP={}",
-            mock_server_http_addr, mock_server_tcp_addr, mock_server_udp_addr
+            "Mock Servers: HTTP={}, TCP={}, UDP={}, DNS={}",
+            mock_server_http_addr, mock_server_tcp_addr, mock_server_udp_addr, mock_server_dns_addr
         );
 
         Self {
             mock_server_http_addr,
             mock_server_tcp_addr,
             mock_server_udp_addr,
+            mock_server_dns_addr,
             proxies: Vec::new(),
             _mock_handles: handles,
             default_timeout: Duration::from_secs(5),
             _log_guard: None,
+            _test_guard: test_guard,
         }
     }
 
@@ -183,13 +219,13 @@ impl TestContext {
         inbound_name: &str,
     ) -> usize {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let mut port = listener.local_addr().unwrap().port();
         drop(listener);
 
         // Modify config with the port
         let mut config_json = config_json;
         let mut protocol_type = "mix".to_string();
-        let mut is_quic_transport = false;
+        let is_quic_transport;
 
         if let Some(inbound) = config_json
             .get_mut("inbounds")
@@ -208,6 +244,12 @@ impl TestContext {
                 .and_then(|v| v.as_str())
                 .map(|v| v.eq_ignore_ascii_case("quic"))
                 .unwrap_or(false);
+
+            if protocol_type == "shadowquic" || (protocol_type == "trojan" && is_quic_transport) {
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                port = socket.local_addr().unwrap().port();
+                inbound["port"] = serde_json::json!(port);
+            }
         } else {
             panic!("Inbound '{}' not found in config", inbound_name);
         }

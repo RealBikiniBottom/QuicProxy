@@ -112,9 +112,11 @@ impl TargetAddr {
     ///
     /// # Examples
     /// ```
-    /// let addr = TargetAddr::from_str("1.1.1.1:53")?;
-    /// let addr = TargetAddr::from_str("[2001:db8::1]:443")?;
-    /// let addr = TargetAddr::from_str("google.com:80")?;
+    /// use quicproxy::proxy::TargetAddr;
+    ///
+    /// let _addr = TargetAddr::from_str("1.1.1.1:53").unwrap();
+    /// let _addr = TargetAddr::from_str("[2001:db8::1]:443").unwrap();
+    /// let _addr = TargetAddr::from_str("google.com:80").unwrap();
     /// ```
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
         // 1. Try standard SocketAddr parsing (handles IPv4 + bracketed IPv6)
