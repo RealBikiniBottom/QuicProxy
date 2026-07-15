@@ -35,19 +35,16 @@ pub trait InterfaceInfoExt {
 impl InterfaceInfoExt for netdev::Interface {
     fn display_name(&self) -> String {
         let friendly = self.friendly_name.as_deref().unwrap_or("");
-        let gateway_str = self
-            .gateway
-            .as_ref()
-            .and_then(|gw| gw.ipv4.first())
-            .map(|ip| ip.to_string())
-            .unwrap_or_default();
-
         format!(
-            "{} ({} {} {} {})",
+            "{} {} Index: {} Gateway: {:?}, IPv4: {:?}, IPv6: {:?}, DNS: {:?}, Default: {:?}, Usable: {}",
             friendly,
             self.name,
             self.index,
-            gateway_str,
+            self.gateway,
+            self.ipv4,
+            self.ipv6,
+            self.dns_servers,
+            self.default,
             self.is_usable(),
         )
     }
@@ -78,7 +75,7 @@ impl InterfaceInfoExt for netdev::Interface {
     }
 
     fn get_dns(&self) -> std::io::Result<Vec<IpAddr>> {
-        platform::get_dns(self)
+        Ok(self.dns_servers.clone())
     }
 
     fn restore_dns(&self) -> std::io::Result<()> {
@@ -168,13 +165,7 @@ impl InterfaceManager {
 
             if changed {
                 info!(
-                    "Selected iface: {} (IPv4: {:?}, IPv6: {:?}, DNS: {:?}, Gateway: {:?}, Default: {:?})",
-                    iface.display_name(),
-                    iface.ipv4,
-                    iface.ipv6,
-                    iface.dns_servers,
-                    iface.gateway,
-                    iface.default,
+                    "Selected iface: {}",iface.display_name(),
                 );
                 *writer = Some(iface.clone());
                 Self::notify_change();
