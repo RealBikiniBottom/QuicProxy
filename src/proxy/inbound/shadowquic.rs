@@ -18,7 +18,7 @@ use crate::proxy::shadowquic_udp::{
     read_request_head, run_bistream_recv_listener, start_datagram_loop, start_udp_session_cleaner,
     start_unistream_listener, write_conn_stats_response, write_ext_error_not_available,
 };
-use crate::proxy::{TlsConfig, TargetAddr};
+use crate::proxy::{TargetAddr, TlsConfig};
 use anyhow::Context;
 
 use crate::utils::keyed_notify::KeyedNotify;

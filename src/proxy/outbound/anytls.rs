@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use crate::{
     config::OutboundConfig,
     proxy::{
-        TlsConfig, SessionCloser, SourceAddr, TargetAddr,
+        SessionCloser, SourceAddr, TargetAddr, TlsConfig,
         anytls_proto::*,
         outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo, select_outbound_interface},
     },

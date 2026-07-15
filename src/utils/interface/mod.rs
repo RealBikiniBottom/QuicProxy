@@ -164,9 +164,7 @@ impl InterfaceManager {
             };
 
             if changed {
-                info!(
-                    "Selected iface: {}",iface.display_name(),
-                );
+                info!("Selected iface: {}", iface.display_name(),);
                 *writer = Some(iface.clone());
                 Self::notify_change();
             }

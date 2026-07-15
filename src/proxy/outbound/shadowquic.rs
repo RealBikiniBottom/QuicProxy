@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::OutboundConfig;
 use crate::proxy::outbound::{AnyOutbound, AnyStream, UdpMode};
-use crate::proxy::{TlsConfig, TargetAddr};
+use crate::proxy::{TargetAddr, TlsConfig};
 
 use crate::utils::{format_duration, new_io_other_error};
 
