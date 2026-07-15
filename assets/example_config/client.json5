@@ -7,7 +7,8 @@
         // "fdfe:dcba:9876::1/126",
       ],
       "udp_timeout": 50,
-      "auto_route": true
+      "auto_route": true,
+      "strict_route": false
     },
     "mix_inbound": {
       "type": "mix",

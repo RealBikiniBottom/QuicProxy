@@ -296,6 +296,8 @@ pub struct InboundConfig {
     pub initial_mtu: u16,
     pub auto_route: Option<bool>,
     #[serde(default = "default_false")]
+    pub strict_route: bool,
+    #[serde(default = "default_false")]
     pub block_ipv6: bool,
     pub tun_name: Option<String>,
     pub tun_address: Option<Vec<String>>,
