@@ -35,4 +35,4 @@ pub use premium::android;
         all(target_os = "macos", feature = "apple-network-extension")
     )
 ))]
-pub use premium::ios;
+pub use premium::apple;

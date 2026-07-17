@@ -2,6 +2,7 @@ use crate::config::LogConfig;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*, reload};
 
 #[cfg(any(
@@ -169,6 +170,20 @@ pub fn init_logging(
     tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>,
     Option<tracing_appender::non_blocking::WorkerGuard>,
 ) {
+    /// A token type whose Drop ensures the layers stay alive.
+    struct LogGuard {
+        _reload_handle: tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>,
+        _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    }
+
+    static INIT: OnceLock<LogGuard> = OnceLock::new();
+    if INIT.get().is_some() {
+        // Already initialized in an earlier call (e.g. from apple.rs).
+        // Return dummy handles so callers can still forget them.
+        let (filter, reload_handle) = reload::Layer::new(EnvFilter::new("off"));
+        return (reload_handle, None);
+    }
+
     let (log_enabled, log_level, log_path, log_color, log_stdout, log_max_size, backtrace_mode) =
         match log_config {
             LogConfig::Level(l) => (
@@ -302,5 +317,12 @@ pub fn init_logging(
         .try_init()
         .ok();
 
-    (reload_handle, file_guard)
+    // Store the real handles in OnceLock; return dummy handles so that
+    // callers can forget them safely without affecting the held guards.
+    let _ = INIT.set(LogGuard {
+        _reload_handle: reload_handle,
+        _file_guard: file_guard,
+    });
+    let (_, dummy_reload) = reload::Layer::new(EnvFilter::new("off"));
+    (dummy_reload, None)
 }
