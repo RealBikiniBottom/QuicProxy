@@ -42,7 +42,7 @@ socket2 = "0.6.1"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-quinn = { package = "quinn", git = "https://github.com/spongebob888/quinn-jls", tag = "jls-0.3.6", default-features = false, features = ["runtime-tokio", "rustls-ring"]}
+quinn = { package = "quinn", git = "https://github.com/spongebob888/quinn-jls", branch = "jls-main", default-features = false, features = ["runtime-tokio", "rustls-ring"]}
 rustls = { git = "https://github.com/spongebob888/rustls-jls", branch = "jls-main", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 rustls-pemfile = "2.1"
 webpki-roots = "0.26"
@@ -81,7 +81,6 @@ shadowsocks = { version = "1.24", features = ["aead-cipher-2022", "stream-cipher
 sysinfo = "0.38"
 
 [patch.crates-io]
-# Keep tokio-rustls and other TLS consumers on the JLS-capable rustls fork.
 rustls = { git = "https://github.com/spongebob888/rustls-jls", branch = "jls-main" }
 
 [target.'cfg(target_os = "android")'.dependencies]
