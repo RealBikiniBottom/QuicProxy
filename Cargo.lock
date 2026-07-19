@@ -2517,7 +2517,7 @@ dependencies = [
 [[package]]
 name = "quinn"
 version = "0.12.0"
-source = "git+https://github.com/spongebob888/quinn-jls?tag=jls-0.3.6#e1c8108163bc40220425c2203b8ae0bb604b3ed7"
+source = "git+https://github.com/spongebob888/quinn-jls?branch=jls-main#44f85daccf06ca56f4573dc8ff5b6d39a10de673"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2525,7 +2525,7 @@ dependencies = [
  "quinn-proto 0.12.0",
  "quinn-udp 0.6.1",
  "rustc-hash 2.1.3",
- "rustls 0.23.36 (git+https://github.com/spongebob888/rustls-jls?tag=v%2F0.23.36-1.3.1)",
+ "rustls 0.23.36 (git+https://github.com/spongebob888/rustls-jls?tag=jls-1.3.3)",
  "socket2",
  "thiserror 2.0.18",
  "tokio",
@@ -2558,7 +2558,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.12.0"
-source = "git+https://github.com/spongebob888/quinn-jls?tag=jls-0.3.6#e1c8108163bc40220425c2203b8ae0bb604b3ed7"
+source = "git+https://github.com/spongebob888/quinn-jls?branch=jls-main#44f85daccf06ca56f4573dc8ff5b6d39a10de673"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",
@@ -2566,7 +2566,7 @@ dependencies = [
  "rand 0.9.5",
  "ring",
  "rustc-hash 2.1.3",
- "rustls 0.23.36 (git+https://github.com/spongebob888/rustls-jls?tag=v%2F0.23.36-1.3.1)",
+ "rustls 0.23.36 (git+https://github.com/spongebob888/rustls-jls?tag=jls-1.3.3)",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.18",
@@ -2592,13 +2592,13 @@ dependencies = [
 [[package]]
 name = "quinn-udp"
 version = "0.6.1"
-source = "git+https://github.com/spongebob888/quinn-jls?tag=jls-0.3.6#e1c8108163bc40220425c2203b8ae0bb604b3ed7"
+source = "git+https://github.com/spongebob888/quinn-jls?branch=jls-main#44f85daccf06ca56f4573dc8ff5b6d39a10de673"
 dependencies = [
  "cfg_aliases",
  "libc",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2890,7 +2890,7 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.36"
-source = "git+https://github.com/spongebob888/rustls-jls?tag=v%2F0.23.36-1.3.1#459f14c849f4fd5986aeeb80a7f52dca785bf80c"
+source = "git+https://github.com/spongebob888/rustls-jls?tag=jls-1.3.3#f55b7fc9aa640f4153e9bb5a4655748934f9c9fb"
 dependencies = [
  "aes-gcm",
  "once_cell",
