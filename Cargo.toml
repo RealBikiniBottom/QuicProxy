@@ -42,7 +42,7 @@ socket2 = "0.6.1"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-quinn = { package = "quinn", git = "https://github.com/spongebob888/quinn-jls", tag = "jls-0.3.6", default-features = false, features = ["runtime-tokio", "rustls-ring"]}
+quinn = { package = "quinn", git = "https://github.com/spongebob888/quinn-jls", branch = "jls-main", default-features = false, features = ["runtime-tokio", "rustls-ring"]}
 rustls = { git = "https://github.com/spongebob888/rustls-jls", branch = "jls-main", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 rustls-pemfile = "2.1"
 webpki-roots = "0.26"
