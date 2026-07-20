@@ -145,6 +145,13 @@ fn select_outbound_interface(
     bind_interface: Option<&str>,
     connect_to: Option<SocketAddr>,
 ) -> Option<Arc<InterfaceInfo>> {
+    // Mobile VPN runtimes already keep the proxy process/provider outside the
+    // tunnel. Binding sockets to the current physical interface would pin them
+    // to Wi-Fi or cellular and break subsequent network handoffs.
+    if crate::utils::os::is_mobile() {
+        return None;
+    }
+
     let mut used_interface = bind_interface.and_then(|name| resolve_iface(name, None).ok());
 
     let is_loopback = connect_to.map(|a| a.ip().is_loopback()).unwrap_or(false);
