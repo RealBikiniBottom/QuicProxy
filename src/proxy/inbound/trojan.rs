@@ -168,6 +168,7 @@ impl TrojanInbound {
             let tag = self.tag.clone();
             let udp_timeout = self.idle_timeout;
             let acceptor = tls_acceptor.clone();
+            let tls = self.tls.clone();
 
             info!(
                 "TrojanInbound accept proxy request from {}",
@@ -182,7 +183,15 @@ impl TrojanInbound {
                 )
                 .await
                 {
-                    Some(s) => Box::new(s) as AnyStream,
+                    Some(s) => {
+                        if let Err(e) =
+                            crate::proxy::verify_jls_connection(&tls, s.get_ref().1.jls_state())
+                        {
+                            error!("Trojan inbound JLS error from {}: {}", peer_addr_str, e);
+                            return;
+                        }
+                        Box::new(s) as AnyStream
+                    }
                     None => return,
                 };
 

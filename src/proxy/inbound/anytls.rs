@@ -749,6 +749,7 @@ impl AnytlsInbound {
             let tag = self.tag.clone();
             let udp_timeout = self.idle_timeout;
             let acceptor = tls_acceptor.clone();
+            let tls = self.tls.clone();
 
             info!("Anytls inbound accept from {}", peer_addr);
             tokio::spawn(async move {
@@ -756,7 +757,15 @@ impl AnytlsInbound {
                     match tokio::time::timeout(Duration::from_secs(30), acceptor.accept(socket))
                         .await
                     {
-                        Ok(Ok(s)) => s,
+                        Ok(Ok(s)) => {
+                            if let Err(e) =
+                                crate::proxy::verify_jls_connection(&tls, s.get_ref().1.jls_state())
+                            {
+                                error!("Anytls inbound JLS error from {}: {}", peer_addr, e);
+                                return;
+                            }
+                            s
+                        }
                         Ok(Err(e)) => {
                             error!("Anytls inbound TLS error from {}: {}", peer_addr, e);
                             return;

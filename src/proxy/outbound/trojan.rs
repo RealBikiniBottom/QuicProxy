@@ -152,6 +152,9 @@ impl TrojanOutbound {
             .with_context(|| format!("Trojan TLS handshake timeout after {:?}", timeout_duration))?
             .context("TLS handshake failed")?;
 
+        crate::proxy::verify_jls_connection(&self.tls, tls_stream.get_ref().1.jls_state())
+            .context("Trojan JLS handshake failed")?;
+
         Ok(tls_stream)
     }
 

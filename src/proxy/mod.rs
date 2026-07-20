@@ -210,6 +210,14 @@ pub(crate) fn configure_jls_server(config: &mut rustls::ServerConfig, tls: &TlsC
     config.jls_config = jls_config.into();
 }
 
+/// Reject a connection that was configured for JLS but did not authenticate as JLS.
+pub(crate) fn verify_jls_connection(tls: &TlsConfig, state: rustls::jls::JlsState) -> Result<()> {
+    if tls.enable_jls && !matches!(state, rustls::jls::JlsState::AuthSuccess(_)) {
+        bail!("JLS authentication failed");
+    }
+    Ok(())
+}
+
 impl TlsConfig {
     pub fn from_inbound(config: &InboundConfig) -> Result<Self> {
         let tls = config.tls.as_ref();
@@ -374,5 +382,15 @@ mod jls_tests {
         stream.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"ok");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn enabled_jls_rejects_an_unauthenticated_connection() {
+        let tls = TlsConfig {
+            enable_jls: true,
+            ..TlsConfig::default()
+        };
+
+        assert!(verify_jls_connection(&tls, rustls::jls::JlsState::NotAuthed).is_err());
     }
 }

@@ -211,21 +211,20 @@ async fn test_shadowquic_jls_full_chain() {
           "local_dns": {
             "type": "udp",
             "address": "8.8.8.8",
-            "outbound": "sq_out",
+            "outbound": "test_shadowquic_jls_full_chain",
             "port": 53,
           },
         }
       },
         "outbounds": {
-            "default_server": "sq_out",
+            "default_server": "test_shadowquic_jls_full_chain",
             "servers": {
-                "sq_out": {
+                "test_shadowquic_jls_full_chain": {
                     "type": "shadowquic",
                     "address": "127.0.0.1",
                     "port": proxy_b_port,
                     "tls": {
                         "enable_jls": true,
-                        "insecure": true,
                         "sni": "localhost",
                         "jls_username": jls_user,
                         "jls_password": jls_pwd

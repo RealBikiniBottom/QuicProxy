@@ -20,6 +20,103 @@ fn find_free_port() -> u16 {
 // Run with: cargo test --test anytls_test -- --ignored --nocapture --test-threads=1
 
 #[tokio::test]
+async fn test_anytls_jls_full_chain() {
+    let _watchdog = Watchdog::new("test_anytls_jls_full_chain", TEST_TIMEOUT);
+    let mut context = TestContext::new().await;
+    let jls_username = "anytls-jls-user";
+    let jls_password = "anytls-jls-password";
+
+    let server_config = serde_json::json!({
+        "inbounds": {
+            "anytls_in": {
+                "type": "anytls",
+                "address": "127.0.0.1",
+                "port": 0,
+                "password": "anytls-password",
+                "transport": { "type": "tcp" },
+                "tls": {
+                    "enable": true,
+                    "server_name": "localhost",
+                    "enable_jls": true,
+                    "jls_username": jls_username,
+                    "jls_password": jls_password
+                }
+            }
+        },
+        "outbounds": {
+            "default_server": "direct_out",
+            "servers": {
+                "direct_out": { "type": "direct" }
+            }
+        },
+        "dns": {
+            "default_server": "local_dns",
+            "servers": {
+                "local_dns": {
+                    "type": "udp",
+                    "address": "8.8.8.8",
+                    "port": 53,
+                    "outbound": "direct_out"
+                }
+            }
+        },
+        "router": { "default_mode": "direct" }
+    });
+
+    let server_idx = context.start_proxy(server_config, "anytls_in").await;
+    let server_port = context.proxies[server_idx].port;
+
+    let client_config = serde_json::json!({
+        "inbounds": {
+            "socks_in": {
+                "type": "socks5",
+                "address": "127.0.0.1",
+                "port": 0
+            }
+        },
+        "outbounds": {
+            "default_server": "anytls_out",
+            "servers": {
+                "anytls_out": {
+                    "type": "anytls",
+                    "address": "127.0.0.1",
+                    "port": server_port,
+                    "password": "anytls-password",
+                    "transport": { "type": "tcp" },
+                    "tls": {
+                        "enable": true,
+                        "insecure": true,
+                        "server_name": "localhost",
+                        "enable_jls": true,
+                        "jls_username": jls_username,
+                        "jls_password": jls_password
+                    }
+                },
+                "dns_direct": { "type": "direct" }
+            }
+        },
+        "dns": {
+            "default_server": "local_dns",
+            "servers": {
+                "local_dns": {
+                    "type": "udp",
+                    "address": "8.8.8.8",
+                    "port": 53,
+                    "outbound": "dns_direct"
+                }
+            }
+        },
+        "router": { "default_mode": "proxy" }
+    });
+
+    context.start_proxy(client_config, "socks_in").await;
+
+    tokio::time::timeout(Duration::from_secs(15), context.test_http_get())
+        .await
+        .expect("AnyTLS JLS test timed out");
+}
+
+#[tokio::test]
 #[ignore = "requires separate process per proxy due to global OUTBOUNDS_MAP"]
 async fn test_socks5_to_anytls_chain() {
     let _watchdog = Watchdog::new("test_socks5_to_anytls_chain", TEST_TIMEOUT);

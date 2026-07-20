@@ -207,6 +207,7 @@ impl Session {
         padding_scheme: PaddingScheme,
     ) -> Result<Arc<Self>> {
         // TLS handshake
+        let jls_enabled = tls_cfg.jls_config.enable;
         let connector = TlsConnector::from(tls_cfg);
         let tls_stream = tokio::time::timeout(
             tls_connect_timeout,
@@ -215,6 +216,15 @@ impl Session {
         .await
         .context("Anytls TLS handshake timeout")?
         .context("Anytls TLS handshake failed")?;
+
+        if jls_enabled
+            && !matches!(
+                tls_stream.get_ref().1.jls_state(),
+                rustls::jls::JlsState::AuthSuccess(_)
+            )
+        {
+            bail!("Anytls JLS authentication failed");
+        }
 
         let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();
 
