@@ -195,16 +195,7 @@ impl TrojanInbound {
                     None => return,
                 };
 
-                handle_connection(
-                    stream,
-                    router,
-                    password_hash,
-                    tag,
-                    peer_addr,
-                    "TLS",
-                    udp_timeout,
-                )
-                .await;
+                handle_connection(stream, router, password_hash, tag, peer_addr, udp_timeout).await;
             });
         }
     }
@@ -269,7 +260,6 @@ async fn handle_connection<S>(
     password_hash: String,
     tag: String,
     peer_addr: SocketAddr,
-    protocol: &'static str,
     udp_timeout: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -278,10 +268,7 @@ async fn handle_connection<S>(
         let result = match run_with_timeout(
             handle_client(stream, &password_hash),
             udp_timeout,
-            &format!(
-                "Trojan {} handshake timeout for client {}",
-                protocol, peer_addr
-            ),
+            &format!("Trojan handshake timeout for client {}", peer_addr),
             &format!("Error handling Trojan client {}", peer_addr),
         )
         .await

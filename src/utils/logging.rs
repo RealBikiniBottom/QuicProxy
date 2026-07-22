@@ -180,7 +180,7 @@ pub fn init_logging(
     if INIT.get().is_some() {
         // Already initialized in an earlier call (e.g. from apple.rs).
         // Return dummy handles so callers can still forget them.
-        let (filter, reload_handle) = reload::Layer::new(EnvFilter::new("off"));
+        let (_filter, reload_handle) = reload::Layer::new(EnvFilter::new("off"));
         return (reload_handle, None);
     }
 

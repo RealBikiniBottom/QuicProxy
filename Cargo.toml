@@ -46,15 +46,15 @@ quinn = { package = "quinn", git = "https://github.com/spongebob888/quinn-jls", 
 rustls = { git = "https://github.com/spongebob888/rustls-jls", branch = "jls-main", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 rustls-pemfile = "2.1"
 webpki-roots = "0.26"
-futures = "0.3.31"
-bytesize = "2.3.1"
+futures = "0"
+bytesize = "2"
 dashmap = "6"
 maxminddb = { version = "0.29", features = ["mmap"] }
 memmap2 = "0.9.9"
 tracing-appender = "0.2.4"
 hashbrown = { version = "0.15.2", features = ["serde"] }
 ipnet = "2.11.0"
-netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip", rev ="4cc3162c6a968a27d01c943bcb8d38fd0e7311ca" }
+netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip", rev ="49434359ed59cae05092c1055396289ba2297389" }
 tun-rs = { version = "2", features = ["async", "async_framed", "utun_fd"], optional = true, git = "https://github.com/tun-rs/tun-rs", tag = "2.8.7" }
 netdev = "0.45"
 etherparse = "0.13"
