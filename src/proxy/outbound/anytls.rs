@@ -193,7 +193,7 @@ struct Session {
     is_dead: AtomicBool,
     packet_count: AtomicU64,
     send_padding: AtomicBool,
-    padding_scheme: Mutex<PaddingScheme>,
+    padding_scheme: Arc<Mutex<PaddingScheme>>,
     closer: Arc<SessionCloser>,
     close_when_idle: bool,
 }
@@ -206,7 +206,7 @@ impl Session {
         password_hash: &[u8; 32],
         tls_connect_timeout: Duration,
         session_seq: u64,
-        padding_scheme: PaddingScheme,
+        padding_scheme: Arc<Mutex<PaddingScheme>>,
         close_when_idle: bool,
     ) -> Result<Arc<Self>> {
         // TLS handshake
@@ -240,7 +240,7 @@ impl Session {
             is_dead: AtomicBool::new(false),
             packet_count: AtomicU64::new(1), // pkt=0 used for auth
             send_padding: AtomicBool::new(true),
-            padding_scheme: Mutex::new(padding_scheme),
+            padding_scheme,
             closer: Arc::new(SessionCloser::new()),
             close_when_idle,
         });
@@ -576,7 +576,7 @@ pub struct AnytlsClient {
     current_session: Mutex<Option<Arc<Session>>>,
     create_session_lock: Mutex<()>,
     session_seq: AtomicU64,
-    padding_scheme: Mutex<PaddingScheme>,
+    padding_scheme: Arc<Mutex<PaddingScheme>>,
 }
 
 impl AnytlsClient {
@@ -613,7 +613,7 @@ impl AnytlsClient {
             current_session: Mutex::new(None),
             create_session_lock: Mutex::new(()),
             session_seq: AtomicU64::new(0),
-            padding_scheme: Mutex::new(PaddingScheme::get_default()),
+            padding_scheme: Arc::new(Mutex::new(PaddingScheme::get_default())),
         })
     }
 
@@ -699,7 +699,6 @@ impl AnytlsClient {
         .map_err(|_| new_io_timeout_error("connect timeout"))?
         .context("TCP connect failed")?;
 
-        let padding_scheme = self.padding_scheme.lock().await.clone();
         let session = Session::new(
             tcp_stream,
             self.tls_client_config.clone(),
@@ -707,7 +706,7 @@ impl AnytlsClient {
             &self.password_hash,
             self.connect_timeout,
             seq,
-            padding_scheme,
+            self.padding_scheme.clone(),
             self.disable_mux,
         )
         .await?;
@@ -1641,7 +1640,7 @@ mod tests {
             &phash,
             Duration::from_secs(10),
             0,
-            PaddingScheme::get_default(),
+            Arc::new(Mutex::new(PaddingScheme::get_default())),
             false,
         )
         .await
@@ -1731,7 +1730,7 @@ mod tests {
             &wrong_phash,
             Duration::from_secs(10),
             0,
-            PaddingScheme::get_default(),
+            Arc::new(Mutex::new(PaddingScheme::get_default())),
             false,
         )
         .await
@@ -1860,6 +1859,7 @@ mod tests {
     /// Test that our Rust anytls client can talk to the Go anytls server.
     /// The Go server proxies to a local TCP echo server.
     #[tokio::test]
+    #[ignore = "superseded by tests/anytls_go_compat_test.rs"]
     async fn test_crossver_rust_client_go_server_tcp_echo() {
         // Ensure Go server binary exists
         if !std::path::Path::new(GO_SERVER_PATH).exists() {
@@ -1906,7 +1906,7 @@ mod tests {
             &password_hash(password),
             Duration::from_secs(10),
             0,
-            PaddingScheme::get_default(),
+            Arc::new(Mutex::new(PaddingScheme::get_default())),
             false,
         )
         .await
@@ -1966,6 +1966,7 @@ mod tests {
     /// Test that the Go anytls client can talk to our Rust mock server.
     /// The mock server echoes data back.
     #[tokio::test]
+    #[ignore = "superseded by tests/anytls_go_compat_test.rs"]
     async fn test_crossver_go_client_rust_server_tcp_echo() {
         if !std::path::Path::new(GO_CLIENT_PATH).exists() {
             eprintln!(
@@ -2106,6 +2107,7 @@ mod tests {
     /// Full-stack test: Rust AnytlsOutbound → Go anytls server → TCP echo.
     /// Uses the real production outbound, not raw Session.
     #[tokio::test]
+    #[ignore = "superseded by tests/anytls_go_compat_test.rs"]
     async fn test_crossver_rust_outbound_go_server_tcp_echo() {
         if !std::path::Path::new(GO_SERVER_PATH).exists() {
             eprintln!("Skipping: Go server binary not found at {}", GO_SERVER_PATH);
@@ -2201,6 +2203,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "superseded by tests/anytls_go_compat_test.rs"]
     async fn test_crossver_rust_outbound_go_server_udp_echo() {
         if !std::path::Path::new(GO_SERVER_PATH).exists() {
             eprintln!("Skipping: Go server binary not found at {}", GO_SERVER_PATH);
