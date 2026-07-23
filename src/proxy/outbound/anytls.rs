@@ -182,6 +182,8 @@ enum StreamEvent {
 /// It owns:
 /// - A `streams` map: stream_id -> sender to push incoming data to the stream
 /// - A write channel: streams push outgoing frames here, a write task drains it
+const SESSION_WRITE_BATCH_BYTES: usize = 256 * 1024;
+
 struct Session {
     session_seq: u64,
     /// Map from stream_id to event sender for routing incoming frames
@@ -193,7 +195,7 @@ struct Session {
     is_dead: AtomicBool,
     packet_count: AtomicU64,
     send_padding: AtomicBool,
-    padding_scheme: Mutex<PaddingScheme>,
+    padding_scheme: Arc<Mutex<PaddingScheme>>,
     closer: Arc<SessionCloser>,
     close_when_idle: bool,
 }
@@ -206,7 +208,7 @@ impl Session {
         password_hash: &[u8; 32],
         tls_connect_timeout: Duration,
         session_seq: u64,
-        padding_scheme: PaddingScheme,
+        padding_scheme: Arc<Mutex<PaddingScheme>>,
         close_when_idle: bool,
     ) -> Result<Arc<Self>> {
         // TLS handshake
@@ -240,7 +242,7 @@ impl Session {
             is_dead: AtomicBool::new(false),
             packet_count: AtomicU64::new(1), // pkt=0 used for auth
             send_padding: AtomicBool::new(true),
-            padding_scheme: Mutex::new(padding_scheme),
+            padding_scheme,
             closer: Arc::new(SessionCloser::new()),
             close_when_idle,
         });
@@ -320,25 +322,26 @@ impl Session {
             match cmd {
                 Command::Waste => {}
                 Command::Psh => {
-                    if let Some(tx) = self.streams.get(&stream_id) {
-                        if tx.try_send(StreamEvent::Data(data)).is_err() {
-                            drop(tx);
-                            self.streams.remove(&stream_id);
-                            let _ = self
-                                .write_tx
-                                .try_send((stream_id, Command::Fin, Bytes::new()));
-                            warn!("Anytls stream {} receive queue full; closing it", stream_id);
-                        }
+                    let tx = self
+                        .streams
+                        .get(&stream_id)
+                        .map(|entry| entry.value().clone());
+                    if let Some(tx) = tx
+                        && tx.send(StreamEvent::Data(data)).await.is_err()
+                    {
+                        self.streams.remove(&stream_id);
                     }
                 }
                 Command::Fin => {
-                    if let Some(tx) = self.streams.get(&stream_id) {
+                    // Removing the last sender guarantees EOF after queued data is
+                    // drained even when the bounded queue has no room for FIN.
+                    if let Some((_, tx)) = self.streams.remove(&stream_id) {
                         let _ = tx.try_send(StreamEvent::Fin);
                     }
                 }
                 Command::SynAck => {
                     if !data.is_empty() {
-                        if let Some(tx) = self.streams.get(&stream_id) {
+                        if let Some((_, tx)) = self.streams.remove(&stream_id) {
                             let _ = tx.try_send(StreamEvent::SynAckError(data.to_vec()));
                         }
                     }
@@ -349,11 +352,16 @@ impl Session {
                         "Anytls session {} received alert: {}",
                         self.session_seq, msg
                     );
-                    // Notify all streams
-                    for entry in self.streams.iter() {
-                        let _ = entry.value().try_send(StreamEvent::SynAckError(
-                            format!("server alert: {}", msg).into_bytes(),
-                        ));
+                    // Close every receiver after its already-buffered data. An
+                    // explicit error is best-effort because queues are bounded.
+                    let stream_ids: Vec<_> =
+                        self.streams.iter().map(|entry| *entry.key()).collect();
+                    for stream_id in stream_ids {
+                        if let Some((_, tx)) = self.streams.remove(&stream_id) {
+                            let _ = tx.try_send(StreamEvent::SynAckError(
+                                format!("server alert: {}", msg).into_bytes(),
+                            ));
+                        }
                     }
                     return Err(new_io_other_error(format!("server alert: {}", msg)).into());
                 }
@@ -411,24 +419,41 @@ impl Session {
             }) else {
                 break;
             };
-            let frame_bytes = build_frame(cmd, stream_id, &data)?;
 
             if buffering {
-                buffer.extend_from_slice(&frame_bytes);
+                append_frame(&mut buffer, cmd, stream_id, &data)?;
                 // First PSH = target address → stop buffering and flush
                 if cmd == Command::Psh {
                     buffering = false;
-                    let combined = std::mem::take(&mut buffer);
-                    if let Err(e) = self.write_with_padding(&mut tls, &combined).await {
-                        debug!("Anytls write_with_padding error: {:?}", e);
+                }
+            } else {
+                append_frame(&mut buffer, cmd, stream_id, &data)?;
+            }
+
+            let mut channel_closed = false;
+            while !buffering && buffer.len() < SESSION_WRITE_BATCH_BYTES {
+                match write_rx.try_recv() {
+                    Ok((stream_id, cmd, data)) => {
+                        append_frame(&mut buffer, cmd, stream_id, &data)?;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        channel_closed = true;
                         break;
                     }
                 }
-            } else {
-                if let Err(e) = self.write_with_padding(&mut tls, &frame_bytes).await {
+            }
+
+            if !buffering && !buffer.is_empty() {
+                if let Err(e) = self.write_with_padding(&mut tls, &buffer).await {
                     debug!("Anytls write_with_padding error: {:?}", e);
                     break;
                 }
+                buffer.clear();
+            }
+
+            if channel_closed {
+                break;
             }
         }
         Ok(())
@@ -576,7 +601,7 @@ pub struct AnytlsClient {
     current_session: Mutex<Option<Arc<Session>>>,
     create_session_lock: Mutex<()>,
     session_seq: AtomicU64,
-    padding_scheme: Mutex<PaddingScheme>,
+    padding_scheme: Arc<Mutex<PaddingScheme>>,
 }
 
 impl AnytlsClient {
@@ -613,7 +638,7 @@ impl AnytlsClient {
             current_session: Mutex::new(None),
             create_session_lock: Mutex::new(()),
             session_seq: AtomicU64::new(0),
-            padding_scheme: Mutex::new(PaddingScheme::get_default()),
+            padding_scheme: Arc::new(Mutex::new(PaddingScheme::get_default())),
         })
     }
 
@@ -699,7 +724,6 @@ impl AnytlsClient {
         .map_err(|_| new_io_timeout_error("connect timeout"))?
         .context("TCP connect failed")?;
 
-        let padding_scheme = self.padding_scheme.lock().await.clone();
         let session = Session::new(
             tcp_stream,
             self.tls_client_config.clone(),
@@ -707,7 +731,7 @@ impl AnytlsClient {
             &self.password_hash,
             self.connect_timeout,
             seq,
-            padding_scheme,
+            self.padding_scheme.clone(),
             self.disable_mux,
         )
         .await?;
@@ -948,7 +972,7 @@ impl AnyOutbound for AnytlsOutbound {
 
         // Send UoT Request header (uses Socksaddr format: ATYP 1/3/4)
         let mut uot_request = vec![0x00]; // IsConnect = false
-        uot_request.extend_from_slice(&socksaddr_encode_target(target));
+        uot_request.extend_from_slice(&target.to_bytes());
         session
             .write_tx
             .send((stream_id, Command::Psh, Bytes::from(uot_request)))
@@ -1183,11 +1207,14 @@ mod tests {
     use super::*;
     use crate::proxy::TlsConfig;
     use sha2::{Digest, Sha256};
+    use std::io;
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
+    use tokio::time::Sleep;
     use tokio_rustls::TlsAcceptor;
 
     const TEST_PASSWORD: &str = "test_password_123";
@@ -1502,6 +1529,73 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Default)]
+    struct MockWriteState {
+        bytes: Vec<u8>,
+        write_calls: usize,
+        flush_calls: usize,
+    }
+
+    struct DelayedFlushWriter {
+        state: Arc<SyncMutex<MockWriteState>>,
+        flush_delay: Duration,
+        pending_flush: Option<Pin<Box<Sleep>>>,
+    }
+
+    impl DelayedFlushWriter {
+        fn new(state: Arc<SyncMutex<MockWriteState>>, flush_delay: Duration) -> Self {
+            Self {
+                state,
+                flush_delay,
+                pending_flush: None,
+            }
+        }
+    }
+
+    impl AsyncWrite for DelayedFlushWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let mut state = this.state.lock().expect("lock mock writer state");
+            state.write_calls += 1;
+            state.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.flush_delay.is_zero() {
+                this.state
+                    .lock()
+                    .expect("lock mock writer state")
+                    .flush_calls += 1;
+                return Poll::Ready(Ok(()));
+            }
+
+            let sleep = this
+                .pending_flush
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.flush_delay)));
+            match sleep.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    this.pending_flush = None;
+                    this.state
+                        .lock()
+                        .expect("lock mock writer state")
+                        .flush_calls += 1;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     // ── TCP Echo Test ──────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1641,7 +1735,7 @@ mod tests {
             &phash,
             Duration::from_secs(10),
             0,
-            PaddingScheme::get_default(),
+            Arc::new(Mutex::new(PaddingScheme::get_default())),
             false,
         )
         .await
@@ -1731,7 +1825,7 @@ mod tests {
             &wrong_phash,
             Duration::from_secs(10),
             0,
-            PaddingScheme::get_default(),
+            Arc::new(Mutex::new(PaddingScheme::get_default())),
             false,
         )
         .await
@@ -1747,6 +1841,63 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_anytls_upload_batching_regression() {
+        let (dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel(1);
+        let (write_tx, write_rx) = tokio::sync::mpsc::channel(SESSION_QUEUE_CAPACITY);
+        let session = Session {
+            session_seq: 0,
+            streams: DashMap::new(),
+            write_tx: dummy_tx,
+            next_stream_id: AtomicU32::new(1),
+            server_version: AtomicU8::new(PROTOCOL_VERSION),
+            is_dead: AtomicBool::new(false),
+            packet_count: AtomicU64::new(0),
+            send_padding: AtomicBool::new(false),
+            padding_scheme: Arc::new(Mutex::new(PaddingScheme::get_default())),
+            closer: Arc::new(SessionCloser::new()),
+            close_when_idle: false,
+        };
+
+        let chunk = Bytes::from(vec![0x5a; 1024]);
+        for _ in 0..SESSION_QUEUE_CAPACITY {
+            write_tx
+                .send((1, Command::Psh, chunk.clone()))
+                .await
+                .expect("queue upload frame");
+        }
+        drop(write_tx);
+
+        let state = Arc::new(SyncMutex::new(MockWriteState::default()));
+        let writer = DelayedFlushWriter::new(state.clone(), Duration::from_millis(3));
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            session.write_loop(writer, write_rx),
+        )
+        .await
+        .expect("batched upload write_loop timed out")
+        .expect("batched upload write_loop failed");
+
+        let state = state.lock().expect("lock mock writer state");
+        let expected_bytes = SESSION_QUEUE_CAPACITY * (FRAME_HEADER_SIZE + chunk.len());
+        assert_eq!(
+            state.bytes.len(),
+            expected_bytes,
+            "write loop should emit every queued upload frame"
+        );
+        assert!(
+            state.flush_calls <= 4,
+            "write loop should batch small upload frames instead of flushing each frame: {}",
+            state.flush_calls
+        );
+        assert!(
+            state.write_calls < SESSION_QUEUE_CAPACITY,
+            "write loop should reduce write calls for small upload frames: {}",
+            state.write_calls
+        );
     }
 
     // ── Go Cross-Verification Helpers ──────────────────────────────────────
@@ -1860,6 +2011,7 @@ mod tests {
     /// Test that our Rust anytls client can talk to the Go anytls server.
     /// The Go server proxies to a local TCP echo server.
     #[tokio::test]
+    #[ignore = "superseded by tests/anytls_go_compat_test.rs"]
     async fn test_crossver_rust_client_go_server_tcp_echo() {
         // Ensure Go server binary exists
         if !std::path::Path::new(GO_SERVER_PATH).exists() {
@@ -1906,7 +2058,7 @@ mod tests {
             &password_hash(password),
             Duration::from_secs(10),
             0,
-            PaddingScheme::get_default(),
+            Arc::new(Mutex::new(PaddingScheme::get_default())),
             false,
         )
         .await
@@ -1966,6 +2118,7 @@ mod tests {
     /// Test that the Go anytls client can talk to our Rust mock server.
     /// The mock server echoes data back.
     #[tokio::test]
+    #[ignore = "superseded by tests/anytls_go_compat_test.rs"]
     async fn test_crossver_go_client_rust_server_tcp_echo() {
         if !std::path::Path::new(GO_CLIENT_PATH).exists() {
             eprintln!(
@@ -2106,6 +2259,7 @@ mod tests {
     /// Full-stack test: Rust AnytlsOutbound → Go anytls server → TCP echo.
     /// Uses the real production outbound, not raw Session.
     #[tokio::test]
+    #[ignore = "superseded by tests/anytls_go_compat_test.rs"]
     async fn test_crossver_rust_outbound_go_server_tcp_echo() {
         if !std::path::Path::new(GO_SERVER_PATH).exists() {
             eprintln!("Skipping: Go server binary not found at {}", GO_SERVER_PATH);
@@ -2201,6 +2355,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "superseded by tests/anytls_go_compat_test.rs"]
     async fn test_crossver_rust_outbound_go_server_udp_echo() {
         if !std::path::Path::new(GO_SERVER_PATH).exists() {
             eprintln!("Skipping: Go server binary not found at {}", GO_SERVER_PATH);

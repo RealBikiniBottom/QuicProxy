@@ -413,16 +413,18 @@ impl InboundSession {
                         self.handle_target(stream_id, target).await;
                     } else if state_type == Some("waiting_uot") {
                         self.handle_uot_request(stream_id, data).await;
-                    } else if let Some(entry) = self.streams.get(&stream_id) {
-                        if let StreamState::Active(tx) = entry.value() {
-                            if tx.try_send(data).is_err() {
-                                warn!("Anytls inbound stream {} receive queue full", stream_id);
-                                drop(entry);
-                                self.streams.remove(&stream_id);
-                                let _ =
-                                    self.write_tx
-                                        .try_send((stream_id, Command::Fin, Bytes::new()));
+                    } else {
+                        let tx = self.streams.get(&stream_id).and_then(|entry| {
+                            if let StreamState::Active(tx) = entry.value() {
+                                Some(tx.clone())
+                            } else {
+                                None
                             }
+                        });
+                        if let Some(tx) = tx
+                            && tx.send(data).await.is_err()
+                        {
+                            self.streams.remove(&stream_id);
                         }
                     }
                 }
@@ -516,8 +518,9 @@ impl InboundSession {
             return;
         }
         let is_connect = data[0] != 0;
-        let (real_target, addr_len) = match socksaddr_decode_target(&data[1..]) {
-            Ok(t) => t,
+        let mut target_reader = std::io::Cursor::new(&data[1..]);
+        let real_target = match TargetAddr::read_from(&mut target_reader).await {
+            Ok(target) => target,
             Err(e) => {
                 warn!(
                     "Anytls inbound bad UoT request from {}: {:?}",
@@ -530,6 +533,7 @@ impl InboundSession {
                 return;
             }
         };
+        let addr_len = target_reader.position() as usize;
 
         // The remaining bytes after the UoT Request header are part of the first packet
         let remaining = if data.len() > 1 + addr_len {

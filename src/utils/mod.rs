@@ -113,16 +113,18 @@ where
     io::Error::new(io::ErrorKind::TimedOut, msg.into())
 }
 
-// Use 1KB buffer size for mobile, 4KB for desktop
+// Use a larger forwarding buffer to avoid turning sustained uploads into tiny
+// writes on the outbound transport path.
 #[cfg(any(target_os = "android", target_os = "ios"))]
-const BUFFER_SIZE: usize = 1024 * 1;
+const BUFFER_SIZE: usize = 1024 * 4;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-const BUFFER_SIZE: usize = 1024 * 1;
+const BUFFER_SIZE: usize = 1024 * 16;
 
 /// Copies data in both directions between `a` and `b`.
 ///
-/// This function uses `tokio::io::copy_bidirectional_with_sizes` with a custom buffer size
-/// (1KB for mobile, 4KB for desktop) to optimize memory usage per connection.
+/// This function uses `tokio::io::copy_bidirectional_with_sizes` with a custom
+/// buffer size (4KB for mobile, 16KB for desktop) to balance throughput and
+/// per-connection memory usage.
 pub async fn copy_bidirectional<A, B>(a: &mut A, b: &mut B) -> Result<(u64, u64), std::io::Error>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,

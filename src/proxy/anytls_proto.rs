@@ -17,9 +17,9 @@ pub const FRAME_HEADER_SIZE: usize = 7; // cmd(1) + streamId(4) + dataLen(2)
 pub const AUTH_HASH_SIZE: usize = 32; // SHA-256 output
 pub const AUTH_LENGTH_FIELD_SIZE: usize = 2; // BE u16
 
-/// Bounds queued encrypted writes and per-stream reads. These queues are kept
-/// deliberately small because a frame can carry up to 64 KiB.
-pub const SESSION_QUEUE_CAPACITY: usize = 64;
+/// Bounds queued encrypted writes and per-stream reads. A larger session queue
+/// gives the write loop room to coalesce small upload frames under backpressure.
+pub const SESSION_QUEUE_CAPACITY: usize = 256;
 pub const STREAM_QUEUE_CAPACITY: usize = 16;
 
 /// UDP-over-TCP target domain
@@ -28,7 +28,7 @@ pub const UDP_OVER_TCP_TARGET: &str = "sp.v2.udp-over-tcp.arpa";
 // ─── UoT Helpers ──────────────────────────────────────────────────────────────
 
 /// Encode TargetAddr in UoT data-packet AddrParser format (ATYP: 0x00=IPv4, 0x01=IPv6, 0x02=Domain).
-/// Note: UoT Request uses Socksaddr format (ATYP 1/3/4) — see `socksaddr_encode_target`.
+/// Note: UoT Request uses the regular SOCKS address format from `TargetAddr::to_bytes`.
 pub fn uot_encode_target(target: &TargetAddr) -> Vec<u8> {
     let mut buf = Vec::new();
     match target {
@@ -109,89 +109,6 @@ pub fn uot_decode_target(data: &[u8]) -> Result<(TargetAddr, usize)> {
     }
 }
 
-/// Encode TargetAddr in Socksaddr format (ATYP: 1=IPv4, 3=Domain, 4=IPv6).
-/// Used for UoT Request destination encoding.
-pub fn socksaddr_encode_target(target: &TargetAddr) -> Vec<u8> {
-    let mut buf = Vec::new();
-    match target {
-        TargetAddr::Ip(std::net::SocketAddr::V4(addr)) => {
-            buf.push(1u8);
-            buf.extend_from_slice(&addr.ip().octets());
-            buf.extend_from_slice(&addr.port().to_be_bytes());
-        }
-        TargetAddr::Ip(std::net::SocketAddr::V6(addr)) => {
-            buf.push(4u8);
-            buf.extend_from_slice(&addr.ip().octets());
-            buf.extend_from_slice(&addr.port().to_be_bytes());
-        }
-        TargetAddr::Domain(domain, port) => {
-            buf.push(3u8);
-            buf.push(domain.len() as u8);
-            buf.extend_from_slice(domain.as_bytes());
-            buf.extend_from_slice(&port.to_be_bytes());
-        }
-    }
-    buf
-}
-
-/// Decode TargetAddr from Socksaddr format (ATYP: 1=IPv4, 3=Domain, 4=IPv6).
-/// Used for UoT Request destination parsing.
-pub fn socksaddr_decode_target(data: &[u8]) -> Result<(TargetAddr, usize)> {
-    if data.is_empty() {
-        bail!("empty socksaddr");
-    }
-    match data[0] {
-        1 => {
-            // IPv4
-            if data.len() < 7 {
-                bail!("socksaddr IPv4 address too short");
-            }
-            let mut ip = [0u8; 4];
-            ip.copy_from_slice(&data[1..5]);
-            let port = u16::from_be_bytes([data[5], data[6]]);
-            Ok((
-                TargetAddr::Ip(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                    std::net::Ipv4Addr::from(ip),
-                    port,
-                ))),
-                7,
-            ))
-        }
-        4 => {
-            // IPv6
-            if data.len() < 19 {
-                bail!("socksaddr IPv6 address too short");
-            }
-            let mut ip = [0u8; 16];
-            ip.copy_from_slice(&data[1..17]);
-            let port = u16::from_be_bytes([data[17], data[18]]);
-            Ok((
-                TargetAddr::Ip(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
-                    std::net::Ipv6Addr::from(ip),
-                    port,
-                    0,
-                    0,
-                ))),
-                19,
-            ))
-        }
-        3 => {
-            // Domain
-            if data.len() < 2 {
-                bail!("socksaddr domain address too short");
-            }
-            let domain_len = data[1] as usize;
-            if data.len() < 2 + domain_len + 2 {
-                bail!("socksaddr domain address too short for domain length");
-            }
-            let domain = String::from_utf8_lossy(&data[2..2 + domain_len]).to_string();
-            let port = u16::from_be_bytes([data[2 + domain_len], data[2 + domain_len + 1]]);
-            Ok((TargetAddr::Domain(domain, port), 2 + domain_len + 2))
-        }
-        _ => bail!("unknown socksaddr address type: {}", data[0]),
-    }
-}
-
 // ─── Frame Commands ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,13 +171,19 @@ pub async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(Command
     Ok((cmd, stream_id, Bytes::from(data)))
 }
 
-pub fn build_frame(cmd: Command, stream_id: u32, data: &[u8]) -> Result<Vec<u8>> {
+pub fn append_frame(dst: &mut Vec<u8>, cmd: Command, stream_id: u32, data: &[u8]) -> Result<()> {
     let data_len = u16::try_from(data.len()).context("anytls frame payload exceeds 65535 bytes")?;
+    dst.reserve(FRAME_HEADER_SIZE + data.len());
+    dst.push(cmd.into());
+    dst.extend_from_slice(&stream_id.to_be_bytes());
+    dst.extend_from_slice(&data_len.to_be_bytes());
+    dst.extend_from_slice(data);
+    Ok(())
+}
+
+pub fn build_frame(cmd: Command, stream_id: u32, data: &[u8]) -> Result<Vec<u8>> {
     let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE + data.len());
-    frame.push(cmd.into());
-    frame.extend_from_slice(&stream_id.to_be_bytes());
-    frame.extend_from_slice(&data_len.to_be_bytes());
-    frame.extend_from_slice(data);
+    append_frame(&mut frame, cmd, stream_id, data)?;
     Ok(frame)
 }
 
