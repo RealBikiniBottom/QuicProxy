@@ -16,9 +16,10 @@ use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{Mutex, mpsc};
 use tokio_rustls::{TlsAcceptor, rustls};
+use tokio_util::sync::PollSender;
 use tracing::{Instrument, debug, error, field, info, info_span, warn};
 
 // ─── Inbound Stream / UDP ─────────────────────────────────────────────────────
@@ -26,21 +27,28 @@ use tracing::{Instrument, debug, error, field, info, info_span, warn};
 struct AnytlsInboundStream {
     stream_id: u32,
     /// Channel to send data frames to the session's write loop
-    write_tx: mpsc::UnboundedSender<(u32, u8, Bytes)>,
+    write_tx: PollSender<Frame>,
     /// Receiver for incoming data
-    data_rx: SyncMutex<mpsc::UnboundedReceiver<Bytes>>,
+    data_rx: SyncMutex<mpsc::Receiver<Bytes>>,
+    read_buffer: SyncMutex<StreamReadBuffer>,
+    streams: Arc<DashMap<u32, StreamState>>,
+    fin_sent: std::sync::atomic::AtomicBool,
 }
 
 impl AnytlsInboundStream {
     fn new(
         stream_id: u32,
-        write_tx: mpsc::UnboundedSender<(u32, u8, Bytes)>,
-        data_rx: mpsc::UnboundedReceiver<Bytes>,
+        write_tx: mpsc::Sender<Frame>,
+        data_rx: mpsc::Receiver<Bytes>,
+        streams: Arc<DashMap<u32, StreamState>>,
     ) -> Self {
         Self {
             stream_id,
-            write_tx,
+            write_tx: PollSender::new(write_tx),
             data_rx: SyncMutex::new(data_rx),
+            read_buffer: SyncMutex::new(StreamReadBuffer::default()),
+            streams,
+            fin_sent: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -52,11 +60,14 @@ impl AsyncRead for AnytlsInboundStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if this.read_buffer.lock().unwrap().copy_to(buf) {
+            return std::task::Poll::Ready(Ok(()));
+        }
         let mut rx = this.data_rx.lock().unwrap();
         match rx.poll_recv(cx) {
             std::task::Poll::Ready(Some(data)) => {
-                let to_copy = data.len().min(buf.remaining());
-                buf.put_slice(&data[..to_copy]);
+                drop(rx);
+                this.read_buffer.lock().unwrap().copy_from(data, buf);
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(None) => {
@@ -70,21 +81,32 @@ impl AsyncRead for AnytlsInboundStream {
 impl AsyncWrite for AnytlsInboundStream {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let data = Bytes::copy_from_slice(buf);
-        let len = data.len();
-        match this
-            .write_tx
-            .send((this.stream_id, Command::Psh as u8, data))
-        {
-            Ok(_) => std::task::Poll::Ready(Ok(len)),
-            Err(_) => std::task::Poll::Ready(Err(std::io::Error::new(
+        if buf.is_empty() {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        match this.write_tx.poll_reserve(cx) {
+            std::task::Poll::Ready(Ok(())) => {
+                let len = buf.len().min(u16::MAX as usize);
+                this.write_tx
+                    .send_item((
+                        this.stream_id,
+                        Command::Psh,
+                        Bytes::copy_from_slice(&buf[..len]),
+                    ))
+                    .map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session closed")
+                    })?;
+                std::task::Poll::Ready(Ok(len))
+            }
+            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "session closed",
             ))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 
@@ -97,89 +119,88 @@ impl AsyncWrite for AnytlsInboundStream {
 
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let _ = this
-            .write_tx
-            .send((this.stream_id, Command::Fin as u8, Bytes::new()));
-        std::task::Poll::Ready(Ok(()))
+        if this.fin_sent.load(std::sync::atomic::Ordering::Acquire) {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        match this.write_tx.poll_reserve(cx) {
+            std::task::Poll::Ready(Ok(())) => {
+                this.fin_sent
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let _ = this
+                    .write_tx
+                    .send_item((this.stream_id, Command::Fin, Bytes::new()));
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for AnytlsInboundStream {
+    fn drop(&mut self) {
+        if !self.fin_sent.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(tx) = self.write_tx.get_ref() {
+                let _ = tx.try_send((self.stream_id, Command::Fin, Bytes::new()));
+            }
+        }
+        self.streams.remove(&self.stream_id);
     }
 }
 
 struct AnytlsInboundUdp {
     stream_id: u32,
-    write_tx: mpsc::UnboundedSender<(u32, u8, Bytes)>,
-    data_rx: Mutex<mpsc::UnboundedReceiver<Bytes>>,
-    read_buf: Mutex<Vec<u8>>,
+    write_tx: mpsc::Sender<Frame>,
+    data_rx: Mutex<mpsc::Receiver<Bytes>>,
+    read_buf: Mutex<UotReadBuffer>,
     client_addr: TargetAddr,
     /// UoT v2 connect mode: if true, packets omit address prefix,
     /// and `recv_from` returns `real_target` as the destination.
     is_connect: bool,
     real_target: TargetAddr,
+    closer: Arc<SessionCloser>,
+    streams: Arc<DashMap<u32, StreamState>>,
 }
 
 impl AnytlsInboundUdp {
     fn new(
         stream_id: u32,
-        write_tx: mpsc::UnboundedSender<(u32, u8, Bytes)>,
-        data_rx: mpsc::UnboundedReceiver<Bytes>,
+        write_tx: mpsc::Sender<Frame>,
+        data_rx: mpsc::Receiver<Bytes>,
         client_addr: TargetAddr,
         is_connect: bool,
         real_target: TargetAddr,
+        closer: Arc<SessionCloser>,
+        streams: Arc<DashMap<u32, StreamState>>,
     ) -> Self {
         Self {
             stream_id,
             write_tx,
             data_rx: Mutex::new(data_rx),
-            read_buf: Mutex::new(Vec::new()),
+            read_buf: Mutex::new(UotReadBuffer::default()),
             client_addr,
             is_connect,
             real_target,
+            closer,
+            streams,
         }
     }
 
     async fn read_next_msg(&self) -> Result<Bytes> {
         loop {
             {
-                let mut buf = self.read_buf.lock().await;
-                if self.is_connect {
-                    // Connect mode: length(u16) + data
-                    if buf.len() >= 2 {
-                        let payload_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-                        let total_needed = 2 + payload_len;
-                        if buf.len() >= total_needed {
-                            let msg = Bytes::copy_from_slice(&buf[..total_needed]);
-                            buf.drain(..total_needed);
-                            return Ok(msg);
-                        }
-                    }
-                } else {
-                    // Non-connect mode: ATYP(uot) + addr + port + length(u16) + data
-                    if !buf.is_empty() {
-                        if let Ok((_, target_len)) = uot_decode_target(&buf) {
-                            if buf.len() >= target_len + 2 {
-                                let payload_len =
-                                    u16::from_be_bytes([buf[target_len], buf[target_len + 1]])
-                                        as usize;
-                                let total_needed = target_len + 2 + payload_len;
-                                if buf.len() >= total_needed {
-                                    let msg = Bytes::copy_from_slice(&buf[..total_needed]);
-                                    buf.drain(..total_needed);
-                                    return Ok(msg);
-                                }
-                            }
-                        } else if buf.len() > 256 {
-                            bail!("invalid UoT packet header");
-                        }
-                    }
+                if let Some(packet) = self.read_buf.lock().await.next_packet(self.is_connect)? {
+                    return Ok(packet);
                 }
             }
             let mut rx = self.data_rx.lock().await;
             match rx.recv().await {
                 Some(data) => {
                     let mut buf = self.read_buf.lock().await;
-                    buf.extend_from_slice(&data);
+                    buf.push(&data);
                 }
                 None => bail!("UDP stream closed"),
             }
@@ -190,60 +211,36 @@ impl AnytlsInboundUdp {
 #[async_trait]
 impl AnyPacket for AnytlsInboundUdp {
     async fn send_to(&self, buf: Bytes, _from: &SourceAddr, target: &TargetAddr) -> Result<usize> {
-        let packet = if self.is_connect {
-            // Connect mode: length(u16) + data
-            let mut p = Vec::with_capacity(2 + buf.len());
-            p.extend_from_slice(&(buf.len() as u16).to_be_bytes());
-            p.extend_from_slice(&buf);
-            p
-        } else {
-            // Non-connect mode: ATYP(uot) + addr + port + length(u16) + data
-            let target_bytes = uot_encode_target(target);
-            let mut p = Vec::with_capacity(target_bytes.len() + 2 + buf.len());
-            p.extend_from_slice(&target_bytes);
-            p.extend_from_slice(&(buf.len() as u16).to_be_bytes());
-            p.extend_from_slice(&buf);
-            p
-        };
+        let packet = encode_uot_packet(&buf, (!self.is_connect).then_some(target))?;
         let len = packet.len();
         self.write_tx
-            .send((self.stream_id, Command::Psh as u8, Bytes::from(packet)))
+            .send((self.stream_id, Command::Psh, packet))
+            .await
             .map_err(|_| new_io_other_error("UDP write closed"))?;
         Ok(len)
     }
 
     async fn recv_from(&self) -> Result<PacketInfo> {
         let data = self.read_next_msg().await?;
-        if self.is_connect {
-            // Connect mode: length(u16) + data
-            if data.len() < 2 {
-                bail!("UoT connect packet too short");
-            }
-            let payload_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-            if data.len() < 2 + payload_len {
-                bail!("UoT connect packet too short for payload");
-            }
-            let payload = Bytes::copy_from_slice(&data[2..2 + payload_len]);
-            Ok((self.client_addr.clone(), self.real_target.clone(), payload))
-        } else {
-            // Non-connect mode: ATYP(uot) + addr + port + length(u16) + data
-            let (target, target_len) = uot_decode_target(&data)?;
-            if data.len() < target_len + 2 {
-                bail!("UoT packet too short for length");
-            }
-            let payload_len = u16::from_be_bytes([data[target_len], data[target_len + 1]]) as usize;
-            if data.len() < target_len + 2 + payload_len {
-                bail!("UoT packet too short for payload");
-            }
-            let payload =
-                Bytes::copy_from_slice(&data[target_len + 2..target_len + 2 + payload_len]);
-            Ok((self.client_addr.clone(), target, payload))
-        }
+        let (target, payload) = decode_uot_packet(data, self.is_connect)?;
+        Ok((
+            self.client_addr.clone(),
+            target.unwrap_or_else(|| self.real_target.clone()),
+            payload,
+        ))
     }
 
     fn closer(&self) -> Arc<SessionCloser> {
-        // Minimal stub; actual session close is managed externally
-        Arc::new(SessionCloser::new())
+        self.closer.clone()
+    }
+}
+
+impl Drop for AnytlsInboundUdp {
+    fn drop(&mut self) {
+        let _ = self
+            .write_tx
+            .try_send((self.stream_id, Command::Fin, Bytes::new()));
+        self.streams.remove(&self.stream_id);
     }
 }
 
@@ -257,15 +254,15 @@ enum StreamState {
     #[allow(dead_code)]
     WaitingUotRequest(TargetAddr),
     /// Active TCP stream, data forwarded via this sender
-    Active(mpsc::UnboundedSender<Bytes>),
+    Active(mpsc::Sender<Bytes>),
 }
 
 /// Server-side session: one per TLS connection, manages multiplexed streams.
 struct InboundSession {
     /// Map stream_id -> stream state
-    streams: DashMap<u32, StreamState>,
+    streams: Arc<DashMap<u32, StreamState>>,
     /// Write channel to the TLS write loop
-    write_tx: mpsc::UnboundedSender<(u32, u8, Bytes)>,
+    write_tx: mpsc::Sender<Frame>,
     /// Tag of this inbound
     tag: String,
     /// Client address
@@ -274,6 +271,7 @@ struct InboundSession {
     router: Arc<Router>,
     /// UDP timeout
     udp_timeout: Duration,
+    closer: Arc<SessionCloser>,
 }
 
 impl InboundSession {
@@ -314,7 +312,7 @@ impl InboundSession {
         if cmd != Command::Settings {
             // Protocol violation: send cmdAlert and close
             let alert = format!("expected cmdSettings, got cmd={:?}", cmd);
-            write_frame(&mut tls_write, Command::Alert, 0, alert.as_bytes()).await?;
+            write_frame(&mut tls_write, 0, Command::Alert, alert.as_bytes()).await?;
             return Err(new_io_other_error(alert).into());
         }
 
@@ -326,14 +324,15 @@ impl InboundSession {
         );
 
         // 3. Start session
-        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (write_tx, write_rx) = mpsc::channel(SESSION_QUEUE_CAPACITY);
         let session = Arc::new(Self {
-            streams: DashMap::new(),
+            streams: Arc::new(DashMap::new()),
             write_tx,
             tag,
             peer_addr,
             router,
             udp_timeout,
+            closer: Arc::new(SessionCloser::new()),
         });
 
         // Send cmdServerSettings if client version >= 2
@@ -341,29 +340,35 @@ impl InboundSession {
             let settings = format!("v={}\n", PROTOCOL_VERSION);
             write_frame(
                 &mut tls_write,
-                Command::ServerSettings,
                 0,
+                Command::ServerSettings,
                 settings.as_bytes(),
             )
             .await?;
         }
 
         // Spawn write loop
-        let session_w = session.clone();
+        let write_closer = session.closer.clone();
         tokio::spawn(async move {
-            if let Err(e) = session_w.write_loop(tls_write, write_rx).await {
+            if let Err(e) = Self::write_loop(tls_write, write_rx, write_closer.clone()).await {
                 debug!("Anytls inbound session write loop ended: {:?}", e);
             }
+            write_closer.close();
         });
 
         // Run read loop (blocking)
-        session.read_loop(tls_read).await?;
-        Ok(())
+        let result = session.read_loop(tls_read).await;
+        session.closer.close();
+        session.streams.clear();
+        result
     }
 
     async fn read_loop(&self, mut tls: impl AsyncRead + Unpin + Send) -> Result<()> {
         loop {
-            let (cmd, stream_id, data) = match read_frame(&mut tls).await {
+            let (cmd, stream_id, data) = match tokio::select! {
+                frame = read_frame(&mut tls) => frame,
+                _ = self.closer.wait() => return Ok(()),
+            } {
                 Ok(f) => f,
                 Err(_) => return Ok(()), // client disconnected
             };
@@ -374,7 +379,7 @@ impl InboundSession {
                     self.streams.insert(stream_id, StreamState::Pending);
                     let _ = self
                         .write_tx
-                        .send((stream_id, Command::SynAck as u8, Bytes::new()));
+                        .try_send((stream_id, Command::SynAck, Bytes::new()));
                 }
                 Command::Psh => {
                     // Check stream state
@@ -388,11 +393,9 @@ impl InboundSession {
                             Ok(t) => t,
                             Err(e) => {
                                 warn!("Anytls inbound bad target from {}: {:?}", self.peer_addr, e);
-                                let _ = self.write_tx.send((
-                                    stream_id,
-                                    Command::Fin as u8,
-                                    Bytes::new(),
-                                ));
+                                let _ =
+                                    self.write_tx
+                                        .try_send((stream_id, Command::Fin, Bytes::new()));
                                 self.streams.remove(&stream_id);
                                 continue;
                             }
@@ -412,7 +415,14 @@ impl InboundSession {
                         self.handle_uot_request(stream_id, data).await;
                     } else if let Some(entry) = self.streams.get(&stream_id) {
                         if let StreamState::Active(tx) = entry.value() {
-                            let _ = tx.send(data);
+                            if tx.try_send(data).is_err() {
+                                warn!("Anytls inbound stream {} receive queue full", stream_id);
+                                drop(entry);
+                                self.streams.remove(&stream_id);
+                                let _ =
+                                    self.write_tx
+                                        .try_send((stream_id, Command::Fin, Bytes::new()));
+                            }
                         }
                     }
                 }
@@ -423,7 +433,7 @@ impl InboundSession {
                 Command::HeartRequest => {
                     let _ = self
                         .write_tx
-                        .send((0, Command::HeartResponse as u8, Bytes::new()));
+                        .try_send((0, Command::HeartResponse, Bytes::new()));
                 }
                 Command::Alert => {
                     warn!(
@@ -444,23 +454,33 @@ impl InboundSession {
     }
 
     async fn write_loop(
-        &self,
         mut tls: impl AsyncWrite + Unpin + Send,
-        mut rx: mpsc::UnboundedReceiver<(u32, u8, Bytes)>,
+        mut rx: mpsc::Receiver<Frame>,
+        closer: Arc<SessionCloser>,
     ) -> Result<()> {
-        while let Some((stream_id, cmd, data)) = rx.recv().await {
-            write_frame(&mut tls, Command::from(cmd), stream_id, &data).await?;
+        loop {
+            let Some((stream_id, cmd, data)) = (tokio::select! {
+                frame = rx.recv() => frame,
+                _ = closer.wait() => None,
+            }) else {
+                break;
+            };
+            write_frame(&mut tls, stream_id, cmd, &data).await?;
         }
         Ok(())
     }
 
     /// Handle TCP target: create stream and dispatch to router.
     async fn handle_target(&self, stream_id: u32, target: TargetAddr) {
-        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        let (data_tx, data_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
         let write_tx = self.write_tx.clone();
 
-        let stream = Box::new(AnytlsInboundStream::new(stream_id, write_tx, data_rx))
-            as crate::proxy::outbound::AnyStream;
+        let stream = Box::new(AnytlsInboundStream::new(
+            stream_id,
+            write_tx,
+            data_rx,
+            self.streams.clone(),
+        )) as crate::proxy::outbound::AnyStream;
 
         self.streams.insert(stream_id, StreamState::Active(data_tx));
 
@@ -491,7 +511,7 @@ impl InboundSession {
             warn!("Anytls inbound empty UoT request from {}", self.peer_addr);
             let _ = self
                 .write_tx
-                .send((stream_id, Command::Fin as u8, Bytes::new()));
+                .try_send((stream_id, Command::Fin, Bytes::new()));
             self.streams.remove(&stream_id);
             return;
         }
@@ -505,7 +525,7 @@ impl InboundSession {
                 );
                 let _ = self
                     .write_tx
-                    .send((stream_id, Command::Fin as u8, Bytes::new()));
+                    .try_send((stream_id, Command::Fin, Bytes::new()));
                 self.streams.remove(&stream_id);
                 return;
             }
@@ -513,14 +533,14 @@ impl InboundSession {
 
         // The remaining bytes after the UoT Request header are part of the first packet
         let remaining = if data.len() > 1 + addr_len {
-            Bytes::copy_from_slice(&data[1 + addr_len..])
+            data.slice(1 + addr_len..)
         } else {
             Bytes::new()
         };
 
-        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        let (data_tx, data_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
         if !remaining.is_empty() {
-            let _ = data_tx.send(remaining);
+            let _ = data_tx.try_send(remaining);
         }
 
         let client_addr = TargetAddr::Ip(self.peer_addr);
@@ -532,6 +552,8 @@ impl InboundSession {
             client_addr.clone(),
             is_connect,
             real_target.clone(),
+            self.closer.clone(),
+            self.streams.clone(),
         ));
 
         // Transition to Active and consume the WaitingUotRequest entry
@@ -568,37 +590,6 @@ impl InboundSession {
             .instrument(span),
         );
     }
-}
-
-// ─── Frame I/O ────────────────────────────────────────────────────────────────
-
-async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(Command, u32, Bytes)> {
-    let cmd = stream.read_u8().await?;
-    let stream_id = stream.read_u32().await?;
-    let data_len = stream.read_u16().await?;
-    let mut data = vec![0u8; data_len as usize];
-    if data_len > 0 {
-        stream.read_exact(&mut data).await?;
-    }
-    Ok((Command::from(cmd), stream_id, Bytes::from(data)))
-}
-
-async fn write_frame<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    cmd: Command,
-    stream_id: u32,
-    data: &[u8],
-) -> Result<()> {
-    let mut header = [0u8; FRAME_HEADER_SIZE];
-    header[0] = u8::from(cmd);
-    header[1..5].copy_from_slice(&stream_id.to_be_bytes());
-    header[5..7].copy_from_slice(&(data.len() as u16).to_be_bytes());
-    stream.write_all(&header).await?;
-    if !data.is_empty() {
-        stream.write_all(data).await?;
-    }
-    stream.flush().await?;
-    Ok(())
 }
 
 fn parse_version(data: &[u8]) -> u8 {

@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -19,10 +19,11 @@ use rand::Rng;
 use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     sync::Mutex,
 };
 use tokio_rustls::{TlsConnector, rustls};
+use tokio_util::sync::PollSender;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -127,7 +128,7 @@ impl PaddingScheme {
                     .parse()
                     .context("invalid padding max")?;
                 let (min, max) = (min.min(max), min.max(max));
-                if min <= 0 || max <= 0 {
+                if min == 0 {
                     continue;
                 }
                 if min == max {
@@ -184,9 +185,9 @@ enum StreamEvent {
 struct Session {
     session_seq: u64,
     /// Map from stream_id to event sender for routing incoming frames
-    streams: DashMap<u32, tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
+    streams: DashMap<u32, tokio::sync::mpsc::Sender<StreamEvent>>,
     /// Write channel: (stream_id, cmd, data)
-    write_tx: tokio::sync::mpsc::UnboundedSender<(u32, u8, Bytes)>,
+    write_tx: tokio::sync::mpsc::Sender<Frame>,
     next_stream_id: AtomicU32,
     server_version: AtomicU8,
     is_dead: AtomicBool,
@@ -194,6 +195,7 @@ struct Session {
     send_padding: AtomicBool,
     padding_scheme: Mutex<PaddingScheme>,
     closer: Arc<SessionCloser>,
+    close_when_idle: bool,
 }
 
 impl Session {
@@ -205,6 +207,7 @@ impl Session {
         tls_connect_timeout: Duration,
         session_seq: u64,
         padding_scheme: PaddingScheme,
+        close_when_idle: bool,
     ) -> Result<Arc<Self>> {
         // TLS handshake
         let jls_enabled = tls_cfg.jls_config.enable;
@@ -226,7 +229,7 @@ impl Session {
             bail!("Anytls JLS authentication failed");
         }
 
-        let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (write_tx, write_rx) = tokio::sync::mpsc::channel(SESSION_QUEUE_CAPACITY);
 
         let session = Arc::new(Self {
             session_seq,
@@ -239,6 +242,7 @@ impl Session {
             send_padding: AtomicBool::new(true),
             padding_scheme: Mutex::new(padding_scheme),
             closer: Arc::new(SessionCloser::new()),
+            close_when_idle,
         });
 
         // Authenticate (pkt=0)
@@ -253,7 +257,8 @@ impl Session {
         );
         session
             .write_tx
-            .send((0, Command::Settings as u8, Bytes::from(settings_data)))
+            .send((0, Command::Settings, Bytes::from(settings_data)))
+            .await
             .map_err(|_| new_io_other_error("failed to queue settings"))?;
 
         // Spawn write loop (starts in buffering mode)
@@ -262,8 +267,7 @@ impl Session {
             if let Err(e) = session_w.write_loop(tls_write, write_rx).await {
                 debug!("Anytls session {} write loop ended: {:?}", session_seq, e);
             }
-            session_w.is_dead.store(true, Ordering::Release);
-            session_w.closer.close();
+            session_w.finish();
         });
 
         // Spawn read loop
@@ -272,8 +276,7 @@ impl Session {
             if let Err(e) = session_r.read_loop(tls_read).await {
                 debug!("Anytls session {} read loop ended: {:?}", session_seq, e);
             }
-            session_r.is_dead.store(true, Ordering::Release);
-            session_r.closer.close();
+            session_r.finish();
         });
 
         Ok(session)
@@ -302,27 +305,14 @@ impl Session {
         Ok(())
     }
 
-    // ── Frame I/O ─────────────────────────────────────────────────────────
-
-    async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(Command, u32, Bytes)> {
-        let cmd = stream.read_u8().await.context("read frame cmd")?;
-        let stream_id = stream.read_u32().await.context("read frame stream_id")?;
-        let data_len = stream.read_u16().await.context("read frame data_len")?;
-        let mut data = vec![0u8; data_len as usize];
-        if data_len > 0 {
-            stream
-                .read_exact(&mut data)
-                .await
-                .context("read frame data")?;
-        }
-        Ok((Command::from(cmd), stream_id, Bytes::from(data)))
-    }
-
     // ── Loops ─────────────────────────────────────────────────────────────
 
     async fn read_loop(&self, mut tls: impl AsyncRead + Unpin + Send) -> Result<()> {
         loop {
-            let (cmd, stream_id, data) = match Self::read_frame(&mut tls).await {
+            let (cmd, stream_id, data) = match tokio::select! {
+                frame = read_frame(&mut tls) => frame,
+                _ = self.closer.wait() => return Ok(()),
+            } {
                 Ok(frame) => frame,
                 Err(e) => return Err(e),
             };
@@ -331,18 +321,25 @@ impl Session {
                 Command::Waste => {}
                 Command::Psh => {
                     if let Some(tx) = self.streams.get(&stream_id) {
-                        let _ = tx.send(StreamEvent::Data(data));
+                        if tx.try_send(StreamEvent::Data(data)).is_err() {
+                            drop(tx);
+                            self.streams.remove(&stream_id);
+                            let _ = self
+                                .write_tx
+                                .try_send((stream_id, Command::Fin, Bytes::new()));
+                            warn!("Anytls stream {} receive queue full; closing it", stream_id);
+                        }
                     }
                 }
                 Command::Fin => {
                     if let Some(tx) = self.streams.get(&stream_id) {
-                        let _ = tx.send(StreamEvent::Fin);
+                        let _ = tx.try_send(StreamEvent::Fin);
                     }
                 }
                 Command::SynAck => {
                     if !data.is_empty() {
                         if let Some(tx) = self.streams.get(&stream_id) {
-                            let _ = tx.send(StreamEvent::SynAckError(data.to_vec()));
+                            let _ = tx.try_send(StreamEvent::SynAckError(data.to_vec()));
                         }
                     }
                 }
@@ -354,7 +351,7 @@ impl Session {
                     );
                     // Notify all streams
                     for entry in self.streams.iter() {
-                        let _ = entry.value().send(StreamEvent::SynAckError(
+                        let _ = entry.value().try_send(StreamEvent::SynAckError(
                             format!("server alert: {}", msg).into_bytes(),
                         ));
                     }
@@ -376,7 +373,7 @@ impl Session {
                     // Send heart response via write channel
                     let _ = self
                         .write_tx
-                        .send((0, Command::HeartResponse as u8, Bytes::new()));
+                        .try_send((0, Command::HeartResponse, Bytes::new()));
                 }
                 Command::HeartResponse => {}
                 Command::ServerSettings => {
@@ -400,20 +397,26 @@ impl Session {
     async fn write_loop(
         &self,
         mut tls: impl AsyncWrite + Unpin + Send,
-        mut write_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, u8, Bytes)>,
+        mut write_rx: tokio::sync::mpsc::Receiver<Frame>,
     ) -> Result<()> {
         // Buffering: accumulate frames until the first PSH (target address)
         // is received, then flush all buffered data with padding.
         let mut buffering = true;
         let mut buffer: Vec<u8> = Vec::new();
 
-        while let Some((stream_id, cmd, data)) = write_rx.recv().await {
-            let frame_bytes = Self::build_frame_bytes(Command::from(cmd), stream_id, &data);
+        loop {
+            let Some((stream_id, cmd, data)) = (tokio::select! {
+                frame = write_rx.recv() => frame,
+                _ = self.closer.wait() => None,
+            }) else {
+                break;
+            };
+            let frame_bytes = build_frame(cmd, stream_id, &data)?;
 
             if buffering {
                 buffer.extend_from_slice(&frame_bytes);
                 // First PSH = target address → stop buffering and flush
-                if Command::from(cmd) == Command::Psh {
+                if cmd == Command::Psh {
                     buffering = false;
                     let combined = std::mem::take(&mut buffer);
                     if let Err(e) = self.write_with_padding(&mut tls, &combined).await {
@@ -429,16 +432,6 @@ impl Session {
             }
         }
         Ok(())
-    }
-
-    /// Build frame bytes without sending them.
-    fn build_frame_bytes(cmd: Command, stream_id: u32, data: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + data.len());
-        buf.push(u8::from(cmd));
-        buf.extend_from_slice(&stream_id.to_be_bytes());
-        buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        buf.extend_from_slice(data);
-        buf
     }
 
     /// Write data with padding according to the current scheme.
@@ -537,6 +530,12 @@ impl Session {
         self.is_dead.load(Ordering::Acquire)
     }
 
+    fn finish(&self) {
+        self.is_dead.store(true, Ordering::Release);
+        self.closer.close();
+        self.streams.clear();
+    }
+
     #[allow(dead_code)]
     fn server_version(&self) -> u8 {
         self.server_version.load(Ordering::Acquire)
@@ -547,8 +546,8 @@ impl Session {
     }
 
     /// Register a new stream and get its event receiver
-    fn register_stream(&self, stream_id: u32) -> tokio::sync::mpsc::UnboundedReceiver<StreamEvent> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    fn register_stream(&self, stream_id: u32) -> tokio::sync::mpsc::Receiver<StreamEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_QUEUE_CAPACITY);
         self.streams.insert(stream_id, tx);
         rx
     }
@@ -556,15 +555,13 @@ impl Session {
     /// Unregister a stream (called when stream is dropped)
     fn unregister_stream(&self, stream_id: u32) {
         self.streams.remove(&stream_id);
+        if self.close_when_idle && self.streams.is_empty() {
+            self.finish();
+        }
     }
 }
 
 // ─── AnytlsClient (Session Manager) ──────────────────────────────────────────
-
-struct IdleSession {
-    session: Arc<Session>,
-    idle_since: Instant,
-}
 
 pub struct AnytlsClient {
     address: TargetAddr,
@@ -576,17 +573,10 @@ pub struct AnytlsClient {
     dns_server_name: Option<String>,
     disable_mux: bool,
 
-    active_sessions: Mutex<Vec<Arc<Session>>>,
-    idle_sessions: Arc<Mutex<Vec<IdleSession>>>,
+    current_session: Mutex<Option<Arc<Session>>>,
+    create_session_lock: Mutex<()>,
     session_seq: AtomicU64,
     padding_scheme: Mutex<PaddingScheme>,
-
-    #[allow(dead_code)]
-    idle_session_check_interval: Duration,
-    #[allow(dead_code)]
-    idle_session_timeout: Duration,
-    #[allow(dead_code)]
-    min_idle_session: usize,
 }
 
 impl AnytlsClient {
@@ -611,17 +601,6 @@ impl AnytlsClient {
             .map_err(|e| new_io_other_error(e))?
             .to_owned();
 
-        let idle_sessions = Arc::new(Mutex::new(Vec::new()));
-
-        // Spawn cleanup task
-        let idle_sessions_c = idle_sessions.clone();
-        let check_interval = Duration::from_secs(30);
-        let session_timeout = Duration::from_secs(60);
-        let min_idle = 1usize;
-        tokio::spawn(async move {
-            Self::cleanup_loop(idle_sessions_c, check_interval, session_timeout, min_idle).await;
-        });
-
         Ok(Self {
             address,
             password_hash,
@@ -631,13 +610,10 @@ impl AnytlsClient {
             bind_interface,
             dns_server_name,
             disable_mux,
-            active_sessions: Mutex::new(Vec::new()),
-            idle_sessions,
+            current_session: Mutex::new(None),
+            create_session_lock: Mutex::new(()),
             session_seq: AtomicU64::new(0),
             padding_scheme: Mutex::new(PaddingScheme::get_default()),
-            idle_session_check_interval: check_interval,
-            idle_session_timeout: session_timeout,
-            min_idle_session: min_idle,
         })
     }
 
@@ -676,22 +652,34 @@ impl AnytlsClient {
             return self.create_session().await;
         }
 
-        // Try to get an idle session (prefer highest seq)
-        {
-            let mut idle = self.idle_sessions.lock().await;
-            if !idle.is_empty() {
-                idle.sort_by(|a, b| b.session.session_seq.cmp(&a.session.session_seq));
-                let idle_session = idle.remove(0);
-                let session = idle_session.session;
-                if !session.is_dead() {
-                    self.active_sessions.lock().await.push(session.clone());
-                    debug!("Anytls reusing idle session seq={}", session.session_seq);
-                    return Ok(session);
-                }
-            }
+        if let Some(session) = self.live_session().await {
+            return Ok(session);
         }
 
-        self.create_session().await
+        // Serialize connection establishment and check again after waiting: a burst
+        // of streams should create one multiplexed TLS session, not one per stream.
+        let _create_guard = self.create_session_lock.lock().await;
+        if let Some(session) = self.live_session().await {
+            return Ok(session);
+        }
+        let session = self.create_session().await?;
+        *self.current_session.lock().await = Some(session.clone());
+        Ok(session)
+    }
+
+    async fn live_session(&self) -> Option<Arc<Session>> {
+        let mut current = self.current_session.lock().await;
+        match current.as_ref() {
+            Some(session) if !session.is_dead() => {
+                debug!("Anytls reusing session seq={}", session.session_seq);
+                Some(session.clone())
+            }
+            Some(_) => {
+                *current = None;
+                None
+            }
+            None => None,
+        }
     }
 
     async fn create_session(&self) -> Result<Arc<Session>> {
@@ -720,62 +708,21 @@ impl AnytlsClient {
             self.connect_timeout,
             seq,
             padding_scheme,
+            self.disable_mux,
         )
         .await?;
 
-        self.active_sessions.lock().await.push(session.clone());
         info!("Anytls created new session seq={}", seq);
         Ok(session)
     }
+}
 
-    #[allow(dead_code)]
-    async fn mark_idle(&self, session: Arc<Session>) {
+impl Drop for AnytlsClient {
+    fn drop(&mut self) {
+        if let Ok(current) = self.current_session.try_lock()
+            && let Some(session) = current.as_ref()
         {
-            let mut active = self.active_sessions.lock().await;
-            active.retain(|s| s.session_seq != session.session_seq);
-        }
-        // 禁用多路复用时，不将 session 放入空闲池，直接让其消亡
-        if self.disable_mux || session.is_dead() {
-            return;
-        }
-        self.idle_sessions.lock().await.push(IdleSession {
-            session,
-            idle_since: Instant::now(),
-        });
-    }
-
-    async fn cleanup_loop(
-        idle_sessions: Arc<Mutex<Vec<IdleSession>>>,
-        check_interval: Duration,
-        session_timeout: Duration,
-        min_idle: usize,
-    ) {
-        loop {
-            tokio::time::sleep(check_interval).await;
-            let mut idle = idle_sessions.lock().await;
-            let now = Instant::now();
-            idle.sort_by(|a, b| a.idle_since.cmp(&b.idle_since));
-            let keep_count = min_idle.min(idle.len());
-            let remove_count = idle.len().saturating_sub(keep_count);
-            let mut removed = 0;
-            idle.retain(|s| {
-                if removed >= remove_count {
-                    return true;
-                }
-                if now.duration_since(s.idle_since) > session_timeout {
-                    debug!(
-                        "Anytls cleaning up idle session seq={}, idle for {:?}",
-                        s.session.session_seq,
-                        now.duration_since(s.idle_since)
-                    );
-                    s.session.is_dead.store(true, Ordering::Release);
-                    s.session.closer.close();
-                    removed += 1;
-                    false
-                } else {
-                    true
-                }
-            });
+            session.finish();
         }
     }
 }
@@ -785,9 +732,9 @@ impl AnytlsClient {
 pub struct AnytlsUdpSocket {
     stream_id: u32,
     session: Arc<Session>,
-    write_tx: tokio::sync::mpsc::UnboundedSender<(u32, u8, Bytes)>,
-    event_rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>>,
-    read_buffer: Mutex<Vec<u8>>,
+    write_tx: tokio::sync::mpsc::Sender<Frame>,
+    event_rx: Mutex<tokio::sync::mpsc::Receiver<StreamEvent>>,
+    read_buffer: Mutex<UotReadBuffer>,
     is_connect: bool,
 }
 
@@ -795,7 +742,7 @@ impl AnytlsUdpSocket {
     fn new(
         stream_id: u32,
         session: Arc<Session>,
-        event_rx: tokio::sync::mpsc::UnboundedReceiver<StreamEvent>,
+        event_rx: tokio::sync::mpsc::Receiver<StreamEvent>,
         is_connect: bool,
     ) -> Self {
         Self {
@@ -803,7 +750,7 @@ impl AnytlsUdpSocket {
             write_tx: session.write_tx.clone(),
             session,
             event_rx: Mutex::new(event_rx),
-            read_buffer: Mutex::new(Vec::new()),
+            read_buffer: Mutex::new(UotReadBuffer::default()),
             is_connect,
         }
     }
@@ -811,37 +758,8 @@ impl AnytlsUdpSocket {
     async fn read_next_msg(&self) -> Result<Bytes> {
         loop {
             {
-                let mut buf = self.read_buffer.lock().await;
-                if self.is_connect {
-                    // Connect mode: length(u16) + data
-                    if buf.len() >= 2 {
-                        let payload_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-                        let total_needed = 2 + payload_len;
-                        if buf.len() >= total_needed {
-                            let msg = Bytes::copy_from_slice(&buf[..total_needed]);
-                            buf.drain(..total_needed);
-                            return Ok(msg);
-                        }
-                    }
-                } else {
-                    // Non-connect mode: ATYP(uot) + addr + port + length(u16) + data
-                    if !buf.is_empty() {
-                        if let Ok((_, target_len)) = uot_decode_target(&buf) {
-                            if buf.len() >= target_len + 2 {
-                                let payload_len =
-                                    u16::from_be_bytes([buf[target_len], buf[target_len + 1]])
-                                        as usize;
-                                let total_needed = target_len + 2 + payload_len;
-                                if buf.len() >= total_needed {
-                                    let msg = Bytes::copy_from_slice(&buf[..total_needed]);
-                                    buf.drain(..total_needed);
-                                    return Ok(msg);
-                                }
-                            }
-                        } else if buf.len() > 256 {
-                            bail!("invalid UoT packet header");
-                        }
-                    }
+                if let Some(packet) = self.read_buffer.lock().await.next_packet(self.is_connect)? {
+                    return Ok(packet);
                 }
             }
 
@@ -849,7 +767,7 @@ impl AnytlsUdpSocket {
             match rx.recv().await {
                 Some(StreamEvent::Data(data)) => {
                     let mut buf = self.read_buffer.lock().await;
-                    buf.extend_from_slice(&data);
+                    buf.push(&data);
                 }
                 Some(StreamEvent::Fin) => bail!("UDP stream closed by remote"),
                 Some(StreamEvent::SynAckError(e)) => {
@@ -866,7 +784,7 @@ impl Drop for AnytlsUdpSocket {
         // Send FIN
         let _ = self
             .write_tx
-            .send((self.stream_id, Command::Fin as u8, Bytes::new()));
+            .try_send((self.stream_id, Command::Fin, Bytes::new()));
         self.session.unregister_stream(self.stream_id);
     }
 }
@@ -874,55 +792,23 @@ impl Drop for AnytlsUdpSocket {
 #[async_trait]
 impl AnyPacket for AnytlsUdpSocket {
     async fn send_to(&self, buf: Bytes, _from: &SourceAddr, target: &TargetAddr) -> Result<usize> {
-        let packet = if self.is_connect {
-            // Connect mode: length(u16) + data
-            let mut p = Vec::with_capacity(2 + buf.len());
-            p.extend_from_slice(&(buf.len() as u16).to_be_bytes());
-            p.extend_from_slice(&buf);
-            p
-        } else {
-            // Non-connect mode: ATYP(uot) + addr + port + length(u16) + data
-            let target_bytes = uot_encode_target(target);
-            let mut p = Vec::with_capacity(target_bytes.len() + 2 + buf.len());
-            p.extend_from_slice(&target_bytes);
-            p.extend_from_slice(&(buf.len() as u16).to_be_bytes());
-            p.extend_from_slice(&buf);
-            p
-        };
+        let packet = encode_uot_packet(&buf, (!self.is_connect).then_some(target))?;
 
         self.write_tx
-            .send((self.stream_id, Command::Psh as u8, Bytes::from(packet)))
+            .send((self.stream_id, Command::Psh, packet))
+            .await
             .map_err(|_| new_io_other_error("UDP write channel closed"))?;
         Ok(buf.len())
     }
 
     async fn recv_from(&self) -> Result<PacketInfo> {
         let data = self.read_next_msg().await?;
-        if self.is_connect {
-            // Connect mode: length(u16) + data
-            if data.len() < 2 {
-                bail!("UoT connect packet too short");
-            }
-            let payload_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-            if data.len() < 2 + payload_len {
-                bail!("UoT connect packet too short for payload");
-            }
-            let payload = Bytes::copy_from_slice(&data[2..2 + payload_len]);
-            Ok((TargetAddr::dummy(), TargetAddr::dummy(), payload))
-        } else {
-            // Non-connect mode: ATYP(uot) + addr + port + length(u16) + data
-            let (target, target_len) = uot_decode_target(&data)?;
-            if data.len() < target_len + 2 {
-                bail!("UoT packet too short for length");
-            }
-            let payload_len = u16::from_be_bytes([data[target_len], data[target_len + 1]]) as usize;
-            if data.len() < target_len + 2 + payload_len {
-                bail!("UoT packet too short for payload");
-            }
-            let payload =
-                Bytes::copy_from_slice(&data[target_len + 2..target_len + 2 + payload_len]);
-            Ok((TargetAddr::dummy(), target, payload))
-        }
+        let (target, payload) = decode_uot_packet(data, self.is_connect)?;
+        Ok((
+            TargetAddr::dummy(),
+            target.unwrap_or_else(TargetAddr::dummy),
+            payload,
+        ))
     }
 
     fn closer(&self) -> Arc<SessionCloser> {
@@ -1023,13 +909,15 @@ impl AnyOutbound for AnytlsOutbound {
         // Go protocol: SYN has no data, target address sent as first PSH
         session
             .write_tx
-            .send((stream_id, Command::Syn as u8, Bytes::new()))
+            .send((stream_id, Command::Syn, Bytes::new()))
+            .await
             .context("session write channel closed")?;
 
         let target_data = target.to_bytes();
         session
             .write_tx
-            .send((stream_id, Command::Psh as u8, Bytes::from(target_data)))
+            .send((stream_id, Command::Psh, Bytes::from(target_data)))
+            .await
             .context("session write channel closed")?;
 
         let proxy = AnytlsProxyStream::new(stream_id, session.clone(), event_rx);
@@ -1047,13 +935,15 @@ impl AnyOutbound for AnytlsOutbound {
         // Go protocol: SYN has no data, target sent as first PSH
         session
             .write_tx
-            .send((stream_id, Command::Syn as u8, Bytes::new()))
+            .send((stream_id, Command::Syn, Bytes::new()))
+            .await
             .context("session write channel closed")?;
 
         let target_data = udp_target.to_bytes();
         session
             .write_tx
-            .send((stream_id, Command::Psh as u8, Bytes::from(target_data)))
+            .send((stream_id, Command::Psh, Bytes::from(target_data)))
+            .await
             .context("session write channel closed")?;
 
         // Send UoT Request header (uses Socksaddr format: ATYP 1/3/4)
@@ -1061,7 +951,8 @@ impl AnyOutbound for AnytlsOutbound {
         uot_request.extend_from_slice(&socksaddr_encode_target(target));
         session
             .write_tx
-            .send((stream_id, Command::Psh as u8, Bytes::from(uot_request)))
+            .send((stream_id, Command::Psh, Bytes::from(uot_request)))
+            .await
             .context("session write channel closed")?;
 
         Ok(Arc::new(AnytlsUdpSocket::new(
@@ -1079,9 +970,9 @@ impl AnyOutbound for AnytlsOutbound {
 struct AnytlsProxyStream {
     stream_id: u32,
     session: Arc<Session>,
-    write_tx: tokio::sync::mpsc::UnboundedSender<(u32, u8, Bytes)>,
-    event_rx: SyncMutex<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>>,
-    read_buffer: SyncMutex<Vec<u8>>,
+    write_tx: PollSender<Frame>,
+    event_rx: SyncMutex<tokio::sync::mpsc::Receiver<StreamEvent>>,
+    read_buffer: SyncMutex<StreamReadBuffer>,
     fin_received: AtomicBool,
     fin_sent: AtomicBool,
 }
@@ -1090,14 +981,14 @@ impl AnytlsProxyStream {
     fn new(
         stream_id: u32,
         session: Arc<Session>,
-        event_rx: tokio::sync::mpsc::UnboundedReceiver<StreamEvent>,
+        event_rx: tokio::sync::mpsc::Receiver<StreamEvent>,
     ) -> Self {
         Self {
             stream_id,
-            write_tx: session.write_tx.clone(),
+            write_tx: PollSender::new(session.write_tx.clone()),
             session,
             event_rx: SyncMutex::new(event_rx),
-            read_buffer: SyncMutex::new(Vec::new()),
+            read_buffer: SyncMutex::new(StreamReadBuffer::default()),
             fin_received: AtomicBool::new(false),
             fin_sent: AtomicBool::new(false),
         }
@@ -1115,10 +1006,7 @@ impl AsyncRead for AnytlsProxyStream {
         // Serve from read buffer first
         {
             let mut rb = this.read_buffer.lock().unwrap();
-            if !rb.is_empty() {
-                let to_copy = rb.len().min(buf.remaining());
-                buf.put_slice(&rb[..to_copy]);
-                rb.drain(..to_copy);
+            if rb.copy_to(buf) {
                 return Poll::Ready(Ok(()));
             }
         }
@@ -1132,12 +1020,7 @@ impl AsyncRead for AnytlsProxyStream {
         match rx.poll_recv(cx) {
             Poll::Ready(Some(StreamEvent::Data(data))) => {
                 drop(rx);
-                let to_copy = data.len().min(buf.remaining());
-                buf.put_slice(&data[..to_copy]);
-                if to_copy < data.len() {
-                    let mut rb = this.read_buffer.lock().unwrap();
-                    rb.extend_from_slice(&data[to_copy..]);
-                }
+                this.read_buffer.lock().unwrap().copy_from(data, buf);
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(StreamEvent::Fin)) => {
@@ -1166,22 +1049,39 @@ impl AsyncWrite for AnytlsProxyStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         if this.fin_sent.load(Ordering::Acquire) {
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "stream already closed",
             )));
         }
-        match this.write_tx.send((
-            this.stream_id,
-            Command::Psh as u8,
-            Bytes::copy_from_slice(buf),
-        )) {
-            Ok(_) => Poll::Ready(Ok(buf.len())),
-            Err(_) => Poll::Ready(Err(std::io::Error::new(
+        match this.write_tx.poll_reserve(_cx) {
+            Poll::Ready(Ok(())) => {
+                let len = buf.len().min(u16::MAX as usize);
+                if this
+                    .write_tx
+                    .send_item((
+                        this.stream_id,
+                        Command::Psh,
+                        Bytes::copy_from_slice(&buf[..len]),
+                    ))
+                    .is_err()
+                {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "session closed",
+                    )));
+                }
+                Poll::Ready(Ok(len))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "session closed",
             ))),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -1189,23 +1089,31 @@ impl AsyncWrite for AnytlsProxyStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if !this.fin_sent.swap(true, Ordering::AcqRel) {
-            let _ = this
-                .write_tx
-                .send((this.stream_id, Command::Fin as u8, Bytes::new()));
+        if this.fin_sent.load(Ordering::Acquire) {
+            return Poll::Ready(Ok(()));
         }
-        Poll::Ready(Ok(()))
+        match this.write_tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                this.fin_sent.store(true, Ordering::Release);
+                let _ = this
+                    .write_tx
+                    .send_item((this.stream_id, Command::Fin, Bytes::new()));
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
 impl Drop for AnytlsProxyStream {
     fn drop(&mut self) {
         if !self.fin_sent.load(Ordering::Acquire) {
-            let _ = self
-                .write_tx
-                .send((self.stream_id, Command::Fin as u8, Bytes::new()));
+            if let Some(tx) = self.write_tx.get_ref() {
+                let _ = tx.try_send((self.stream_id, Command::Fin, Bytes::new()));
+            }
         }
         self.session.unregister_stream(self.stream_id);
     }
@@ -1328,7 +1236,7 @@ mod tests {
         if data_len > 0 {
             r.read_exact(&mut data).await?;
         }
-        Ok((Command::from(cmd), stream_id, Bytes::from(data)))
+        Ok((Command::try_from(cmd)?, stream_id, Bytes::from(data)))
     }
 
     /// Write a frame: cmd | stream_id(BE u32) | data_len(BE u16) | data
@@ -1600,7 +1508,7 @@ mod tests {
     async fn test_anytls_tcp_echo() {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let (server_tls_cfg, client_tls_cfg) = generate_tls_config();
+        let (server_tls_cfg, _) = generate_tls_config();
         let acceptor = TlsAcceptor::from(Arc::new(server_tls_cfg));
         let phash = password_hash(TEST_PASSWORD);
 
@@ -1622,7 +1530,7 @@ mod tests {
         let address = TargetAddr::Ip(server_addr);
         let tls_cfg = TlsConfig {
             enable: true,
-            insecure: false,
+            insecure: true,
             zero_rtt: false,
             sni: Some("localhost".to_string()),
             cert: None,
@@ -1633,7 +1541,7 @@ mod tests {
             jls_password: String::new(),
         };
 
-        let _client = AnytlsClient::new(
+        let client = AnytlsClient::new(
             address,
             TEST_PASSWORD,
             &tls_cfg,
@@ -1644,25 +1552,12 @@ mod tests {
         )
         .expect("create client");
 
-        // We connect directly using Session::new with our test TLS config
-        let socket_addr = SocketAddr::from(([127, 0, 0, 1], server_addr.port()));
-        let tcp_stream = TcpStream::connect(socket_addr).await.expect("connect");
-
-        let server_name = rustls::pki_types::ServerName::try_from("localhost")
-            .unwrap()
-            .to_owned();
-
-        let session = Session::new(
-            tcp_stream,
-            Arc::new(client_tls_cfg),
-            server_name,
-            &phash,
-            Duration::from_secs(10),
-            0,
-            PaddingScheme::get_default(),
-        )
-        .await
-        .expect("create session");
+        let session = client.get_session().await.expect("create session");
+        let reused = client.get_session().await.expect("reuse session");
+        assert!(
+            Arc::ptr_eq(&session, &reused),
+            "mux must reuse the live TLS session"
+        );
 
         // Wait for server to process settings and be ready
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1674,7 +1569,8 @@ mod tests {
         // 1. Send empty SYN
         session
             .write_tx
-            .send((stream_id, Command::Syn as u8, Bytes::new()))
+            .send((stream_id, Command::Syn, Bytes::new()))
+            .await
             .expect("send SYN");
 
         // 2. Send target address as first PSH
@@ -1682,7 +1578,8 @@ mod tests {
         let target_data = target.to_bytes();
         session
             .write_tx
-            .send((stream_id, Command::Psh as u8, Bytes::from(target_data)))
+            .send((stream_id, Command::Psh, Bytes::from(target_data)))
+            .await
             .expect("send target PSH");
 
         let proxy = AnytlsProxyStream::new(stream_id, session.clone(), event_rx);
@@ -1745,6 +1642,7 @@ mod tests {
             Duration::from_secs(10),
             0,
             PaddingScheme::get_default(),
+            false,
         )
         .await
         .expect("create session");
@@ -1757,14 +1655,16 @@ mod tests {
         // Go protocol: SYN empty, target as first PSH
         session
             .write_tx
-            .send((stream_id, Command::Syn as u8, Bytes::new()))
+            .send((stream_id, Command::Syn, Bytes::new()))
+            .await
             .expect("send SYN");
 
         let udp_target = TargetAddr::Domain(UDP_OVER_TCP_TARGET.to_string(), 12345);
         let target_data = udp_target.to_bytes();
         session
             .write_tx
-            .send((stream_id, Command::Psh as u8, Bytes::from(target_data)))
+            .send((stream_id, Command::Psh, Bytes::from(target_data)))
+            .await
             .expect("send target PSH");
 
         let udp_socket = AnytlsUdpSocket::new(stream_id, session.clone(), event_rx, false);
@@ -1832,6 +1732,7 @@ mod tests {
             Duration::from_secs(10),
             0,
             PaddingScheme::get_default(),
+            false,
         )
         .await
         .expect("session creation should succeed (auth is async)");
@@ -2006,6 +1907,7 @@ mod tests {
             Duration::from_secs(10),
             0,
             PaddingScheme::get_default(),
+            false,
         )
         .await
         .expect("create session to Go server");
@@ -2019,7 +1921,8 @@ mod tests {
         // Send SYN (Go server expects empty SYN data)
         session
             .write_tx
-            .send((stream_id, Command::Syn as u8, Bytes::new()))
+            .send((stream_id, Command::Syn, Bytes::new()))
+            .await
             .expect("send SYN");
 
         let proxy = AnytlsProxyStream::new(stream_id, session.clone(), event_rx);
