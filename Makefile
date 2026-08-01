@@ -35,7 +35,7 @@ run_client: build
 	./target/release/quicproxy --elevate -c ./src/premium/test/client.json5
 
 run_persist_server: build
-	./target/release/quicproxy --manage --port 8080 -c ./src/premium/test/client.json5
+	./target/release/quicproxy --manage --port 8080 --web-dir ./src/premium/quicproxy_flutter/build/web
 
 USE_MIMALLOC ?= 0
 USE_SNMALLOC ?= 0

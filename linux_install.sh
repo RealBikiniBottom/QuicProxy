@@ -489,9 +489,6 @@ print_success() {
   echo -e "    GET  /api/core/status   — 查看核心状态"
   echo -e "    GET  /api/core/logs     — 查看核心日志"
   echo -e "    GET  /api/health        — 健康检查"
-  echo -e "    GET  /observe           — 代理状态 (反向代理到核心)"
-  echo -e "    GET  /outbounds         — 出站列表 (反向代理到核心)"
-  echo -e "    PUT  /selector          — 切换节点 (反向代理到核心)"
   echo ""
 }
 

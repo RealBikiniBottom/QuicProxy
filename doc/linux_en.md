@@ -60,16 +60,6 @@ curl -X POST ${BASE}/api/core/start -H "Authorization: ${PASS}"
 curl ${BASE}/api/core/status -H "Authorization: ${PASS}"
 ```
 
-After the core starts, the following endpoints are automatically reverse-proxied to the core:
-
-| Endpoint           | Description              |
-| ------------------ | ------------------------ |
-| `GET /observe`     | Proxy status statistics  |
-| `GET /outbounds`   | Outbound node list       |
-| `PUT /selector`    | Switch selected node     |
-| `GET /connections` | Current connection list  |
-| `GET /traffic`     | Traffic statistics       |
-
 ---
 
 ## Directory Structure

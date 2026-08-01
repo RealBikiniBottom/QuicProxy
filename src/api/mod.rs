@@ -4,7 +4,6 @@ pub mod core_manager;
 pub mod management;
 pub mod persist_handler;
 pub mod persist_store;
-pub mod reverse_proxy;
 pub mod static_files;
 pub mod sysinfo_api;
 

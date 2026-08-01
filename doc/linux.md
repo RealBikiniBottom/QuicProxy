@@ -58,23 +58,7 @@ curl -X POST ${BASE}/api/core/start -H "Authorization: ${PASS}"
 
 # 查看核心状态
 curl ${BASE}/api/core/status -H "Authorization: ${PASS}"
-```
 
-核心启动后，以下端点自动反向代理到核心：
-
-| 端点               | 说明         |
-| ------------------ | ------------ |
-| `GET /observe`     | 代理状态统计 |
-| `GET /outbounds`   | 出站节点列表 |
-| `PUT /selector`    | 切换节点     |
-| `GET /connections` | 当前连接列表 |
-| `GET /traffic`     | 流量统计     |
-
----
-
-## 目录结构
-
-```
 /opt/quicproxy/
 ├── quicproxy            # 二进制
 ├── config.json          # 管理配置

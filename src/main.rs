@@ -5,7 +5,7 @@
 //! 2. 管理模式：`quicproxy --manage --port 8080` — 管理服务器，可启停核心
 
 use anyhow::{Context, Result};
-use axum::{Router, extract::State, response::Json, routing::get};
+use axum::{Router, response::Json, routing::get};
 use clap::Parser;
 use quicproxy::api::{
     common::cors_middleware,
@@ -13,19 +13,17 @@ use quicproxy::api::{
     management::{self, ManagementState},
     persist_handler::{self, PersistHandlerState},
     persist_store::PersistStore,
-    reverse_proxy::{self, ProxyState},
     static_files,
     sysinfo_api::{self, SysInfoState},
 };
 use quicproxy::bootstrap;
 use quicproxy::config::Config;
 use quicproxy::utils::elevate::{self, ElevateConfig};
-use reqwest::Client;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process;
-use tracing::{debug, info};
+use tracing::info;
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -173,18 +171,24 @@ async fn async_main() -> Result<()> {
 async fn run_manage(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "quicproxy=info".into()))
+        .with_file(true)
+        .with_line_number(true)
+        .with_target(false)
+        .without_time()
         .init();
 
+    let current_executable = std::env::current_exe().ok();
+
     let work_dir = args.work_dir.unwrap_or_else(|| {
-        std::env::current_exe()
-            .ok()
+        current_executable
+            .as_ref()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."))
     });
 
     let core_path = args.core_path.unwrap_or_else(|| {
-        std::env::current_exe()
-            .ok()
+        current_executable
+            .as_ref()
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_else(|| "./quicproxy".to_string())
     });
@@ -197,34 +201,6 @@ async fn run_manage(args: Args) -> Result<()> {
     let core_path_display = core_manager.status().core_path;
     let work_dir_display = core_manager.status().work_dir;
     let web_dir = args.web_dir.clone();
-
-    // ─── 构建 Router ───
-    let proxy_state = ProxyState {
-        core_manager: core_manager.clone(),
-        client: Client::new(),
-    };
-
-    // 核心 API 反向代理路由
-    let proxy_routes = Router::new()
-        .route("/observe", get(reverse_proxy::proxy_to_core))
-        .route("/outbounds", get(reverse_proxy::proxy_to_core))
-        .route(
-            "/mode",
-            get(reverse_proxy::proxy_to_core).put(reverse_proxy::proxy_to_core),
-        )
-        .route(
-            "/connections",
-            get(reverse_proxy::proxy_to_core).delete(reverse_proxy::proxy_to_core),
-        )
-        .route(
-            "/selector",
-            get(reverse_proxy::proxy_to_core).put(reverse_proxy::proxy_to_core),
-        )
-        .route("/trace", get(reverse_proxy::proxy_to_core))
-        .route("/request", get(reverse_proxy::proxy_to_core))
-        .route("/quit", get(reverse_proxy::proxy_to_core))
-        .route("/traffic", get(reverse_proxy::proxy_to_core))
-        .with_state(proxy_state);
 
     // 管理 API 路由
     let mgmt_router = management::router().with_state(ManagementState {
@@ -263,39 +239,18 @@ async fn run_manage(args: Args) -> Result<()> {
         }),
     );
 
-    let core_api_router = proxy_routes
+    let core_api_router = Router::new()
         .merge(mgmt_router)
         .merge(persist_router)
         .merge(sysinfo_router)
         .merge(health_route);
 
-    // SPA fallback
-    #[derive(Clone)]
-    struct FallbackState {
-        web_dir: Option<PathBuf>,
-    }
-
-    let fallback_state = FallbackState {
-        web_dir: web_dir.clone(),
-    };
-
-    let app = if web_dir.is_some() {
+    let app = if let Some(ref dir) = web_dir {
         core_api_router
-            .fallback(
-                |State(s): State<FallbackState>, req: axum::extract::Request| async move {
-                    let dir = s
-                        .web_dir
-                        .as_ref()
-                        .expect("web_dir must be set for SPA fallback");
-                    static_files::serve_static_from(dir, req).await
-                },
-            )
+            .merge(static_files::spa_router(dir.clone())?)
             .layer(axum::middleware::from_fn(cors_middleware))
-            .with_state(fallback_state)
     } else {
-        core_api_router
-            .layer(axum::middleware::from_fn(cors_middleware))
-            .with_state(fallback_state)
+        core_api_router.layer(axum::middleware::from_fn(cors_middleware))
     };
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
