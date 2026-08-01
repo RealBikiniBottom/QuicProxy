@@ -359,9 +359,113 @@ jobs:
           path: ${{ env.INSTALLER_PATH }}
           if-no-files-found: error
 
+  build-flutter-web:
+    name: Web (Flutter)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.PRIVATE_KEY }}
+      - run: git clone git@github.com:RealBikiniBottom/premium.git ./src/premium
+
+      - name: Sync Cargo.toml version from git tag
+        run: |
+          VERSION_NUM=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          sed -i "0,/^version = \"[^\"]*\"/s/^version = \"[^\"]*\"/version = \"${VERSION_NUM}\"/" Cargo.toml
+          echo "✓ Synced Cargo.toml version to ${VERSION_NUM}"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.x"
+          channel: "stable"
+
+      - name: Install Flutter dependencies
+        working-directory: ./src/premium/quicproxy_flutter
+        run: flutter pub get
+
+      - name: Extract version from Cargo.toml
+        id: extract_version_web
+        run: |
+          VERSION=$(grep -m1 'version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "VERSION_STR=v${VERSION}" >> $GITHUB_OUTPUT
+          echo "VERSION_NUM=${VERSION}" >> $GITHUB_OUTPUT
+          echo "✓ Extracted version: v${VERSION}"
+
+      - name: Sync core version to Flutter code
+        run: |
+          VERSION_STR="${{ steps.extract_version_web.outputs.VERSION_STR }}"
+          VPN_SERVICE_PATH="src/premium/quicproxy_flutter/lib/services/vpn_service.dart"
+          if [ ! -f "$VPN_SERVICE_PATH" ]; then
+            echo "vpn_service.dart not found at $VPN_SERVICE_PATH"
+            exit 1
+          fi
+          sed -i "s/static const String currentCoreVersion = '[^']*';/static const String currentCoreVersion = '${VERSION_STR}';/" "$VPN_SERVICE_PATH"
+          echo "✓ Updated core version to ${VERSION_STR} in Flutter code"
+
+      - name: Build Flutter Web (Full)
+        working-directory: ./src/premium/quicproxy_flutter
+        run: |
+          rm -rf build/web
+          flutter build web --release
+          du -sh build/web
+
+      - name: Package Flutter Web (Full)
+        run: |
+          FULL_WEB_DIR="src/premium/quicproxy_flutter/build/web"
+          FULL_WEB_ZIP="QuicProxy-Web-Full.zip"
+          if [ ! -f "$FULL_WEB_DIR/index.html" ]; then
+            echo "Full web build output not found at $FULL_WEB_DIR"
+            exit 1
+          fi
+          (
+            cd "$FULL_WEB_DIR"
+            zip -qr "$GITHUB_WORKSPACE/$FULL_WEB_ZIP" .
+          )
+          echo "FULL_WEB_PATH=$GITHUB_WORKSPACE/$FULL_WEB_ZIP" >> $GITHUB_ENV
+          echo "✓ Packaged full web build to $FULL_WEB_ZIP"
+
+      - name: Build Flutter Web (CDN)
+        working-directory: ./src/premium/quicproxy_flutter
+        run: |
+          rm -rf build/web
+          flutter build web --release --web-resources-cdn
+          rm -rf build/web/canvaskit
+          rm -f build/web/version.json build/web/.last_build_id
+          du -sh build/web
+
+      - name: Package Flutter Web (CDN)
+        run: |
+          CDN_WEB_DIR="src/premium/quicproxy_flutter/build/web"
+          CDN_WEB_ZIP="QuicProxy-Web-CDN.zip"
+          if [ ! -f "$CDN_WEB_DIR/index.html" ]; then
+            echo "CDN web build output not found at $CDN_WEB_DIR"
+            exit 1
+          fi
+          (
+            cd "$CDN_WEB_DIR"
+            zip -qr "$GITHUB_WORKSPACE/$CDN_WEB_ZIP" .
+          )
+          echo "CDN_WEB_PATH=$GITHUB_WORKSPACE/$CDN_WEB_ZIP" >> $GITHUB_ENV
+          echo "✓ Packaged CDN web build to $CDN_WEB_ZIP"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quicproxy-flutter-web-full
+          path: ${{ env.FULL_WEB_PATH }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quicproxy-flutter-web-cdn
+          path: ${{ env.CDN_WEB_PATH }}
+          if-no-files-found: error
+
   build-web:
     name: Web (Docusaurus)
-    needs: [build-linux, build-linux-arm64, build-linux-arm32, build-windows, build-android]
+    needs: [build-linux, build-linux-arm64, build-linux-arm32, build-windows, build-android, build-flutter-web]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -408,6 +512,16 @@ jobs:
           name: quicproxy-flutter-android
           path: src/premium/web/static/assets
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-flutter-web-full
+          path: src/premium/web/static/assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-flutter-web-cdn
+          path: src/premium/web/static/assets
+
       - name: List web download assets
         run: ls -la src/premium/web/static/assets/
 
@@ -433,6 +547,8 @@ jobs:
             "assets": [
               { "platform": "Windows", "file": "QuicProxy-Windows-Setup.exe", "type": "installer" },
               { "platform": "Android", "file": "QuicProxy-Android.apk", "type": "apk" },
+              { "platform": "Web (Full)", "file": "QuicProxy-Web-Full.zip", "type": "web" },
+              { "platform": "Web (CDN)", "file": "QuicProxy-Web-CDN.zip", "type": "web" },
               { "platform": "Linux x64", "file": "quicproxy-core-linux-x64.tar.gz", "type": "core" },
               { "platform": "Linux arm64", "file": "quicproxy-core-linux-arm64.tar.gz", "type": "core" },
               { "platform": "Linux arm32", "file": "quicproxy-core-linux-arm32.tar.gz", "type": "core" },
@@ -577,7 +693,7 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [build-linux, build-linux-arm64, build-linux-arm32, build-windows, build-android, build-web]
+    needs: [build-linux, build-linux-arm64, build-linux-arm32, build-windows, build-android, build-flutter-web, build-web]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -611,6 +727,16 @@ jobs:
           name: quicproxy-flutter-android
           path: release-assets
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-flutter-web-full
+          path: release-assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: quicproxy-flutter-web-cdn
+          path: release-assets
+
       - name: List release assets
         run: |
           echo "Release assets:"
@@ -626,6 +752,8 @@ jobs:
             release-assets/quicproxy-core-windows-x64.zip
             release-assets/QuicProxy-Windows-Setup.exe
             release-assets/QuicProxy-Android.apk
+            release-assets/QuicProxy-Web-Full.zip
+            release-assets/QuicProxy-Web-CDN.zip
           generate_release_notes: true
           name: QuicProxy ${{ github.ref_name }}
           body: |
@@ -636,6 +764,8 @@ jobs:
             |---|---|
             | 🖥️ Windows | `QuicProxy-Windows-Setup.exe` |
             | 📱 Android | `QuicProxy-Android.apk` |
+            | 🌐 Web 全量版 | `QuicProxy-Web-Full.zip` |
+            | 🌐 Web CDN 版 | `QuicProxy-Web-CDN.zip` |
             | 🐧 Linux x64 | `quicproxy-core-linux-x64.tar.gz` |
             | 🐧 Linux arm64 | `quicproxy-core-linux-arm64.tar.gz` |
             | 🐧 Linux arm32 | `quicproxy-core-linux-arm32.tar.gz` |
