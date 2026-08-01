@@ -20,7 +20,7 @@ use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
-    sync::Mutex,
+    sync::{Mutex, mpsc::error::TryRecvError},
 };
 use tokio_rustls::{TlsConnector, rustls};
 use tokio_util::sync::PollSender;
@@ -436,8 +436,8 @@ impl Session {
                     Ok((stream_id, cmd, data)) => {
                         append_frame(&mut buffer, cmd, stream_id, &data)?;
                     }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
                         channel_closed = true;
                         break;
                     }

@@ -1,5 +1,7 @@
 # Linux 客户端安装
 
+[简体中文](./linux.md) | [English](./linux_en.md)
+
 在本地 Linux 设备上一键安装 QuicProxy，通过 Web UI 管理代理。
 
 > 支持 **systemd** 和 **init.d** (SysV)，自动检测 CPU 架构 (x64 / arm64 / arm32)。

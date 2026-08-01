@@ -1,5 +1,7 @@
 # 自建节点
 
+[简体中文](./server.md) | [English](./server_en.md)
+
 在 VPS 上搭建 QuicProxy 节点，生成订阅链接供客户端使用。
 
 ---

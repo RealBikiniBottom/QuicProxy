@@ -151,7 +151,7 @@ async fn async_main() -> Result<()> {
     if elevate::is_elevated() {
         info!("Running with elevated privileges");
     } else {
-        debug!("Running without elevated privileges");
+        info!("Running without elevated privileges");
     }
 
     if let Err(e) = bootstrap::run_with_signal(config, async {

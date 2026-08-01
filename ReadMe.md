@@ -4,6 +4,10 @@
   <sup>高性能、低内存、零延迟、安全且简单易用的开源游戏加速器</sup>
 </div>
 
+<p align="center">
+  <strong>简体中文</strong> | <a href="./ReadMe_EN.md">English</a>
+</p>
+
 # 点击下载，开箱即用
 
 |      平台      | 下载                                                                                                                | 说明                                                       |
