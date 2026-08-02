@@ -6,12 +6,15 @@ set -euo pipefail
 #
 # 用法:
 #   curl -fsSL https://raw.githubusercontent.com/.../linux_install.sh | sudo bash -s -- --password mypass
+#   curl -fsSL https://raw.githubusercontent.com/.../linux_install.sh | sudo bash -s -- --password mypass --web-ui with
 #
 # 特性:
 #   - 自动检测 CPU 架构 (x86_64 / aarch64 / armv7l)
 #   - 同时支持 systemd 和 init.d (SysV)
 #   - 以 --manage 模式运行，暴露管理 API + 反向代理
-#   - 可选的 Web UI (通过 --web-dir 指定 Flutter Web 产物目录)
+#   - 支持用户选择安装带 Web UI 或不带 Web UI 的版本
+#   - 无论是否带 Web UI，都统一通过 systemd / init.d 管理
+#   - 支持通过 --web-dir 指定已有的 Flutter Web 产物目录
 # ────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'
@@ -25,20 +28,26 @@ NC='\033[0m'
 REPO="RealBikiniBottom/QuicProxy"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases/latest"
 INSTALL_DIR="/opt/quicproxy"
-BIN_PATH="${INSTALL_DIR}/quicproxy"
+CORE_DIR="${INSTALL_DIR}/core"
+DEFAULT_WEB_DIR="${INSTALL_DIR}/web"
+BIN_PATH="${CORE_DIR}/quicproxy"
 CONFIG_PATH="${INSTALL_DIR}/config.json"
-PERSIST_PATH="${INSTALL_DIR}/persist.json"
 SERVICE_NAME="quicproxy"
 SYSTEMD_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 INITD_FILE="/etc/init.d/${SERVICE_NAME}"
+WEB_ASSET_NAME="QuicProxy-Web-Full.zip"
+CORE_MIN_FREE_BYTES=$((120 * 1024 * 1024))
+WEB_MIN_FREE_BYTES=$((200 * 1024 * 1024))
 
 # 用户可覆盖
 PASSWORD="${PASSWORD:-}"
 PORT="${PORT:-8080}"
 WEB_DIR="${WEB_DIR:-}"
+WEB_UI_MODE="${WEB_UI_MODE:-ask}"
 VERSION="${VERSION:-}"
 WORK_DIR="${WORK_DIR:-${INSTALL_DIR}}"
 HOST="${HOST:-0.0.0.0}"
+PERSIST_PATH="${WORK_DIR}/persist.json"
 
 TMPDIR=""
 
@@ -81,6 +90,223 @@ check_deps() {
     log_info "OpenWrt:        opkg install curl tar"
     exit 1
   fi
+}
+
+has_zip_extractor() {
+  command -v unzip &>/dev/null || command -v bsdtar &>/dev/null
+}
+
+bytes_to_human() {
+  local bytes="${1:-0}"
+  awk -v bytes="$bytes" '
+    function human(x, i, units) {
+      split("B KiB MiB GiB TiB", units, " ")
+      i = 1
+      while (x >= 1024 && i < 5) {
+        x /= 1024
+        i++
+      }
+      return sprintf("%.1f %s", x, units[i])
+    }
+    BEGIN {
+      print human(bytes)
+    }
+  '
+}
+
+get_free_bytes() {
+  local target_path="$1"
+  df -Pk "$target_path" 2>/dev/null | awk 'NR==2 {print $4 * 1024}'
+}
+
+build_release_download_url() {
+  local asset_name="$1"
+
+  if [[ -n "${VERSION:-}" ]]; then
+    echo "https://github.com/${REPO}/releases/download/${VERSION}/${asset_name}"
+  else
+    echo "https://github.com/${REPO}/releases/latest/download/${asset_name}"
+  fi
+}
+
+get_remote_file_size() {
+  local url="$1"
+  local content_length
+
+  content_length=$(curl -fsSLI --connect-timeout 10 --max-time 30 "$url" 2>/dev/null \
+    | tr -d '\r' \
+    | awk 'BEGIN{IGNORECASE=1} /^content-length:/ {print $2}' \
+    | tail -1)
+
+  if [[ ! "$content_length" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+
+  echo "$content_length"
+}
+
+extract_zip_to_dir() {
+  local zip_file="$1"
+  local dest_dir="$2"
+
+  mkdir -p "$dest_dir"
+
+  if command -v unzip &>/dev/null; then
+    unzip -oq "$zip_file" -d "$dest_dir"
+  elif command -v bsdtar &>/dev/null; then
+    bsdtar -xf "$zip_file" -C "$dest_dir"
+  else
+    return 1
+  fi
+}
+
+normalize_web_ui_mode() {
+  case "${WEB_UI_MODE}" in
+    ask|with|without)
+      ;;
+    true|yes|y|1)
+      WEB_UI_MODE="with"
+      ;;
+    false|no|n|0)
+      WEB_UI_MODE="without"
+      ;;
+    *)
+      log_error "无效的 WEB_UI_MODE: ${WEB_UI_MODE}"
+      log_info "支持的值: ask, with, without"
+      exit 1
+      ;;
+  esac
+}
+
+prompt_web_ui_mode() {
+  if [[ "$WEB_UI_MODE" != "ask" ]]; then
+    return
+  fi
+
+  if [[ -n "$WEB_DIR" ]]; then
+    WEB_UI_MODE="with"
+    return
+  fi
+
+  log_step "选择安装模式..."
+  echo "  1) 带 Web UI（下载并启用内置 Web 管理界面）"
+  echo "  2) 不带 Web UI（仅安装 Core 管理服务）"
+
+  if [[ -r /dev/tty ]]; then
+    local choice=""
+    while true; do
+      read -r -p "请选择 [1/2] (默认 1): " choice </dev/tty
+      choice="${choice:-1}"
+      case "$choice" in
+        1)
+          WEB_UI_MODE="with"
+          break
+          ;;
+        2)
+          WEB_UI_MODE="without"
+          break
+          ;;
+        *)
+          log_warn "请输入 1 或 2"
+          ;;
+      esac
+    done
+  else
+    WEB_UI_MODE="without"
+    log_warn "当前不是交互式终端，默认安装不带 Web UI 的版本"
+    log_warn "如需带 Web UI，请显式传入: --web-ui with"
+  fi
+}
+
+calculate_required_install_bytes() {
+  local asset_size_bytes="$1"
+  local min_free_bytes="$2"
+  local required_bytes=$((asset_size_bytes * 4))
+
+  if (( required_bytes < min_free_bytes )); then
+    required_bytes=$min_free_bytes
+  fi
+
+  echo "$required_bytes"
+}
+
+check_install_space() {
+  log_step "检查安装空间..."
+
+  mkdir -p "$INSTALL_DIR"
+
+  local free_bytes
+  free_bytes=$(get_free_bytes "$INSTALL_DIR") || {
+    log_error "无法检测 ${INSTALL_DIR} 所在分区的剩余空间"
+    exit 1
+  }
+
+  local core_url
+  core_url=$(build_release_download_url "quicproxy-core-${ARCH_TARGET}.tar.gz")
+
+  local core_size_bytes
+  core_size_bytes=$(get_remote_file_size "$core_url") || {
+    log_error "无法获取 Core 安装包大小，无法继续安装"
+    exit 1
+  }
+
+  local core_required_bytes
+  core_required_bytes=$(calculate_required_install_bytes "$core_size_bytes" "$CORE_MIN_FREE_BYTES")
+
+  local total_required_bytes="$core_required_bytes"
+
+  log_info "Core 包大小: $(bytes_to_human "$core_size_bytes")"
+  log_info "Core 预留空间: $(bytes_to_human "$core_required_bytes")"
+
+  if [[ "$WEB_UI_MODE" == "with" ]] && [[ -z "$WEB_DIR" ]]; then
+    local web_url
+    web_url=$(build_release_download_url "${WEB_ASSET_NAME}")
+
+    local web_size_bytes
+    web_size_bytes=$(get_remote_file_size "$web_url") || {
+      log_error "无法获取 Web UI 安装包大小，无法继续安装"
+      exit 1
+    }
+
+    local web_required_bytes
+    web_required_bytes=$(calculate_required_install_bytes "$web_size_bytes" "$WEB_MIN_FREE_BYTES")
+    total_required_bytes=$((total_required_bytes + web_required_bytes))
+
+    log_info "Web UI 包大小: $(bytes_to_human "$web_size_bytes")"
+    log_info "Web UI 预留空间: $(bytes_to_human "$web_required_bytes")"
+  fi
+
+  log_info "当前可用空间: $(bytes_to_human "$free_bytes")"
+  log_info "总预留空间: $(bytes_to_human "$total_required_bytes")"
+
+  if (( free_bytes < total_required_bytes )); then
+    log_error "磁盘空间不足，无法继续安装"
+    log_error "当前可用: $(bytes_to_human "$free_bytes")，至少需要: $(bytes_to_human "$total_required_bytes")"
+    exit 1
+  fi
+}
+
+check_existing_installation() {
+  log_step "检查已有安装..."
+
+  local current_bin=""
+  if [[ -f "$BIN_PATH" ]]; then
+    current_bin="$BIN_PATH"
+  elif [[ -f "${INSTALL_DIR}/quicproxy" ]]; then
+    current_bin="${INSTALL_DIR}/quicproxy"
+  fi
+
+  if [[ -z "$current_bin" ]]; then
+    log_info "未检测到已有安装，将执行全新安装"
+    return
+  fi
+
+  local current_version
+  current_version=$("$current_bin" --version 2>/dev/null || echo "unknown")
+
+  log_info "检测到已安装版本: ${current_version}"
+  log_info "目标安装版本: ${TAG_NAME}"
+  log_info "将执行覆盖安装并自动更新现有文件"
 }
 
 # ──────────────────────────────────────────────
@@ -150,11 +376,7 @@ download_and_install() {
   log_step "下载 QuicProxy (${ARCH_TARGET})..."
 
   local download_url
-  if [[ -n "${VERSION:-}" ]]; then
-    download_url="https://github.com/${REPO}/releases/download/${VERSION}/quicproxy-core-${ARCH_TARGET}.tar.gz"
-  else
-    download_url="https://github.com/${REPO}/releases/latest/download/quicproxy-core-${ARCH_TARGET}.tar.gz"
-  fi
+  download_url=$(build_release_download_url "quicproxy-core-${ARCH_TARGET}.tar.gz")
 
   local tarball="${TMPDIR}/quicproxy.tar.gz"
 
@@ -172,15 +394,22 @@ download_and_install() {
   fi
 
   # 备份旧版本
+  local current_bin=""
   if [[ -f "$BIN_PATH" ]]; then
-    local old_version
-    old_version=$("$BIN_PATH" --version 2>/dev/null || echo "unknown")
-    log_info "备份旧版本 (${old_version})..."
-    cp "$BIN_PATH" "${BIN_PATH}.bak.$(date +%s)" 2>/dev/null || true
+    current_bin="$BIN_PATH"
+  elif [[ -f "${INSTALL_DIR}/quicproxy" ]]; then
+    current_bin="${INSTALL_DIR}/quicproxy"
   fi
 
-  mkdir -p "$INSTALL_DIR"
-  tar xzf "$tarball" -C "$INSTALL_DIR" --overwrite || {
+  if [[ -n "$current_bin" ]]; then
+    local old_version
+    old_version=$("$current_bin" --version 2>/dev/null || echo "unknown")
+    log_info "备份旧版本 (${old_version})..."
+    cp "$current_bin" "${current_bin}.bak.$(date +%s)" 2>/dev/null || true
+  fi
+
+  mkdir -p "$INSTALL_DIR" "$CORE_DIR"
+  tar xzf "$tarball" -C "$CORE_DIR" --overwrite || {
     log_error "解压失败"
     exit 1
   }
@@ -189,6 +418,63 @@ download_and_install() {
   local installed_version
   installed_version=$("$BIN_PATH" --version 2>/dev/null || echo "unknown")
   log_info "安装完成: ${installed_version}"
+}
+
+setup_web_ui() {
+  if [[ "$WEB_UI_MODE" == "without" ]]; then
+    log_info "已选择不安装 Web UI"
+    return
+  fi
+
+  if [[ -n "$WEB_DIR" ]]; then
+    if [[ -d "$WEB_DIR" ]]; then
+      log_info "使用指定的 Web UI 目录: ${WEB_DIR}"
+      return
+    fi
+    log_error "指定的 Web UI 目录不存在: ${WEB_DIR}"
+    exit 1
+  fi
+
+  log_step "安装 Web UI..."
+
+  if ! has_zip_extractor; then
+    log_error "未找到 unzip 或 bsdtar，无法自动解压 Web UI"
+    exit 1
+  fi
+
+  mkdir -p "$INSTALL_DIR"
+
+  local web_url
+  web_url=$(build_release_download_url "${WEB_ASSET_NAME}")
+
+  local web_zip="${TMPDIR}/${WEB_ASSET_NAME}"
+  local web_staging_dir="${TMPDIR}/web"
+
+  log_info "下载 Web UI: ${web_url}"
+  if ! curl -fSL --connect-timeout 10 --max-time 600 -o "$web_zip" "$web_url"; then
+    log_error "Web UI 下载失败，无法继续安装"
+    exit 1
+  fi
+
+  rm -rf "$web_staging_dir"
+  if ! extract_zip_to_dir "$web_zip" "$web_staging_dir"; then
+    log_error "Web UI 解压失败，无法继续安装"
+    exit 1
+  fi
+
+  if [[ ! -f "${web_staging_dir}/index.html" ]]; then
+    log_error "Web UI 内容不完整，未发现 index.html"
+    exit 1
+  fi
+
+  rm -rf "$DEFAULT_WEB_DIR"
+  if ! mv "$web_staging_dir" "$DEFAULT_WEB_DIR"; then
+    log_error "无法将 Web UI 安装到 ${DEFAULT_WEB_DIR}"
+    exit 1
+  fi
+  WEB_DIR="$DEFAULT_WEB_DIR"
+
+  log_info "Web UI 已安装到: ${WEB_DIR}"
 }
 
 # ──────────────────────────────────────────────
@@ -281,7 +567,7 @@ install_systemd() {
   [[ -n "$PORT" ]] && exec_start="${exec_start} --port ${PORT}"
   [[ -n "$HOST" ]] && exec_start="${exec_start} --host ${HOST}"
   [[ -n "$WORK_DIR" ]] && exec_start="${exec_start} --work-dir ${WORK_DIR}"
-  [[ -f "${WORK_DIR}/persist.json" ]] && exec_start="${exec_start} --persist-file ${WORK_DIR}/persist.json"
+  [[ -f "${PERSIST_PATH}" ]] && exec_start="${exec_start} --persist-file ${PERSIST_PATH}"
 
   # Web UI 可选
   if [[ -n "$WEB_DIR" ]] && [[ -d "$WEB_DIR" ]]; then
@@ -326,15 +612,11 @@ UNITEOF
 install_initd() {
   log_step "安装 init.d 服务..."
 
-  local exec_start="${BIN_PATH} --manage"
-  [[ -n "$PASSWORD" ]] && exec_start="${exec_start} --password \"${PASSWORD}\""
-  [[ -n "$PORT" ]] && exec_start="${exec_start} --port ${PORT}"
-  [[ -n "$HOST" ]] && exec_start="${exec_start} --host ${HOST}"
-  [[ -n "$WORK_DIR" ]] && exec_start="${exec_start} --work-dir ${WORK_DIR}"
-  [[ -f "${WORK_DIR}/persist.json" ]] && exec_start="${exec_start} --persist-file ${WORK_DIR}/persist.json"
+  local daemon_args="--manage --password ${PASSWORD} --port ${PORT} --host ${HOST} --work-dir ${WORK_DIR}"
+  [[ -f "${PERSIST_PATH}" ]] && daemon_args="${daemon_args} --persist-file ${PERSIST_PATH}"
 
   if [[ -n "$WEB_DIR" ]] && [[ -d "$WEB_DIR" ]]; then
-    exec_start="${exec_start} --web-dir ${WEB_DIR}"
+    daemon_args="${daemon_args} --web-dir ${WEB_DIR}"
   fi
 
   cat > "$INITD_FILE" << INITEOF
@@ -353,7 +635,7 @@ PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 NAME="${SERVICE_NAME}"
 DESC="QuicProxy Client"
 DAEMON="${BIN_PATH}"
-DAEMON_ARGS="--manage --password ${PASSWORD} --port ${PORT} --host ${HOST} --work-dir ${WORK_DIR}"
+DAEMON_ARGS="${daemon_args}"
 PIDFILE="/var/run/\${NAME}.pid"
 
 test -x \${DAEMON} || exit 0
@@ -456,15 +738,19 @@ print_success() {
   echo ""
   echo -e "  ${CYAN}管理面板:${NC} http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_IP"):${PORT}"
   echo -e "  ${CYAN}API 密码:${NC}  ${PASSWORD}"
+  echo -e "  ${CYAN}Core 目录:${NC} ${CORE_DIR}"
   echo -e "  ${CYAN}配置文件:${NC} ${CONFIG_PATH}"
   echo -e "  ${CYAN}持久化数据:${NC} ${PERSIST_PATH}"
+  echo -e "  ${CYAN}安装模式:${NC} ${WEB_UI_MODE}"
   echo ""
 
   if [[ -d "${WEB_DIR:-}" ]]; then
     echo -e "  ${CYAN}Web UI:${NC}   已启用 (${WEB_DIR})"
+  elif [[ "${WEB_UI_MODE}" == "without" ]]; then
+    echo -e "  ${YELLOW}Web UI:${NC}   未启用（已按选择安装为不带 Web UI）"
   else
-    echo -e "  ${YELLOW}Web UI:${NC}   未启用。如需 Web 管理界面，请设置 WEB_DIR 重新安装"
-    echo -e "              WEB_DIR=/path/to/web 重新运行本脚本"
+    echo -e "  ${YELLOW}Web UI:${NC}   未启用（本次选择了带 Web UI，但下载或解压未成功）"
+    echo -e "              可使用 --web-ui with 或 --web-dir /path/to/web 重新运行本脚本"
   fi
 
   echo ""
@@ -501,26 +787,37 @@ print_banner() {
   echo -e "${NC}"
 }
 
+refresh_runtime_paths() {
+  PERSIST_PATH="${WORK_DIR}/persist.json"
+}
+
 # ──────────────────────────────────────────────
 # 主流程
 # ──────────────────────────────────────────────
 
 main() {
   TMPDIR=$(mktemp -d)
+  refresh_runtime_paths
 
   print_banner
 
   check_root
   check_deps
+  normalize_web_ui_mode
+  prompt_web_ui_mode
   detect_arch
   detect_latest_version
+  check_existing_installation
+  check_install_space
 
   log_info "安装目录: ${INSTALL_DIR}"
+  log_info "Core 目录: ${CORE_DIR}"
   log_info "架构:      ${ARCH_TARGET}"
   log_info "端口:      ${PORT}"
 
   stop_existing
   download_and_install
+  setup_web_ui
   generate_manage_config
   detect_and_install_service
   print_success
@@ -537,6 +834,8 @@ while [[ $# -gt 0 ]]; do
       PORT="$2"; shift 2 ;;
     --host)
       HOST="$2"; shift 2 ;;
+    --web-ui)
+      WEB_UI_MODE="$2"; shift 2 ;;
     --web-dir)
       WEB_DIR="$2"; shift 2 ;;
     --work-dir)
@@ -545,7 +844,7 @@ while [[ $# -gt 0 ]]; do
       VERSION="$2"; shift 2 ;;
     *)
       log_error "未知参数: $1"
-      echo "用法: sudo bash linux_install.sh [--password PASS] [--port 8080] [--web-dir /path] [--version v1.0.0]"
+      echo "用法: sudo bash linux_install.sh [--password PASS] [--port 8080] [--host 0.0.0.0] [--web-ui ask|with|without] [--web-dir /path] [--work-dir /path] [--version v1.0.0]"
       exit 1
       ;;
   esac
