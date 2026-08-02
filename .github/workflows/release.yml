@@ -408,9 +408,7 @@ jobs:
       - name: Build Flutter Web (Full)
         working-directory: ./src/premium/quicproxy_flutter
         run: |
-          rm -rf build/web
-          flutter build web --release
-          du -sh build/web
+          make build_web_full
 
       - name: Package Flutter Web (Full)
         run: |
@@ -430,11 +428,7 @@ jobs:
       - name: Build Flutter Web (CDN)
         working-directory: ./src/premium/quicproxy_flutter
         run: |
-          rm -rf build/web
-          flutter build web --release --web-resources-cdn
-          rm -rf build/web/canvaskit
-          rm -f build/web/version.json build/web/.last_build_id
-          du -sh build/web
+          make build_web_cdn
 
       - name: Package Flutter Web (CDN)
         run: |
@@ -465,7 +459,15 @@ jobs:
 
   build-web:
     name: Web (Docusaurus)
-    needs: [build-linux, build-linux-arm64, build-linux-arm32, build-windows, build-android, build-flutter-web]
+    needs:
+      [
+        build-linux,
+        build-linux-arm64,
+        build-linux-arm32,
+        build-windows,
+        build-android,
+        build-flutter-web,
+      ]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -731,7 +733,16 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [build-linux, build-linux-arm64, build-linux-arm32, build-windows, build-android, build-flutter-web, build-web]
+    needs:
+      [
+        build-linux,
+        build-linux-arm64,
+        build-linux-arm32,
+        build-windows,
+        build-android,
+        build-flutter-web,
+        build-web,
+      ]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
