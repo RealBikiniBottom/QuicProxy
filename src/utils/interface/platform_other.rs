@@ -25,10 +25,6 @@ pub(super) fn set_dns(_iface: &InterfaceInfo, _dns: &[IpAddr]) -> io::Result<()>
     Err(new_io_other_error("Platform not supported"))
 }
 
-pub(super) fn get_dns(_iface: &InterfaceInfo) -> io::Result<Vec<IpAddr>> {
-    Err(new_io_other_error("Platform not supported"))
-}
-
 pub(super) fn restore_dns(_iface: &InterfaceInfo) -> io::Result<()> {
     Err(new_io_other_error("Platform not supported"))
 }

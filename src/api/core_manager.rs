@@ -326,6 +326,17 @@ impl CoreManager {
             .map_err(std::io::Error::other)?
     }
 
+    /// 清空 core 日志文件和 manage 模式的内存日志。
+    pub async fn clear_logs(&self) -> std::io::Result<()> {
+        let log_path = self.log_file_path().await;
+        tokio::task::spawn_blocking(move || truncate_log_file(&log_path))
+            .await
+            .map_err(std::io::Error::other)??;
+
+        self.inner.logs.lock().await.clear();
+        Ok(())
+    }
+
     async fn log_file_path(&self) -> PathBuf {
         let configured_path = self
             .inner
@@ -383,6 +394,18 @@ fn read_log_from(path: &std::path::Path, position: u64) -> std::io::Result<CoreL
     })
 }
 
+fn truncate_log_file(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +430,30 @@ mod tests {
         let second_read = manager.read_log(first_read.position).await.unwrap();
         assert_eq!(second_read.content, "second\n");
         assert!(second_read.position > first_read.position);
+    }
+
+    #[tokio::test]
+    async fn clear_logs_truncates_active_file_and_clears_buffer() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = CoreManager::new("quicproxy".into(), temp_dir.path().to_path_buf());
+        let log_path = temp_dir.path().join("quicproxy.log");
+        std::fs::write(&log_path, "before clear\n").unwrap();
+
+        let mut active_writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        manager.push_log("buffered log".into());
+
+        manager.clear_logs().await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");
+        assert!(manager.get_logs(None).await.is_empty());
+
+        write!(active_writer, "after clear\n").unwrap();
+        active_writer.flush().unwrap();
+        let result = manager.read_log(0).await.unwrap();
+        assert_eq!(result.content, "after clear\n");
     }
 }
 

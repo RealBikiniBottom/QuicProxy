@@ -59,55 +59,6 @@ pub(super) fn set_dns(iface: &InterfaceInfo, dns: &[IpAddr]) -> io::Result<()> {
     ))
 }
 
-pub(super) fn get_dns(iface: &InterfaceInfo) -> io::Result<Vec<IpAddr>> {
-    let interface_name = &iface.name;
-    if Command::new("resolvectl").arg("--version").output().is_ok() {
-        let output = Command::new("resolvectl")
-            .args(&["dns", interface_name])
-            .output()?;
-
-        if output.status.success() {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            let mut dns_servers = Vec::new();
-            if let Some(idx) = output_str.find(':') {
-                let ips_str = &output_str[idx + 1..];
-                for part in ips_str.split_whitespace() {
-                    if let Ok(ip) = part.parse::<IpAddr>() {
-                        dns_servers.push(ip);
-                    }
-                }
-            }
-            return Ok(dns_servers);
-        }
-    }
-
-    if Command::new("nmcli").arg("--version").output().is_ok() {
-        let output = Command::new("nmcli")
-            .args(&["dev", "show", interface_name])
-            .output()?;
-
-        if output.status.success() {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            let mut dns_servers = Vec::new();
-            for line in output_str.lines() {
-                if line.contains("IP4.DNS") {
-                    if let Some(idx) = line.find(':') {
-                        let val = line[idx + 1..].trim();
-                        if let Ok(ip) = val.parse::<IpAddr>() {
-                            dns_servers.push(ip);
-                        }
-                    }
-                }
-            }
-            return Ok(dns_servers);
-        }
-    }
-
-    Err(new_io_other_error(
-        "No supported DNS management tool found (resolvectl, nmcli)",
-    ))
-}
-
 pub(super) fn restore_dns(iface: &InterfaceInfo) -> io::Result<()> {
     let interface_name = &iface.name;
     if Command::new("resolvectl").arg("--version").output().is_ok() {

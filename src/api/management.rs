@@ -35,7 +35,10 @@ pub fn router() -> Router<ManagementState> {
         .route("/api/core/restart", post(handle_core_restart))
         .route("/api/core/status", get(handle_core_status))
         .route("/api/core/workspace", get(handle_core_workspace))
-        .route("/api/core/logs", get(handle_core_logs))
+        .route(
+            "/api/core/logs",
+            get(handle_core_logs).delete(handle_core_clear_logs),
+        )
 }
 
 // ─── Handlers ───
@@ -200,4 +203,19 @@ async fn handle_core_logs(
 
     let logs = state.core_manager.get_logs(Some(query.tail)).await;
     Ok(Json(json!({ "logs": logs })))
+}
+
+async fn handle_core_clear_logs(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    check_auth(&headers, &state.password)?;
+
+    match state.core_manager.clear_logs().await {
+        Ok(()) => Ok(Json(json!({ "status": "cleared" }))),
+        Err(error) => {
+            error!("Failed to clear core logs: {}", error);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }

@@ -62,34 +62,6 @@ pub(super) fn set_dns(iface: &InterfaceInfo, dns: &[IpAddr]) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn get_dns(iface: &InterfaceInfo) -> io::Result<Vec<IpAddr>> {
-    let service_name = get_macos_service_name(&iface.name)
-        .ok_or_else(|| new_io_other_error(format!("Service name for {} not found", iface.name)))?;
-
-    let output = Command::new("networksetup")
-        .args(&["-getdnsservers", &service_name])
-        .output()?;
-
-    if !output.status.success() {
-        return Err(new_io_other_error(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-
-    let output_str = String::from_utf8_lossy(&output.stdout);
-    let mut dns_servers = Vec::new();
-    for line in output_str.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("There aren't any DNS Servers") {
-            continue;
-        }
-        if let Ok(ip) = line.parse::<IpAddr>() {
-            dns_servers.push(ip);
-        }
-    }
-    Ok(dns_servers)
-}
-
 pub(super) fn restore_dns(iface: &InterfaceInfo) -> io::Result<()> {
     let service_name = get_macos_service_name(&iface.name)
         .ok_or_else(|| new_io_other_error(format!("Service name for {} not found", iface.name)))?;

@@ -20,8 +20,8 @@ use hashbrown::HashMap;
 use hyper::http::Method;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use sysinfo::{Disks, System};
+use std::sync::Arc;
+use sysinfo::System;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info};
 
@@ -35,23 +35,6 @@ pub struct CoreApiState {
     pub observer: Arc<Observer>,
     pub router: Arc<crate::proxy::router::Router>,
     pub shutdown_tx: Sender<()>,
-}
-
-#[derive(Clone)]
-struct CoreVersionApiState {
-    password: String,
-    system: Arc<Mutex<System>>,
-    disks: Arc<Mutex<Disks>>,
-}
-
-impl CoreVersionApiState {
-    fn new(password: String) -> Self {
-        Self {
-            password,
-            system: Arc::new(Mutex::new(System::new_all())),
-            disks: Arc::new(Mutex::new(Disks::new_with_refreshed_list())),
-        }
-    }
 }
 
 // ─── Router 构建 ───
@@ -577,98 +560,6 @@ async fn get_runtime_core_version(
     Ok(Json(build_core_version_response(&system)))
 }
 
-async fn get_core_version(
-    State(state): State<CoreVersionApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
-    let mut system = state.system.lock().unwrap();
-    system.refresh_memory();
-
-    Ok(Json(build_core_version_response(&system)))
-}
-
-async fn get_system_info(
-    State(state): State<CoreVersionApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
-    let mut system = state.system.lock().unwrap();
-    system.refresh_memory();
-
-    Ok(Json(build_system_info(&system)))
-}
-
-async fn get_cpu_info(
-    State(state): State<CoreVersionApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
-    let mut system = state.system.lock().unwrap();
-    system.refresh_cpu_usage();
-
-    let cpus: Vec<CpuInfo> = system
-        .cpus()
-        .iter()
-        .map(|cpu| CpuInfo {
-            name: cpu.name().to_string(),
-            usage: cpu.cpu_usage(),
-            frequency: cpu.frequency(),
-        })
-        .collect();
-
-    let overall_usage = if cpus.is_empty() {
-        0.0
-    } else {
-        cpus.iter().map(|cpu| cpu.usage).sum::<f32>() / cpus.len() as f32
-    };
-
-    Ok(Json(CpuResponse {
-        cpus,
-        overall_usage,
-    }))
-}
-
-async fn get_memory_info(
-    State(state): State<CoreVersionApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
-    let mut system = state.system.lock().unwrap();
-    system.refresh_memory();
-
-    Ok(Json(build_memory_info(&system)))
-}
-
-async fn get_disk_info(
-    State(state): State<CoreVersionApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
-    let mut disks = state.disks.lock().unwrap();
-    disks.refresh(false);
-
-    let disk_list: Vec<DiskInfo> = disks
-        .iter()
-        .map(|disk| DiskInfo {
-            name: disk.name().to_string_lossy().to_string(),
-            mount_point: disk.mount_point().to_string_lossy().to_string(),
-            total: disk.total_space(),
-            available: disk.available_space(),
-            used: disk.total_space() - disk.available_space(),
-            kind: format!("{:?}", disk.kind()),
-            file_system: disk.file_system().to_string_lossy().to_string(),
-        })
-        .collect();
-
-    Ok(Json(DisksResponse { disks: disk_list }))
-}
-
 fn build_core_version_info() -> CoreVersionInfo {
     CoreVersionInfo {
         version: env!("CARGO_PKG_VERSION"),
@@ -735,19 +626,6 @@ struct SystemInfoResponse {
 }
 
 #[derive(Serialize)]
-struct CpuInfo {
-    name: String,
-    usage: f32,
-    frequency: u64,
-}
-
-#[derive(Serialize)]
-struct CpuResponse {
-    cpus: Vec<CpuInfo>,
-    overall_usage: f32,
-}
-
-#[derive(Serialize)]
 struct MemoryResponse {
     total: u64,
     used: u64,
@@ -756,22 +634,6 @@ struct MemoryResponse {
     swap_total: u64,
     swap_used: u64,
     swap_free: u64,
-}
-
-#[derive(Serialize)]
-struct DiskInfo {
-    name: String,
-    mount_point: String,
-    total: u64,
-    available: u64,
-    used: u64,
-    kind: String,
-    file_system: String,
-}
-
-#[derive(Serialize)]
-struct DisksResponse {
-    disks: Vec<DiskInfo>,
 }
 
 #[derive(Serialize)]

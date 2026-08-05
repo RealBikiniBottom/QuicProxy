@@ -9,7 +9,6 @@ use axum::{Router, response::Json, routing::get};
 use clap::Parser;
 use quicproxy::api::{
     common::cors_middleware,
-    core_api,
     core_manager::CoreManager,
     management::{self, ManagementState},
     persist_handler::{self, PersistHandlerState},
