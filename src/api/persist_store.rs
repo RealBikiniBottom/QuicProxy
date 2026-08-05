@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tracing::{info, warn};
 
 /// 持久化存储：内存 HashMap + 可选文件持久化
@@ -13,6 +14,7 @@ pub struct PersistStore {
 struct PersistStoreInner {
     data: DashMap<String, String>,
     file_path: Option<PathBuf>,
+    flush_lock: Mutex<()>,
 }
 
 impl PersistStore {
@@ -20,6 +22,7 @@ impl PersistStore {
         let inner = PersistStoreInner {
             data: DashMap::new(),
             file_path,
+            flush_lock: Mutex::new(()),
         };
         let store = Self {
             inner: std::sync::Arc::new(inner),
@@ -57,6 +60,14 @@ impl PersistStore {
 
     pub fn flush_to_disk(&self) {
         if let Some(ref path) = self.inner.file_path {
+            let _flush_guard = match self.inner.flush_lock.lock() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    warn!("PersistStore: failed to acquire flush lock: {}", e);
+                    return;
+                }
+            };
+
             let entries: Vec<(String, String)> = self
                 .inner
                 .data

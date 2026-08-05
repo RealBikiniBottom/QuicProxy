@@ -4,6 +4,7 @@
 
 use axum::{
     Router,
+    body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
@@ -13,7 +14,7 @@ use serde_json::json;
 use tracing::{error, warn};
 
 use super::common::check_auth;
-use super::core_manager::{CoreManager, SetConfigRequest, SetCorePathRequest};
+use super::core_manager::{CoreManager, SetConfigRequest, SetCorePathRequest, StartCoreRequest};
 
 // ─── State ───
 
@@ -68,10 +69,20 @@ async fn handle_core_set_path(
 async fn handle_core_start(
     State(state): State<ManagementState>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
     check_auth(&headers, &state.password)?;
 
-    match state.core_manager.start().await {
+    let request = if body.is_empty() {
+        StartCoreRequest::default()
+    } else {
+        serde_json::from_slice::<StartCoreRequest>(&body).map_err(|e| {
+            warn!("Invalid start payload: {}", e);
+            StatusCode::BAD_REQUEST
+        })?
+    };
+
+    match state.core_manager.start(request).await {
         Ok(()) => Ok(Json(json!({
             "status": "started",
             "pid": state.core_manager.status().pid,
@@ -110,7 +121,11 @@ async fn handle_core_restart(
 ) -> Result<impl IntoResponse, StatusCode> {
     check_auth(&headers, &state.password)?;
 
-    match state.core_manager.restart().await {
+    match state
+        .core_manager
+        .restart(StartCoreRequest::default())
+        .await
+    {
         Ok(()) => Ok(Json(json!({
             "status": "restarted",
             "pid": state.core_manager.status().pid,
@@ -156,6 +171,7 @@ async fn handle_core_workspace(
 struct LogsQuery {
     #[serde(default = "default_log_tail")]
     tail: usize,
+    position: Option<u64>,
 }
 
 fn default_log_tail() -> usize {
@@ -168,6 +184,19 @@ async fn handle_core_logs(
     axum::extract::Query(query): axum::extract::Query<LogsQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
     check_auth(&headers, &state.password)?;
+
+    if let Some(position) = query.position {
+        return match state.core_manager.read_log(position).await {
+            Ok(result) => Ok(Json(json!({
+                "content": result.content,
+                "position": result.position,
+            }))),
+            Err(error) => {
+                error!("Failed to read core log file: {}", error);
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
 
     let logs = state.core_manager.get_logs(Some(query.tail)).await;
     Ok(Json(json!({ "logs": logs })))

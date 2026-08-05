@@ -12,7 +12,7 @@ use axum::{
 use serde_json::json;
 
 use super::common::check_auth;
-use super::persist_store::PersistStore;
+use super::persist_store::{PersistStore, SetValueRequest};
 
 // ─── State ───
 
@@ -53,15 +53,10 @@ async fn handle_persist_put(
     State(state): State<PersistHandlerState>,
     headers: HeaderMap,
     Path(key): Path<String>,
-    Json(payload): Json<serde_json::Value>,
+    Json(payload): Json<SetValueRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     check_auth(&headers, &state.password)?;
-
-    let value = payload
-        .get("value")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| payload.to_string());
-    state.persist_store.set_and_flush(key, value);
+    state.persist_store.set_and_flush(key, payload.value);
     Ok(StatusCode::OK)
 }
 

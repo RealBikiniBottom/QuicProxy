@@ -103,7 +103,10 @@ async fn request_once_with_body(
         .method(method)
         .uri(path)
         .header("Host", host)
-        .header("User-Agent", user_agent.unwrap_or("quicproxy/sing-box/clash"))
+        .header(
+            "User-Agent",
+            user_agent.unwrap_or("quicproxy/sing-box/clash"),
+        )
         .header("Accept", "*/*")
         .header("Accept-Encoding", "identity")
         .header("Connection", "close")

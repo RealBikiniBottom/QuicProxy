@@ -10,14 +10,14 @@
 
 # Download And Start Right Away
 
-|    Platform     | Download                                                                                                             | Notes                                                              |
-| :-------------: | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| 🖥️ **Windows** | [⬇ Download Installer](https://github.com/RealBikiniBottom/QuicProxy/releases/latest/download/QuicProxy-Windows-Setup.exe) | `.exe` installer                                                   |
-| 📱 **Android** | [⬇ Download APK](https://github.com/RealBikiniBottom/QuicProxy/releases/latest/download/QuicProxy-Android.apk)          | `.apk` app                                                         |
-|   📱 **iOS**   | [⬇ App Store](https://apps.apple.com/us/app/quicproxy/id6775813506?l=zh-Hans-CN)                                        | Available only for Apple IDs outside mainland China                |
-|  🐧 **Linux**  | [Installation Guide](./doc/linux_en.md) and [Set Up Your Own Node](#set-up-your-own-node-in-3-steps)                   | Works on Linux with or without a GUI                               |
-| 🛜 **Router**  | See the [Installation Guide](./doc/linux_en.md)                                                                         | Includes a [Web Panel](https://github.com/spongebob888/quicboard) |
-|  🍎 **macOS**  | _Coming soon_                                                                                                           |                                                                    |
+|    Platform    | Download                                                                                                                    | Notes                                                             |
+| :------------: | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| 🖥️ **Windows** | [⬇ Download Installer](https://github.com/RealBikiniBottom/QuicProxy/releases/latest/download/QuicProxy-Windows-Setup.exe) | `.exe` installer                                                  |
+| 📱 **Android** | [⬇ Download APK](https://github.com/RealBikiniBottom/QuicProxy/releases/latest/download/QuicProxy-Android.apk)             | `.apk` app                                                        |
+|   📱 **iOS**   | [⬇ App Store](https://apps.apple.com/us/app/quicproxy/id6775813506?l=zh-Hans-CN)                                           | Available only for Apple IDs outside mainland China               |
+|  🐧 **Linux**  | [Installation Guide](./doc/linux_en.md) and [Set Up Your Own Node](#set-up-your-own-node-in-3-steps)                        | Works on Linux with or without a GUI                              |
+| 🛜 **Router**  | See the [Installation Guide](./doc/linux_en.md)                                                                             | Includes a [Web Panel](https://github.com/spongebob888/quicboard) |
+|  🍎 **macOS**  | _Coming soon_                                                                                                               |                                                                   |
 
 ## Easy To Use (Out Of The Box)
 
@@ -53,7 +53,7 @@ Inbound:
 - Tun
 - Shadowquic
 - AnyTLS
-<!-- - AnyTLS-JLS -->
+- AnyTLS-JLS
 - Trojan
 
 Outbound:
@@ -61,7 +61,7 @@ Outbound:
 - Shadowquic (recommended)
 - Socks5
 - AnyTLS
-<!-- - AnyTLS-JLS -->
+- AnyTLS-JLS
 - Trojan
 - Shadowsocks
 - Vmess
