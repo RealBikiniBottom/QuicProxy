@@ -101,19 +101,13 @@ impl TrojanInbound {
 
         let tls = TlsConfig::from_inbound(cfg)?;
 
-        let address: SocketAddr = format!(
-            "{}:{}",
-            cfg.address.clone().context("requires address")?,
-            cfg.port.context("requires port")?
-        )
-        .parse()
-        .context("Invalid address")?;
+        let address = cfg.socket_addr(&tag)?;
 
         Ok(Self {
             tag,
             password_hash,
             address,
-            idle_timeout: Duration::from_secs(cfg.idle_timeout.unwrap_or(30)),
+            idle_timeout: cfg.idle_timeout(),
             tls,
         })
     }

@@ -852,14 +852,7 @@ pub struct AnytlsOutbound {
 
 impl AnytlsOutbound {
     pub fn new(tag: String, cfg: &OutboundConfig) -> Result<Arc<dyn AnyOutbound>> {
-        let address = cfg
-            .address
-            .clone()
-            .context(format!("anytls outbound '{}' requires address", tag))?;
-        let port = cfg
-            .port
-            .context(format!("anytls outbound '{}' requires port", tag))?;
-        let address = TargetAddr::from_str2(&address, port)?;
+        let address = cfg.endpoint(&tag)?;
 
         let password = cfg
             .password
@@ -867,7 +860,7 @@ impl AnytlsOutbound {
             .context(format!("anytls outbound '{}' requires password", tag))?;
 
         let tls = TlsConfig::from_outbound(cfg)?;
-        let connect_timeout = Duration::from_secs(cfg.connect_timeout.unwrap_or(30));
+        let connect_timeout = cfg.connect_timeout();
 
         let client = AnytlsClient::new(
             address,

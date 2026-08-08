@@ -25,7 +25,7 @@ impl DnsOutbound {
             .clone()
             .context(format!("dns outbound '{}' requires dns", tag))?;
 
-        let connect_timeout = Duration::from_secs(cfg.connect_timeout.unwrap_or(30));
+        let connect_timeout = cfg.connect_timeout();
 
         Ok(Arc::new(Self {
             tag,

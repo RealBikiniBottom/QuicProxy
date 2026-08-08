@@ -25,22 +25,14 @@ pub struct Socks5Outbound {
 
 impl Socks5Outbound {
     pub fn new(tag: String, cfg: &OutboundConfig) -> Result<Arc<Self>> {
-        let address = cfg.address.clone().context(format!(
-            "shadowquic outbound '{}' requires address",
-            tag.clone()
-        ))?;
-        let port = cfg.port.context(format!(
-            "shadowquic outbound '{}' requires port",
-            tag.clone()
-        ))?;
-        let address = TargetAddr::from_str2(&address, port)?;
+        let address = cfg.endpoint(&tag)?;
 
         Ok(Arc::new(Self {
             tag,
             address,
             username: cfg.username.clone(),
             password: cfg.password.clone(),
-            connect_timeout: Duration::from_secs(cfg.connect_timeout.unwrap_or(30)),
+            connect_timeout: cfg.connect_timeout(),
             dns_server_name: cfg.dns.clone(),
             bind_interface: cfg.bind_interface.clone(),
         }))

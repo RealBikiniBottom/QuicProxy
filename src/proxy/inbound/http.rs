@@ -3,7 +3,6 @@ use crate::proxy::TargetAddr;
 use crate::proxy::inbound::{AnyInbound, create_tcp_listener, setup_system_proxy};
 use crate::proxy::router::get_router;
 use crate::utils::{PrefixedReadStream, format_duration, new_io_other_error, now};
-use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -43,17 +42,11 @@ impl HttpInbound {
             }]),
             _ => None,
         };
-        let addr: SocketAddr = format!(
-            "{}:{}",
-            cfg.address.clone().context("Required address")?,
-            cfg.port.context("Required port")?
-        )
-        .parse()
-        .context("failed to parse SocketAddr")?;
+        let addr = cfg.socket_addr(&tag)?;
 
         Ok(Self {
             tag,
-            idle_timeout: Duration::from_secs(cfg.idle_timeout.unwrap_or(30)),
+            idle_timeout: cfg.idle_timeout(),
             set_system_proxy: cfg.set_system_proxy,
             addr,
             users,

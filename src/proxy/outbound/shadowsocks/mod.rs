@@ -48,31 +48,21 @@ fn map_cipher(cipher: &str) -> std::io::Result<shadowsocks::crypto::CipherKind> 
 
 impl ShadowsocksOutbound {
     pub fn new(tag: String, cfg: &OutboundConfig) -> Result<Arc<dyn AnyOutbound>> {
-        let address = cfg
-            .address
-            .clone()
-            .context(format!("shadowsocks outbound '{}' requires address", tag))?;
-        let port = cfg
-            .port
-            .context(format!("shadowsocks outbound '{}' requires port", tag))?;
-        let server = TargetAddr::from_str2(&address, port)?;
+        let server = cfg.endpoint(&tag)?;
 
         let password = cfg
             .password
             .clone()
             .context(format!("shadowsocks outbound '{}' requires password", tag))?;
 
-        let cipher = cfg
-            .udp_mod
-            .clone()
-            .unwrap_or_else(|| "chacha20-ietf-poly1305".to_string());
+        let cipher = cfg.udp_mode_or("chacha20-ietf-poly1305").to_string();
 
         Ok(Arc::new(Self {
             tag,
             server,
             password,
             cipher,
-            connect_timeout: Duration::from_secs(cfg.connect_timeout.unwrap_or(30)),
+            connect_timeout: cfg.connect_timeout(),
             dns_server_name: cfg.dns.clone(),
             bind_interface: cfg.bind_interface.clone(),
         }))

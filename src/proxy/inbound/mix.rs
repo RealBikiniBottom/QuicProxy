@@ -32,17 +32,11 @@ impl MixInbound {
             _ => None,
         };
 
-        let addr: SocketAddr = format!(
-            "{}:{}",
-            cfg.address.clone().context("Required address")?,
-            cfg.port.context("Required port")?
-        )
-        .parse()
-        .context("failed to parse SocketAddr")?;
+        let addr = cfg.socket_addr(&tag)?;
 
         Ok(Self {
             tag,
-            idle_timeout: Duration::from_secs(cfg.idle_timeout.unwrap_or(30)),
+            idle_timeout: cfg.idle_timeout(),
             addr,
             set_system_proxy: cfg.set_system_proxy,
             users,

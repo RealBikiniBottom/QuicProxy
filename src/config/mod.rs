@@ -5,8 +5,45 @@ use serde_json;
 use serde_json5;
 use std::fs::File;
 use std::io::Read;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::info;
+
+use crate::proxy::TargetAddr;
+
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn duration_from_secs_or(value: Option<u64>, default: Duration) -> Duration {
+    value.map(Duration::from_secs).unwrap_or(default)
+}
+
+fn required_endpoint<'a>(
+    address: &'a Option<String>,
+    port: Option<u16>,
+    bound: &str,
+) -> anyhow::Result<(&'a str, u16)> {
+    let address = address
+        .as_deref()
+        .with_context(|| format!("{bound} requires address"))?;
+    let port = port.with_context(|| format!("{bound} requires port"))?;
+    Ok((address, port))
+}
+
+fn required_credentials<'a>(
+    username: &'a Option<String>,
+    password: &'a Option<String>,
+    bound: &str,
+) -> anyhow::Result<(&'a str, &'a str)> {
+    let username = username
+        .as_deref()
+        .with_context(|| format!("{bound} requires username"))?;
+    let password = password
+        .as_deref()
+        .with_context(|| format!("{bound} requires password"))?;
+    Ok((username, password))
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CacheConfig {
@@ -304,6 +341,46 @@ pub struct InboundConfig {
     pub tun_fd: Option<i32>,
 }
 
+impl InboundConfig {
+    /// Returns the configured idle timeout, or the common 30-second default.
+    pub fn idle_timeout(&self) -> Duration {
+        self.idle_timeout_or(DEFAULT_IDLE_TIMEOUT)
+    }
+
+    /// Returns the configured idle timeout, or a protocol-specific default.
+    pub fn idle_timeout_or(&self, default: Duration) -> Duration {
+        duration_from_secs_or(self.idle_timeout, default)
+    }
+
+    /// Returns the required host and port for this inbound.
+    pub fn endpoint(&self, tag: &str) -> anyhow::Result<(&str, u16)> {
+        let bound = format!("{} inbound '{}'", self.protocol_type, tag);
+        required_endpoint(&self.address, self.port, &bound)
+    }
+
+    /// Returns the inbound endpoint parsed as a socket address.
+    pub fn socket_addr(&self, tag: &str) -> anyhow::Result<SocketAddr> {
+        let (address, port) = self.endpoint(tag)?;
+        format!("{address}:{port}").parse().with_context(|| {
+            format!(
+                "{} inbound '{}' has an invalid socket address",
+                self.protocol_type, tag
+            )
+        })
+    }
+
+    /// Returns the required username and password for this inbound.
+    pub fn credentials(&self, tag: &str) -> anyhow::Result<(&str, &str)> {
+        let bound = format!("{} inbound '{}'", self.protocol_type, tag);
+        required_credentials(&self.username, &self.password, &bound)
+    }
+
+    /// Returns a string-valued mode setting or the protocol-specific default.
+    pub fn udp_mode_or<'a>(&'a self, default: &'a str) -> &'a str {
+        self.udp_mod.as_deref().unwrap_or(default)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Outbounds {
     #[serde(default)]
@@ -360,6 +437,36 @@ pub struct OutboundConfig {
     /// 禁用多路复用：每个代理连接独占一条 TLS 连接（Session）
     #[serde(default = "default_false")]
     pub disable_mux: bool,
+}
+
+impl OutboundConfig {
+    /// Returns the configured idle timeout, or the common 30-second default.
+    pub fn idle_timeout(&self) -> Duration {
+        duration_from_secs_or(self.idle_timeout, DEFAULT_IDLE_TIMEOUT)
+    }
+
+    /// Returns the configured connection timeout, or the common 30-second default.
+    pub fn connect_timeout(&self) -> Duration {
+        duration_from_secs_or(self.connect_timeout, DEFAULT_CONNECT_TIMEOUT)
+    }
+
+    /// Returns the required endpoint parsed as a proxy target address.
+    pub fn endpoint(&self, tag: &str) -> anyhow::Result<TargetAddr> {
+        let bound = format!("{} outbound '{}'", self.protocol_type, tag);
+        let (address, port) = required_endpoint(&self.address, self.port, &bound)?;
+        TargetAddr::from_str2(address, port)
+    }
+
+    /// Returns the required username and password for this outbound.
+    pub fn credentials(&self, tag: &str) -> anyhow::Result<(&str, &str)> {
+        let bound = format!("{} outbound '{}'", self.protocol_type, tag);
+        required_credentials(&self.username, &self.password, &bound)
+    }
+
+    /// Returns a string-valued mode setting or the protocol-specific default.
+    pub fn udp_mode_or<'a>(&'a self, default: &'a str) -> &'a str {
+        self.udp_mod.as_deref().unwrap_or(default)
+    }
 }
 
 /// Cache configuration for selector outbound
@@ -492,5 +599,51 @@ impl Default for RouterConfig {
             geoip_db: HashMap::new(),
             geoip: HashMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InboundConfig, OutboundConfig, duration_from_secs_or};
+    use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn duration_from_secs_uses_configured_value_or_default() {
+        let default = Duration::from_secs(30);
+
+        assert_eq!(
+            duration_from_secs_or(Some(12), default),
+            Duration::from_secs(12)
+        );
+        assert_eq!(duration_from_secs_or(None, default), default);
+    }
+
+    #[test]
+    fn bound_config_resolves_common_values() {
+        let inbound: InboundConfig = serde_json::from_value(json!({
+            "type": "socks5",
+            "address": "127.0.0.1",
+            "port": 1080
+        }))
+        .unwrap();
+        assert_eq!(inbound.socket_addr("local").unwrap().port(), 1080);
+        assert_eq!(inbound.idle_timeout(), Duration::from_secs(30));
+
+        let outbound: OutboundConfig = serde_json::from_value(json!({
+            "type": "shadowquic",
+            "address": "proxy.example.com",
+            "port": 443,
+            "username": "user",
+            "password": "secret",
+            "udp_mod": "datagram"
+        }))
+        .unwrap();
+        let endpoint = outbound.endpoint("proxy").unwrap();
+        assert_eq!(endpoint.host(), "proxy.example.com");
+        assert_eq!(endpoint.port(), 443);
+        assert_eq!(outbound.credentials("proxy").unwrap(), ("user", "secret"));
+        assert_eq!(outbound.connect_timeout(), Duration::from_secs(30));
+        assert_eq!(outbound.udp_mode_or("stream"), "datagram");
     }
 }

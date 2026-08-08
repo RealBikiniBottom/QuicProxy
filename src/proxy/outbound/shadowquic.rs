@@ -57,38 +57,23 @@ pub struct ShadowQuicOutbound {
 
 impl ShadowQuicOutbound {
     pub fn new(tag: String, cfg: &OutboundConfig) -> Result<Arc<dyn AnyOutbound>> {
-        let connect_timeout = Duration::from_secs(cfg.connect_timeout.unwrap_or(30));
-        let idle_timeout = Duration::from_secs(cfg.idle_timeout.unwrap_or(30));
+        let connect_timeout = cfg.connect_timeout();
+        let idle_timeout = cfg.idle_timeout();
 
         let tls = TlsConfig::from_outbound(cfg)?;
 
-        let mut udp_mod = UdpMode::OverStream;
-        if cfg.udp_mod.clone().unwrap_or("stream".to_string()) == "datagram" {
-            udp_mod = UdpMode::OverDatagram;
-        }
+        let udp_mod = match cfg.udp_mode_or("stream") {
+            "datagram" => UdpMode::OverDatagram,
+            _ => UdpMode::OverStream,
+        };
 
         let mut auth_hash = None;
         if !tls.enable_jls {
-            let username = cfg.username.clone().context(format!(
-                "shadowquic outbound '{}' requires username",
-                tag.clone()
-            ))?;
-            let password = cfg.password.clone().context(format!(
-                "shadowquic outbound '{}' requires password",
-                tag.clone()
-            ))?;
-            auth_hash = Some(gen_sunny_auth_hash(&username, &password));
+            let (username, password) = cfg.credentials(&tag)?;
+            auth_hash = Some(gen_sunny_auth_hash(username, password));
         }
 
-        let address = cfg.address.clone().context(format!(
-            "shadowquic outbound '{}' requires address",
-            tag.clone()
-        ))?;
-        let port = cfg.port.context(format!(
-            "shadowquic outbound '{}' requires port",
-            tag.clone()
-        ))?;
-        let address = TargetAddr::from_str2(&address, port)?;
+        let address = cfg.endpoint(&tag)?;
 
         let cached_client = Arc::new(Mutex::new(None));
         if let Some(mut rx) = InterfaceManager::subscribe() {

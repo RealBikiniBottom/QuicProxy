@@ -37,15 +37,7 @@ pub struct TrojanOutbound {
 
 impl TrojanOutbound {
     pub fn new(tag: String, cfg: &OutboundConfig) -> Result<Arc<dyn AnyOutbound>> {
-        let address = cfg.address.clone().context(format!(
-            "shadowquic outbound '{}' requires address",
-            tag.clone()
-        ))?;
-        let port = cfg.port.context(format!(
-            "shadowquic outbound '{}' requires port",
-            tag.clone()
-        ))?;
-        let address = TargetAddr::from_str2(&address, port)?;
+        let address = cfg.endpoint(&tag)?;
 
         let password = cfg
             .password
@@ -53,7 +45,7 @@ impl TrojanOutbound {
             .context(format!("trojan outbound '{}' requires password", tag))?;
 
         let tls = TlsConfig::from_outbound(cfg)?;
-        let connect_timeout = Duration::from_secs(cfg.connect_timeout.unwrap_or(30));
+        let connect_timeout = cfg.connect_timeout();
         let pool_size = cfg.pool_size.unwrap_or(0);
 
         let mut hasher = Sha224::new();

@@ -96,7 +96,7 @@ impl DirectOutbound {
     pub fn new(tag: String, cfg: &OutboundConfig) -> Result<Arc<dyn AnyOutbound>> {
         Ok(Arc::new(Self {
             tag,
-            connect_timeout: Duration::from_secs(cfg.connect_timeout.unwrap_or(30)),
+            connect_timeout: cfg.connect_timeout(),
             bind_interface: cfg.bind_interface.clone(),
             dns: cfg.dns.clone(),
         }))

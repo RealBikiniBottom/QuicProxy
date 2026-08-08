@@ -5,7 +5,6 @@ use crate::proxy::router::{Router, get_router, start_udp_loop};
 use crate::proxy::{SourceAddr, TargetAddr};
 use crate::utils::new_io_timeout_error;
 use crate::utils::{format_duration, new_io_other_error, now};
-use anyhow::Context;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use serde::Deserialize;
@@ -36,13 +35,7 @@ pub struct Socks5Inbound {
 
 impl Socks5Inbound {
     pub fn new(tag: String, cfg: &InboundConfig) -> anyhow::Result<Self> {
-        let addr: SocketAddr = format!(
-            "{}:{}",
-            cfg.address.clone().context("Required address")?,
-            cfg.port.context("Required port")?
-        )
-        .parse()
-        .context("failed to parse SocketAddr")?;
+        let addr = cfg.socket_addr(&tag)?;
 
         let users = match (&cfg.username, &cfg.password) {
             (Some(u), Some(p)) => Some(vec![User {
@@ -54,7 +47,7 @@ impl Socks5Inbound {
 
         Ok(Self {
             tag,
-            idle_timeout: Duration::from_secs(cfg.idle_timeout.unwrap_or(30)),
+            idle_timeout: cfg.idle_timeout(),
             addr,
             set_system_proxy: cfg.set_system_proxy,
             users,

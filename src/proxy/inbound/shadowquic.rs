@@ -53,21 +53,20 @@ impl ShadowQuicInbound {
 
         let mut auth_hash = None;
         if !tls.enable_jls {
-            let username = cfg.username.clone().context("requires username")?;
-            let password = cfg.password.clone().context("requires password")?;
-            auth_hash = Some(gen_sunny_auth_hash(&username, &password));
+            let (username, password) = cfg.credentials(&tag)?;
+            auth_hash = Some(gen_sunny_auth_hash(username, password));
         }
 
-        let idle_timeout = Duration::from_secs(cfg.idle_timeout.unwrap_or(30));
+        let (address, port) = cfg.endpoint(&tag)?;
 
         Ok(Self {
             tag,
             auth_hash,
             congestion_controller: cfg.congestion_controller.clone(),
             tls,
-            address: cfg.address.clone().context("require address")?,
-            port: cfg.port.context("require port")?,
-            idle_timeout,
+            address: address.to_string(),
+            port,
+            idle_timeout: cfg.idle_timeout(),
             enable_gso: cfg.gso,
             enable_mtudis: cfg.mtu_discoveriy,
             min_mtu: cfg.min_mtu,
