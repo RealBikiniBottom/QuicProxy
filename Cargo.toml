@@ -17,80 +17,80 @@ name = "quicproxy"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
-jni = { version = "0.21.1", optional = true }
-mimalloc = { version = "0.1.43", optional = true, default-features = false }
-snmalloc-rs = { version = "0.3", optional = true }
-async-trait = "0.1.89"
+jni = { version = "0", optional = true }
+mimalloc = { version = "0", optional = true, default-features = false }
+snmalloc-rs = { version = "0", optional = true }
+async-trait = "0"
 bytes = "1"
-clap = { version = "4.5.54", features = ["derive"] }
-hex = "0.4.3"
-base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+hex = "0"
+base64 = "0"
 simple-dns = "0"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
-hyper = { version = "1.7.0", features = ["client", "http1"] }
-hyper-util = { version = "0.1.17", features = ["client", "http1", "tokio"] }
-http-body-util = "0.1.3"
+reqwest = { version = "0", default-features = false, features = ["rustls-tls", "json", "socks"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0", features = ["client", "http1", "tokio"] }
+http-body-util = "0"
 rand = "0.8"
-lru = "0.12"
-httparse = "1.10.1"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-serde_json5 = "0.2.1"
-serde_path_to_error = "0.1"
-sha2 = "0.10.9"
+lru = "0"
+httparse = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_json5 = "0"
+serde_path_to_error = "0"
+sha2 = "0.10"
 socket2 = "0"
 tokio = { version = "1", features = ["full", "test-util"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing = "0"
+tracing-subscriber = { version = "0", features = ["env-filter"] }
 quinn = { package = "quinn", git = "https://github.com/spongebob888/quinn-jls", branch = "jls-main", default-features = false, features = ["runtime-tokio", "rustls-ring"]}
 rustls = { git = "https://github.com/spongebob888/rustls-jls", branch = "jls-main", default-features = false, features = ["ring", "std", "logging", "tls12"] }
-rustls-pemfile = "2.1"
-webpki-roots = "0.26"
+rustls-pemfile = "2"
+webpki-roots = "0"
 futures = "0"
 bytesize = "2"
 dashmap = "6"
-maxminddb = { version = "0.29", features = ["mmap"] }
-memmap2 = "0.9.9"
-tracing-appender = "0.2.4"
-hashbrown = { version = "0.15.2", features = ["serde"] }
-ipnet = "2.11.0"
+maxminddb = { version = "0", features = ["mmap"] }
+memmap2 = "0"
+tracing-appender = "0"
+hashbrown = { version = "0", features = ["serde"] }
+ipnet = "2"
 netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip", rev ="49434359ed59cae05092c1055396289ba2297389" }
 tun-rs = { version = "2", features = ["async", "async_framed", "utun_fd"], optional = true, git = "https://github.com/tun-rs/tun-rs", tag = "2.8.7" }
-netdev = "0.45"
+netdev = "0"
 etherparse = "0.13"
-libc = "0.2.180"
+libc = "0"
 tokio-rustls = { git = "https://github.com/spongebob888/tokio-rustls", branch = "main", default-features = false, features = ["ring", "logging", "tls12"] }
 anyhow = { version = "1", features = ["backtrace"] }
-tracing-error = "0.2"
-redb = "4.1.0"
-axum = "0.8.9"
+tracing-error = "0"
+redb = "4"
+axum = "0"
 tower-http = { version = "0.6", features = ["fs"] }
 uuid = { version = "1.21.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
-rcgen = "0.14.7"
-tokio-util = "0.7.18"
-md5 = "0.8.0"
+rcgen = "0"
+tokio-util = "0"
+md5 = "0"
 digest = "0.10"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 crc32fast = "1"
 hmac = "0.12"
 aead = "0.5"
-const-fnv1a-hash = "1.0"
+const-fnv1a-hash = "1"
 cfb-mode = "0.8"
 aes = "0.8"
-shadowsocks = { version = "1.24", features = ["aead-cipher-2022", "stream-cipher"] }
-sysinfo = "0.38"
+shadowsocks = { version = "1", features = ["aead-cipher-2022", "stream-cipher"] }
+sysinfo = "0"
 
 [patch.crates-io]
 rustls = { git = "https://github.com/spongebob888/rustls-jls", branch = "jls-main" }
 
 [target.'cfg(target_os = "android")'.dependencies]
-tracing-android = "0.2.0"
+tracing-android = "0"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-objc2 = "0.5.2"
-block2 = "0.5.1"
-core-foundation = "0.10.0"
+objc2 = "0"
+block2 = "0"
+core-foundation = "0"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.1", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_Rras", "Win32_Networking_WinSock"] }
@@ -104,4 +104,4 @@ panic = "unwind"
 tempfile = "3.24.0"
 
 [build-dependencies]
-chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0", default-features = false, features = ["clock", "std"] }

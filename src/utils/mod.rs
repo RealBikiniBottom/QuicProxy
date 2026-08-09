@@ -116,9 +116,9 @@ where
 // Use a larger forwarding buffer to avoid turning sustained uploads into tiny
 // writes on the outbound transport path.
 #[cfg(any(target_os = "android", target_os = "ios"))]
-const BUFFER_SIZE: usize = 1024 * 4;
+const BUFFER_SIZE: usize = 1024 * 1;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-const BUFFER_SIZE: usize = 1024 * 16;
+const BUFFER_SIZE: usize = 1024 * 1;
 
 /// Copies data in both directions between `a` and `b`.
 ///

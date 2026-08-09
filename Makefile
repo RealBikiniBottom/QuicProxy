@@ -134,7 +134,7 @@ build-xcframework:
 		-library target/aarch64-apple-darwin/release/libquicproxy.a \
 		-output src/premium/quicproxy_flutter/apple/PacketTunnelShared/QuicProxyCore.xcframework
 
-CODE_MMDB_URL ?= https://cdn.jsdelivr.net/gh/Hackl0us/GeoIP2-CN@release/Country.mmdb
+CODE_MMDB_URL ?= https://github.com/JimmyHuang454/Geoip-For-CN/releases/latest/download/Country.mmdb
 CODE_MMDB_PATH ?= assets/code.mmdb
 
 .PHONY: update_code_mmdb
