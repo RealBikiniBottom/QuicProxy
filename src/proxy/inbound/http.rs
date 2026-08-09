@@ -81,7 +81,7 @@ impl AnyInbound for HttpInbound {
             let (socket, peer_addr) = listener.accept().await?;
             info!("Accepted request from {}", peer_addr);
             let start_time = now();
-            let router = get_router();
+            let router = get_router()?;
             let tag_clone = tag.clone();
             let users = users.clone();
             let span = info_span!("http", s = peer_addr.to_string(),);

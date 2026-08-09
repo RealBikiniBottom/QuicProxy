@@ -24,16 +24,13 @@ use super::outbound::SessionMap;
 static GLOBAL_ROUTER: LazyLock<StdRwLock<Option<Arc<Router>>>> =
     LazyLock::new(|| StdRwLock::new(None));
 
-pub fn get_router() -> Arc<Router> {
+pub fn get_router() -> anyhow::Result<Arc<Router>> {
     GLOBAL_ROUTER
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
-        .unwrap_or_else(|| {
-            tracing::error!("Router not set");
-            std::process::exit(1);
-        })
-        .clone()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Router not set"))
 }
 
 pub fn init_router(cfg: &Config) -> anyhow::Result<()> {

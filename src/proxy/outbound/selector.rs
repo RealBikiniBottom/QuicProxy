@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
@@ -39,25 +39,24 @@ pub struct SelectorOutbound {
 
 impl SelectorOutbound {
     pub fn new(tag: String, cfg: &OutboundConfig) -> anyhow::Result<Arc<SelectorOutbound>> {
-        let default_outbound = cfg.default_outbound.clone().unwrap_or_else(|| {
-            tracing::error!("selector '{}' requires default_outbound", tag);
-            std::process::exit(1);
-        });
+        let default_outbound = cfg
+            .default_outbound
+            .clone()
+            .with_context(|| format!("selector '{tag}' requires default_outbound"))?;
 
-        let outbound_tags = cfg.outbounds.as_ref().unwrap_or_else(|| {
-            tracing::error!("selector '{}' requires outbounds", tag);
-            std::process::exit(1);
-        });
+        let outbound_tags = cfg
+            .outbounds
+            .as_ref()
+            .with_context(|| format!("selector '{tag}' requires outbounds"))?;
 
-        let mut cache = None;
-        if let Some(c) = cfg.cache.clone() {
-            cache = Cache::new_with_tag(&c, tag.clone())
-                .map_err(|e| {
-                    tracing::error!("selector '{}' failed to new cache: {:?}", tag, e);
-                    std::process::exit(1);
-                })
-                .ok();
-        }
+        let cache = cfg
+            .cache
+            .as_ref()
+            .map(|cache_tag| {
+                Cache::new_with_tag(cache_tag, tag.clone())
+                    .with_context(|| format!("selector '{tag}' failed to create cache"))
+            })
+            .transpose()?;
 
         let mut selected_tag = default_outbound.clone();
         if let Some(ref cache) = cache {

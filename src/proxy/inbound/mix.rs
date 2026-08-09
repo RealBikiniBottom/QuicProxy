@@ -82,7 +82,7 @@ impl AnyInbound for MixInbound {
             let local_addr = socket.local_addr().ok();
             let tag_clone = tag.clone();
             let start_time = now();
-            let router = get_router();
+            let router = get_router()?;
             let socks5_users = self.users.clone();
             let http_users = http_users.clone();
             info!("Accepted proxy request from: {}", peer_addr.to_string());

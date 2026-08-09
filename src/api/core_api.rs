@@ -78,7 +78,7 @@ pub async fn init_core_api(
         .with_state(CoreApiState {
             password: api.password,
             shutdown_tx,
-            router: get_router(),
+            router: get_router()?,
             observer: match get_observer() {
                 Some(o) => o,
                 None => {

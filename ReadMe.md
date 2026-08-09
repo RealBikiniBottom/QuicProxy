@@ -78,6 +78,12 @@ curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/s
 
 **弱网高可用**，尤其合适网络经常变化的地方，比如说在高铁上信号基站经常切换，Shadowquic 丝滑切换，用户感受不到切换重连的卡顿
 
+## 精确的分流
+
+<!-- Geosite 充斥着各种莫名奇妙的域名，依赖 Geosite 分流是一个掩耳盗铃的做法。 -->
+
+使用具有极高精确度的 Geoip 来分流域名。并且使用 KV-Cache 来缓存分流结果，下次遇到同样的域名，无需再次查询 DNS 和 Geoip，消耗极低的时间即可完成分流。
+
 ## 先进的拥塞算法
 
 > 正在等待上游适配

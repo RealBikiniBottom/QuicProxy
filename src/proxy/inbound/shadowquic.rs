@@ -171,7 +171,7 @@ impl AnyInbound for ShadowQuicInbound {
         let auth_hash = self.auth_hash;
         let session_timeout = self.idle_timeout();
         let tag = self.tag.clone();
-        let router = get_router();
+        let router = get_router()?;
 
         info!("ShadowQuic inbound listening on {}", listen_addr);
 

@@ -157,7 +157,7 @@ impl TrojanInbound {
                 }
             };
             let peer_addr_str = peer_addr.to_string();
-            let router = get_router();
+            let router = get_router()?;
             let password_hash = self.password_hash.clone();
             let tag = self.tag.clone();
             let udp_timeout = self.idle_timeout;

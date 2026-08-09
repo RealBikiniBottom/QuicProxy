@@ -83,7 +83,7 @@ impl AnyInbound for Socks5Inbound {
             let tag_clone = tag.clone();
             let local_addr = socket.local_addr().ok();
 
-            let router = get_router();
+            let router = get_router()?;
             let users = self.users.clone();
             let idle_timeout = self.idle_timeout;
 

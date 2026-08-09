@@ -733,7 +733,7 @@ impl AnytlsInbound {
                 }
             };
 
-            let router = get_router();
+            let router = get_router()?;
             let password_hash = self.password_hash;
             let tag = self.tag.clone();
             let udp_timeout = self.idle_timeout;
