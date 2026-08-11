@@ -19,6 +19,8 @@
 | 🛜 **软路由**  | 参考[安装教程](./doc/linux.md)                                                                                      | 包含 [Web 面板](https://github.com/spongebob888/quicboard) |
 |  🍎 **macOS**  | _即将发布_                                                                                                          |                                                            |
 
+> “代理娱乐圈”内唯一一个全栈可控的项目，从 Web 到 iOS、三大平台、软路由 **全部支持**。
+
 ## 简单易用(Out of the box)
 
 得益于 JLS，不需要购买域名、不需要自己生成证书；小白友好，不需要任何配置东西：

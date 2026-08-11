@@ -18,48 +18,66 @@ static ACTIVE_SYSTEM_PROXY: Mutex<Option<ActiveSystemProxy>> = Mutex::new(None);
 
 #[cfg(target_os = "macos")]
 pub fn set_system_proxy(service: &str, enable: bool, host: &str, port: u16) -> std::io::Result<()> {
+    const PROXY_TYPES: [&str; 3] = ["webproxy", "securewebproxy", "socksfirewallproxy"];
+
+    let port = port.to_string();
+    let state = if enable { "enable" } else { "disable" };
     if enable {
         info!("Enabling system proxy for service: {}", service);
-        let proxies = ["webproxy", "securewebproxy", "socksfirewallproxy"];
-
-        for proxy_type in &proxies {
-            let output = Command::new("networksetup")
-                .arg(format!("-set{}", proxy_type))
-                .arg(service)
-                .arg(host)
-                .arg(port.to_string())
-                .output()?;
-
-            if !output.status.success() {
-                warn!(
-                    "Failed to enable {}: {}",
-                    proxy_type,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
     } else {
         info!("Disabling system proxy for service: {}", service);
-        let proxy_types = ["webproxy", "securewebproxy", "socksfirewallproxy"];
+    }
 
-        for proxy_type in &proxy_types {
-            let output = Command::new("networksetup")
-                .arg(format!("-set{}state", proxy_type))
+    // Each networksetup invocation has noticeable process startup and IPC overhead.
+    // Start all independent proxy updates first so their latency does not add up.
+    let mut children = Vec::with_capacity(PROXY_TYPES.len());
+    for proxy_type in PROXY_TYPES {
+        let mut command = Command::new("networksetup");
+        if enable {
+            command
+                .arg(format!("-set{proxy_type}"))
                 .arg(service)
-                .arg("off")
-                .output()?;
+                .arg(host)
+                .arg(&port);
+        } else {
+            command
+                .arg(format!("-set{proxy_type}state"))
+                .arg(service)
+                .arg("off");
+        }
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
 
-            if !output.status.success() {
-                warn!(
-                    "Failed to disable {}: {}",
-                    proxy_type,
-                    String::from_utf8_lossy(&output.stderr)
-                );
+        match command.spawn() {
+            Ok(child) => children.push((proxy_type, child)),
+            Err(error) => {
+                // Do not leave already spawned children behind when a later spawn fails.
+                for (_, child) in children {
+                    let _ = child.wait_with_output();
+                }
+                return Err(error);
             }
         }
     }
 
-    Ok(())
+    let mut wait_error = None;
+    for (proxy_type, child) in children {
+        match child.wait_with_output() {
+            Ok(output) if !output.status.success() => {
+                warn!(
+                    "Failed to {} {}: {}",
+                    state,
+                    proxy_type,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) if wait_error.is_none() => wait_error = Some(error),
+            _ => {}
+        }
+    }
+
+    wait_error.map_or(Ok(()), Err)
 }
 
 #[cfg(target_os = "windows")]
