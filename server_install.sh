@@ -192,7 +192,7 @@ prompt_install_options() {
     echo -e "  ${GREEN}QuicProxy 支持三种入站协议:${NC}"
     echo ""
     echo -e "  ${CYAN}1) shadowquic (QUIC + JLS)${NC} — 基于 QUIC 的隧道，延迟更低"
-    echo -e "  ${CYAN}2) anytls (TCP / insecure TLS)${NC}  — 基于 TLS 的伪装隧道，抗封锁更好"
+    echo -e "  ${CYAN}2) anytls-jls (TCP / JLS)${NC}  — 基于 TCP 的伪装隧道，抗封锁更好"
     echo -e "  ${CYAN}3) trojan (TLS)${NC} — 标准 Trojan 协议，通用性更强"
     echo ""
 
@@ -206,7 +206,7 @@ prompt_install_options() {
       esac
     fi
 
-    echo -ne "  ${YELLOW}安装 anytls (TCP / insecure TLS)? [Y/n]: ${NC}"
+    echo -ne "  ${YELLOW}安装 anytls-jls (TCP / JLS)? [Y/n]: ${NC}"
     read -r input
     if [[ -n "$input" ]]; then
       input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
@@ -240,7 +240,7 @@ prompt_install_options() {
 
   local parts=()
   [[ "$choose_shadowquic" == "yes" ]] && parts+=("shadowquic")
-  [[ "$choose_anytls" == "yes" ]] && parts+=("anytls")
+  [[ "$choose_anytls" == "yes" ]] && parts+=("anytls-jls")
   [[ "$choose_trojan" == "yes" ]] && parts+=("trojan")
   log_info "已选择: ${parts[*]}"
 }
@@ -312,32 +312,32 @@ detect_available_port() {
 
   if [[ -n "${PORT:-}" ]]; then
     # 手动指定端口时，shadowquic 用 UDP，可与一个 TCP 协议共用；
-    # anytls / trojan 均为 TCP，若都启用则必须分配不同端口
+    # anytls-jls / trojan 均为 TCP，若都启用则必须分配不同端口
     if [[ "${ENABLE_SHADOWQUIC:-}" == "yes" ]]; then
       SQ_PORT="$PORT"
       log_info "shadowquic(UDP) → ${SQ_PORT} (手动指定)"
     fi
     if [[ "${ENABLE_ANYTLS:-}" == "yes" ]]; then
       ANYTLS_PORT="$PORT"
-      log_info "anytls(TCP) → ${ANYTLS_PORT} (手动指定)"
+      log_info "anytls-jls(TCP) → ${ANYTLS_PORT} (手动指定)"
     fi
     if [[ "${ENABLE_TROJAN:-}" == "yes" ]]; then
       if [[ "${ENABLE_ANYTLS:-}" == "yes" ]]; then
-        # 必须为 trojan 另找一个 TCP 端口，避免与 anytls 冲突
+        # 必须为 trojan 另找一个 TCP 端口，避免与 anytls-jls 冲突
         local trojan_port
         trojan_port=$(find_free_tcp_port "$ANYTLS_PORT") || {
-          log_error "无法为 trojan 找到空闲 TCP 端口 (anytls 已占用 ${ANYTLS_PORT})"
+          log_error "无法为 trojan 找到空闲 TCP 端口 (anytls-jls 已占用 ${ANYTLS_PORT})"
           exit 1
         }
         TROJAN_PORT="$trojan_port"
-        log_info "trojan(TCP) → ${TROJAN_PORT} (anytls 与 trojan 不能共用 TCP 端口)"
+        log_info "trojan(TCP) → ${TROJAN_PORT} (anytls-jls 与 trojan 不能共用 TCP 端口)"
       else
         TROJAN_PORT="$PORT"
         log_info "trojan(TCP) → ${TROJAN_PORT} (手动指定)"
       fi
     fi
   else
-    # 自动检测：UDP 与 TCP 互不冲突，但 anytls / trojan 必须各自占用不同 TCP 端口
+    # 自动检测：UDP 与 TCP 互不冲突，但 anytls-jls / trojan 必须各自占用不同 TCP 端口
     if [[ "${ENABLE_SHADOWQUIC:-}" == "yes" ]]; then
       local sq_port
       sq_port=$(find_free_udp_port) || {
@@ -351,11 +351,11 @@ detect_available_port() {
     if [[ "${ENABLE_ANYTLS:-}" == "yes" ]]; then
       local anytls_port
       anytls_port=$(find_free_tcp_port) || {
-        log_error "未找到空闲 TCP 端口给 anytls, 请手动指定: PORT=12345 sudo bash server_install.sh"
+        log_error "未找到空闲 TCP 端口给 anytls-jls, 请手动指定: PORT=12345 sudo bash server_install.sh"
         exit 1
       }
       ANYTLS_PORT="$anytls_port"
-      log_info "anytls(TCP) → ${ANYTLS_PORT}"
+      log_info "anytls-jls(TCP) → ${ANYTLS_PORT}"
     fi
 
     if [[ "${ENABLE_TROJAN:-}" == "yes" ]]; then
@@ -516,8 +516,10 @@ JSON5EOF
       "password": "${PASSWORD}",
       "tls": {
         "enable": true,
-        "insecure": true,
-        "sni": "${sni}"
+        "sni": "${sni}",
+        "enable_jls": true,
+        "jls_username": "${USERNAME}",
+        "jls_password": "${PASSWORD}"
       }
     }${trailing}
 JSON5EOF
@@ -655,7 +657,7 @@ generate_subscription_url() {
     node_num=$((node_num + 1))
     local anytls_encoded_tag
     anytls_encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${anytls_tag}', safe=''))" 2>/dev/null || echo "${anytls_tag}")
-    anytls_url="anytls://${PASSWORD}@${host}:${ANYTLS_PORT}?sni=${sni}&insecure=true#${anytls_encoded_tag}"
+    anytls_url="anytls://${PASSWORD}@${host}:${ANYTLS_PORT}?sni=${sni}&jls_u=${USERNAME}&jls_p=${PASSWORD}#${anytls_encoded_tag}"
   fi
 
   if $trojan_enabled; then

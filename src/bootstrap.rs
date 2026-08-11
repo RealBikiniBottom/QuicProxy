@@ -9,6 +9,7 @@ use crate::proxy::router::{init_router, shutdown_router};
 use crate::utils::interface::InterfaceManager;
 use crate::utils::logging;
 use crate::utils::shutdown;
+use crate::utils::system_proxy::clear_system_proxy;
 use crate::{
     api::init_core_api,
     dns::{init_dns, shutdown_dns},
@@ -76,6 +77,7 @@ where
 
 pub async fn shutdown_app() {
     InterfaceManager::shutdown();
+    clear_system_proxy();
 
     shutdown::abort_all_and_wait().await;
 

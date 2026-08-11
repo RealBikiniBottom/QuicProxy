@@ -3,7 +3,18 @@ use crate::utils::new_io_other_error;
 #[allow(unused_imports)]
 use std::process::Command;
 #[allow(unused_imports)]
+use std::sync::Mutex;
+#[allow(unused_imports)]
 use tracing::{info, warn};
+
+#[derive(Clone)]
+struct ActiveSystemProxy {
+    service: String,
+    host: String,
+    port: u16,
+}
+
+static ACTIVE_SYSTEM_PROXY: Mutex<Option<ActiveSystemProxy>> = Mutex::new(None);
 
 #[cfg(target_os = "macos")]
 pub fn set_system_proxy(service: &str, enable: bool, host: &str, port: u16) -> std::io::Result<()> {
@@ -148,6 +159,7 @@ pub struct SystemProxyGuard {
 
 impl SystemProxyGuard {
     pub fn new(service: String, host: String, port: u16) -> Self {
+        remember_system_proxy(service.clone(), host.clone(), port);
         Self {
             service,
             host,
@@ -158,8 +170,55 @@ impl SystemProxyGuard {
 
 impl Drop for SystemProxyGuard {
     fn drop(&mut self) {
-        if let Err(e) = set_system_proxy(&self.service, false, &self.host, self.port) {
-            tracing::error!("Failed to disable system proxy: {}", e);
+        disable_system_proxy(self.service.clone(), self.host.clone(), self.port, false);
+    }
+}
+
+pub fn clear_system_proxy() {
+    let proxy = {
+        let mut lock = ACTIVE_SYSTEM_PROXY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lock.take()
+    };
+
+    if let Some(proxy) = proxy {
+        disable_system_proxy(proxy.service, proxy.host, proxy.port, true);
+    }
+}
+
+fn remember_system_proxy(service: String, host: String, port: u16) {
+    let mut lock = ACTIVE_SYSTEM_PROXY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *lock = Some(ActiveSystemProxy {
+        service,
+        host,
+        port,
+    });
+}
+
+fn disable_system_proxy(service: String, host: String, port: u16, restore_on_failure: bool) {
+    if let Err(e) = set_system_proxy(&service, false, &host, port) {
+        tracing::error!("Failed to disable system proxy: {}", e);
+        if restore_on_failure {
+            remember_system_proxy(service, host, port);
         }
+    } else {
+        clear_matching_system_proxy(&service, &host, port);
+    }
+}
+
+fn clear_matching_system_proxy(service: &str, host: &str, port: u16) {
+    let mut lock = ACTIVE_SYSTEM_PROXY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let should_clear = lock
+        .as_ref()
+        .map(|proxy| proxy.service == service && proxy.host == host && proxy.port == port)
+        == Some(true);
+
+    if should_clear {
+        *lock = None;
     }
 }

@@ -108,7 +108,7 @@ apk-verify:
 	keytool -printcert -jarfile $(APK_OUTPUT) 2>/dev/null || echo "keytool not available"
 
 build-xcframework:
-	rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin
+	rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
 	@# iOS device
 	IPHONEOS_DEPLOYMENT_TARGET=14.0 \
 	cargo build --release --target aarch64-apple-ios --features "premium" --lib
@@ -117,21 +117,29 @@ build-xcframework:
 	cargo build --release --target aarch64-apple-ios-sim --features "premium" --lib
 	IPHONEOS_DEPLOYMENT_TARGET=14.0 \
 	cargo build --release --target x86_64-apple-ios --features "premium" --lib
-	@# macOS (arm64 only for now)
+	@# macOS
 	MACOSX_DEPLOYMENT_TARGET=11.0 \
 	cargo build --release --target aarch64-apple-darwin --features "apple-network-extension" --lib
+	MACOSX_DEPLOYMENT_TARGET=11.0 \
+	cargo build --release --target x86_64-apple-darwin --features "apple-network-extension" --lib
 	@# Merge iOS simulator fat binary
 	mkdir -p target/ios-simulator-fat
 	lipo -create \
 		target/aarch64-apple-ios-sim/release/libquicproxy.a \
 		target/x86_64-apple-ios/release/libquicproxy.a \
 		-output target/ios-simulator-fat/libquicproxy.a
+	@# Merge macOS universal binary
+	mkdir -p target/macos-universal
+	lipo -create \
+		target/aarch64-apple-darwin/release/libquicproxy.a \
+		target/x86_64-apple-darwin/release/libquicproxy.a \
+		-output target/macos-universal/libquicproxy.a
 	@# Unified xcframework (iOS + macOS)
 	rm -rf src/premium/quicproxy_flutter/apple/PacketTunnelShared/QuicProxyCore.xcframework
 	xcodebuild -create-xcframework \
 		-library target/aarch64-apple-ios/release/libquicproxy.a \
 		-library target/ios-simulator-fat/libquicproxy.a \
-		-library target/aarch64-apple-darwin/release/libquicproxy.a \
+		-library target/macos-universal/libquicproxy.a \
 		-output src/premium/quicproxy_flutter/apple/PacketTunnelShared/QuicProxyCore.xcframework
 
 CODE_MMDB_URL ?= https://github.com/JimmyHuang454/Geoip-For-CN/releases/latest/download/Country.mmdb
