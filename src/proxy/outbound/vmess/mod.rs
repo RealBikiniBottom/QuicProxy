@@ -72,6 +72,24 @@ impl VmessOutbound {
             dst: target.clone(),
         })
     }
+
+    async fn proxy_stream(
+        &self,
+        target: &TargetAddr,
+        stream: AnyStream,
+        udp: bool,
+    ) -> anyhow::Result<AnyStream> {
+        let opt = self.build_vmess_option(target, udp)?;
+        let builder =
+            Builder::new(&opt).map_err(|e| new_io_other_error(format!("vmess builder: {}", e)))?;
+
+        let vmess_stream = timeout(self.connect_timeout(), builder.proxy_stream(stream))
+            .await
+            .with_context(|| format!("vmess connect timeout after {:?}", self.connect_timeout()))?
+            .map_err(|e| new_io_other_error(format!("vmess connect: {}", e)))?;
+
+        Ok(Box::new(vmess_stream))
+    }
 }
 
 #[async_trait]
@@ -107,20 +125,12 @@ impl AnyOutbound for VmessOutbound {
         target: &TargetAddr,
         stream: AnyStream,
     ) -> anyhow::Result<AnyStream> {
-        let opt = self.build_vmess_option(target, false)?;
-        let builder =
-            Builder::new(&opt).map_err(|e| new_io_other_error(format!("vmess builder: {}", e)))?;
-
-        let vmess_stream = timeout(self.connect_timeout(), builder.proxy_stream(stream))
-            .await
-            .with_context(|| format!("vmess connect timeout after {:?}", self.connect_timeout()))?
-            .map_err(|e| new_io_other_error(format!("vmess connect: {}", e)))?;
-
-        Ok(Box::new(vmess_stream))
+        self.proxy_stream(target, stream, false).await
     }
 
     async fn connect_packet(&self, target: &TargetAddr) -> anyhow::Result<Arc<dyn AnyPacket>> {
-        let stream = self.connect_stream(target).await?;
+        let stream = self.connect_stream_base().await?;
+        let stream = self.proxy_stream(target, stream, true).await?;
         Ok(Arc::new(VmessUdpSocket::new(stream, target.clone())))
     }
 }

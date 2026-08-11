@@ -40,7 +40,9 @@ fn map_cipher(cipher: &str) -> std::io::Result<shadowsocks::crypto::CipherKind> 
         "chacha20-ietf-poly1305" => Ok(CipherKind::CHACHA20_POLY1305),
         "2022-blake3-aes-128-gcm" => Ok(CipherKind::AEAD2022_BLAKE3_AES_128_GCM),
         "2022-blake3-aes-256-gcm" => Ok(CipherKind::AEAD2022_BLAKE3_AES_256_GCM),
-        "2022-blake3-chacha20-ietf-poly1305" => Ok(CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305),
+        "2022-blake3-chacha20-poly1305" | "2022-blake3-chacha20-ietf-poly1305" => {
+            Ok(CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305)
+        }
         "rc4-md5" => Ok(CipherKind::SS_RC4_MD5),
         _ => Err(std::io::Error::other("unsupported cipher")),
     }
@@ -281,6 +283,7 @@ mod tests {
         assert!(map_cipher("chacha20-ietf-poly1305").is_ok());
         assert!(map_cipher("2022-blake3-aes-128-gcm").is_ok());
         assert!(map_cipher("2022-blake3-aes-256-gcm").is_ok());
+        assert!(map_cipher("2022-blake3-chacha20-poly1305").is_ok());
         assert!(map_cipher("2022-blake3-chacha20-ietf-poly1305").is_ok());
         assert!(map_cipher("rc4-md5").is_ok());
         assert!(map_cipher("unknown-cipher").is_err());
