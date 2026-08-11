@@ -78,7 +78,7 @@ impl AeadCipher {
         }
     }
 
-    pub fn decrypt_inplace(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+    pub fn decrypt_inplace(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
         let mut nonce = self.nonce;
         let security = &self.security;
         let iv = &self.iv;
@@ -86,30 +86,26 @@ impl AeadCipher {
 
         nonce[..2].copy_from_slice(&count.to_be_bytes());
         nonce[2..12].copy_from_slice(&iv[2..12]);
-        *count += 1;
+        *count = count.wrapping_add(1);
 
         let nonce = &nonce[..security.nonce_len()];
         match security {
             VmessSecurity::Aes128Gcm(cipher) => {
                 cipher
                     .decrypt_in_place_with_slice(nonce, &[], &mut buf[..])
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                    })?;
+                    .map_err(|e| anyhow::anyhow!("AES-GCM decryption failed: {e}"))?;
             }
             VmessSecurity::ChaCha20Poly1305(cipher) => {
                 cipher
                     .decrypt_in_place_with_slice(nonce, &[], &mut buf[..])
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                    })?;
+                    .map_err(|e| anyhow::anyhow!("ChaCha20-Poly1305 decryption failed: {e}"))?;
             }
         }
 
         Ok(())
     }
 
-    pub fn encrypt_inplace(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+    pub fn encrypt_inplace(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
         let mut nonce = self.nonce;
         let security = &self.security;
         let iv = &self.iv;
@@ -117,7 +113,7 @@ impl AeadCipher {
 
         nonce[..2].copy_from_slice(&count.to_be_bytes());
         nonce[2..12].copy_from_slice(&iv[2..12]);
-        *count += 1;
+        *count = count.wrapping_add(1);
 
         let nonce = &nonce[..security.nonce_len()];
         match security {
@@ -130,5 +126,33 @@ impl AeadCipher {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aead_nonce_counter_wraps_after_u16_max() {
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        let mut encrypted = [0u8; 16];
+
+        let mut encryptor = AeadCipher::new(
+            &iv,
+            VmessSecurity::Aes128Gcm(Aes128Gcm::new_with_slice(&key)),
+        );
+        encryptor.count = u16::MAX;
+        encryptor.encrypt_inplace(&mut encrypted).unwrap();
+        assert_eq!(encryptor.count, 0);
+
+        let mut decryptor = AeadCipher::new(
+            &iv,
+            VmessSecurity::Aes128Gcm(Aes128Gcm::new_with_slice(&key)),
+        );
+        decryptor.count = u16::MAX;
+        decryptor.decrypt_inplace(&mut encrypted).unwrap();
+        assert_eq!(decryptor.count, 0);
     }
 }

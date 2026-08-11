@@ -1,6 +1,5 @@
-use std::io;
-
 use crate::proxy::TargetAddr;
+use crate::proxy::outbound::AnyStream;
 use crate::proxy::outbound::vmess::vmess_impl::stream;
 use crate::proxy::outbound::vmess::vmess_impl::user::{self, new_alter_id_list};
 use crate::proxy::outbound::vmess::vmess_impl::{
@@ -25,12 +24,9 @@ pub struct Builder {
 }
 
 impl Builder {
-    pub fn new(opt: &VmessOption) -> io::Result<Self> {
+    pub fn new(opt: &VmessOption) -> anyhow::Result<Self> {
         let uuid = uuid::Uuid::parse_str(&opt.uuid).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid uuid format, should be xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-            )
+            anyhow::anyhow!("invalid uuid format, should be xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
         })?;
 
         let security = match opt.security.to_lowercase().as_str() {
@@ -42,10 +38,7 @@ impl Builder {
                 _ => SECURITY_CHACHA20_POLY1305,
             },
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid security",
-                ));
+                anyhow::bail!("invalid security");
             }
         };
 
@@ -58,10 +51,7 @@ impl Builder {
         })
     }
 
-    pub async fn proxy_stream<S>(&self, stream: S) -> io::Result<stream::VmessStream<S>>
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
+    pub async fn proxy_stream(&self, stream: AnyStream) -> anyhow::Result<stream::VmessStream> {
         let idx = crate::utils::rand_range(0..self.user.len());
         stream::VmessStream::new(
             stream,

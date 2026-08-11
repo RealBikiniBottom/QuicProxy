@@ -12,6 +12,7 @@ use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::proxy::TargetAddr;
+use crate::proxy::outbound::AnyStream;
 
 use super::cipher::{AeadCipher, AeadCipherHelper, VmessSecurity};
 use super::header;
@@ -25,8 +26,8 @@ use super::{
     SECURITY_AES_128_GCM, SECURITY_CHACHA20_POLY1305, SECURITY_NONE, VERSION,
 };
 
-pub struct VmessStream<S> {
-    stream: S,
+pub struct VmessStream {
+    stream: AnyStream,
     aead_read_cipher: Option<AeadCipher>,
     aead_write_cipher: Option<AeadCipher>,
     dst: TargetAddr,
@@ -49,7 +50,7 @@ pub struct VmessStream<S> {
     write_buf: BytesMut,
 }
 
-impl<S> Debug for VmessStream<S> {
+impl Debug for VmessStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VmessStream")
             .field("dst", &self.dst)
@@ -65,6 +66,7 @@ enum ReadState {
     StreamWaitingLength,
     StreamWaitingData(usize),
     StreamFlushingData(usize),
+    Closed,
 }
 
 enum WriteState {
@@ -108,18 +110,15 @@ fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
     outer.finalize().into()
 }
 
-impl<S> VmessStream<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+impl VmessStream {
     pub(crate) async fn new(
-        stream: S,
+        stream: AnyStream,
         id: &ID,
         dst: &TargetAddr,
         security: &u8,
         is_aead: bool,
         is_udp: bool,
-    ) -> io::Result<VmessStream<S>> {
+    ) -> anyhow::Result<VmessStream> {
         let mut rand_bytes = [0u8; 33];
         crate::utils::rand_fill(&mut rand_bytes[..]);
         let req_body_iv = rand_bytes[0..16].to_vec();
@@ -171,7 +170,7 @@ where
                 (Some(read_cipher), Some(write_cipher))
             }
             _ => {
-                return Err(io::Error::other("unsupported security"));
+                anyhow::bail!("unsupported security");
             }
         };
 
@@ -203,16 +202,13 @@ where
         Ok(stream)
     }
 
-    pub fn get_stream(self) -> S {
+    pub fn get_stream(self) -> AnyStream {
         self.stream
     }
 }
 
-impl<S> VmessStream<S>
-where
-    S: AsyncWrite + Unpin,
-{
-    async fn send_handshake_request(&mut self) -> io::Result<()> {
+impl VmessStream {
+    async fn send_handshake_request(&mut self) -> anyhow::Result<()> {
         let &mut Self {
             ref mut stream,
             ref req_body_key,
@@ -277,8 +273,7 @@ where
             let out = mbuf.freeze();
             stream.write_all(&out).await?;
         } else {
-            let out = header::seal_vmess_aead_header(id.cmd_key, buf.freeze().to_vec(), now)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let out = header::seal_vmess_aead_header(id.cmd_key, buf.freeze().to_vec(), now)?;
             stream.write_all(&out).await?;
         }
 
@@ -288,10 +283,7 @@ where
     }
 }
 
-impl<S> AsyncRead for VmessStream<S>
-where
-    S: AsyncRead + Unpin + Send,
-{
+impl AsyncRead for VmessStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -306,7 +298,13 @@ where
                     let resp_v = this.resp_v;
 
                     if !this.is_aead {
-                        ready!(poll_read_exact(&mut this.stream, cx, 4, &mut this.read_buf))?;
+                        ready!(poll_read_exact(
+                            &mut this.stream,
+                            cx,
+                            4,
+                            &mut this.read_buf,
+                            false,
+                        ))?;
                         let mut buf = this.read_buf.split().freeze().to_vec();
                         aes_cfb_decrypt(&resp_body_key, &resp_body_iv, &mut buf)
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -330,7 +328,8 @@ where
                             &mut this.stream,
                             cx,
                             18,
-                            &mut this.read_buf
+                            &mut this.read_buf,
+                            false,
                         ))?;
 
                         let aead_response_header_length_encryption_key = &kdf::vmess_kdf_1_one_shot(
@@ -370,7 +369,8 @@ where
                         &mut this.stream,
                         cx,
                         header_size + 16,
-                        &mut this.read_buf
+                        &mut this.read_buf,
+                        false,
                     ))?;
 
                     let resp_body_key = this.resp_body_key.clone();
@@ -419,7 +419,16 @@ where
 
                 ReadState::StreamWaitingLength => {
                     let this = &mut *self;
-                    ready!(poll_read_exact(&mut this.stream, cx, 2, &mut this.read_buf))?;
+                    if !ready!(poll_read_exact(
+                        &mut this.stream,
+                        cx,
+                        2,
+                        &mut this.read_buf,
+                        true,
+                    ))? {
+                        this.read_state = ReadState::Closed;
+                        return Poll::Ready(Ok(()));
+                    }
                     let len = u16::from_be_bytes(this.read_buf.split().as_ref().try_into().unwrap())
                         as usize;
 
@@ -439,12 +448,21 @@ where
                         &mut this.stream,
                         cx,
                         size,
-                        &mut this.read_buf
+                        &mut this.read_buf,
+                        false,
                     ))?;
 
                     match this.aead_read_cipher {
                         Some(ref mut cipher) => {
-                            cipher.decrypt_inplace(&mut this.read_buf)?;
+                            if size < cipher.security.overhead_len() {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "encrypted VMess chunk is shorter than its authentication tag",
+                                )));
+                            }
+                            cipher
+                                .decrypt_inplace(&mut this.read_buf)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                             let data_len = size - cipher.security.overhead_len();
                             this.read_buf.truncate(data_len);
                             this.read_state = ReadState::StreamFlushingData(data_len);
@@ -467,15 +485,14 @@ where
 
                     return Poll::Ready(Ok(()));
                 }
+
+                ReadState::Closed => return Poll::Ready(Ok(())),
             }
         }
     }
 }
 
-impl<S> AsyncWrite for VmessStream<S>
-where
-    S: AsyncWrite + Unpin + Send,
-{
+impl AsyncWrite for VmessStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -507,7 +524,9 @@ where
 
                     let _cur_len = piece2.len();
                     if let Some(ref mut cipher) = this.aead_write_cipher {
-                        cipher.encrypt_inplace(&mut piece2)?;
+                        cipher
+                            .encrypt_inplace(&mut piece2)
+                            .map_err(io::Error::other)?;
                     }
                     this.write_buf.unsplit(piece2);
                     this.write_state =
@@ -564,35 +583,39 @@ fn poll_read_exact<S: AsyncRead + Unpin>(
     cx: &mut std::task::Context<'_>,
     count: usize,
     buf: &mut BytesMut,
-) -> Poll<io::Result<()>> {
-    let start = buf.len();
-    buf.resize(start + count, 0);
+    allow_eof: bool,
+) -> Poll<io::Result<bool>> {
+    while buf.len() < count {
+        let filled = buf.len();
+        buf.resize(count, 0);
 
-    let mut read_buf = ReadBuf::new(&mut buf[start..]);
-    let result = Pin::new(stream).poll_read(cx, &mut read_buf);
-
-    match result {
-        Poll::Ready(Ok(())) => {
-            if read_buf.filled().len() != count {
-                buf.truncate(start);
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unexpected EOF",
-                )))
-            } else {
-                buf.truncate(start + count);
-                Poll::Ready(Ok(()))
+        let mut read_buf = ReadBuf::new(&mut buf[filled..]);
+        match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => {
+                let read = read_buf.filled().len();
+                buf.truncate(filled + read);
+                if read == 0 {
+                    if allow_eof && filled == 0 {
+                        return Poll::Ready(Ok(false));
+                    }
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "unexpected EOF in VMess frame",
+                    )));
+                }
+            }
+            Poll::Ready(Err(error)) => {
+                buf.truncate(filled);
+                return Poll::Ready(Err(error));
+            }
+            Poll::Pending => {
+                buf.truncate(filled);
+                return Poll::Pending;
             }
         }
-        Poll::Ready(Err(e)) => {
-            buf.truncate(start);
-            Poll::Ready(Err(e))
-        }
-        Poll::Pending => {
-            buf.truncate(start);
-            Poll::Pending
-        }
     }
+
+    Poll::Ready(Ok(true))
 }
 
 fn aes_gcm_decrypt(
@@ -755,6 +778,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_read_exact_handles_fragmentation_and_clean_eof() {
+        let (mut reader, mut writer) = tokio::io::duplex(1);
+        let writer_task = tokio::spawn(async move {
+            for byte in b"vmess" {
+                writer.write_all(&[*byte]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            writer.shutdown().await.unwrap();
+        });
+
+        let mut buf = BytesMut::new();
+        let complete =
+            futures::future::poll_fn(|cx| poll_read_exact(&mut reader, cx, 5, &mut buf, false))
+                .await
+                .unwrap();
+        assert!(complete);
+        assert_eq!(&buf[..], b"vmess");
+
+        buf.clear();
+        let complete =
+            futures::future::poll_fn(|cx| poll_read_exact(&mut reader, cx, 2, &mut buf, true))
+                .await
+                .unwrap();
+        assert!(!complete, "EOF at a frame boundary should be clean");
+        writer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn poll_read_exact_rejects_truncated_frames() {
+        let (mut reader, mut writer) = tokio::io::duplex(1);
+        writer.write_all(&[0x12]).await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut buf = BytesMut::new();
+        let error =
+            futures::future::poll_fn(|cx| poll_read_exact(&mut reader, cx, 2, &mut buf, true))
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
     async fn test_vmess_stream_handshake_timeout() {
         // Test that connecting to a non-responsive peer times out
         let (client, _server) = tokio::io::duplex(1024);
@@ -766,7 +831,15 @@ mod tests {
         );
 
         // The handshake will attempt to write/read but the server side is dropped
-        let result = VmessStream::new(client, &id, &dst, &SECURITY_AES_128_GCM, true, false).await;
+        let result = VmessStream::new(
+            Box::new(client),
+            &id,
+            &dst,
+            &SECURITY_AES_128_GCM,
+            true,
+            false,
+        )
+        .await;
         // Should fail because server side is closed
         assert!(result.is_err());
     }

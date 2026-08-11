@@ -2,7 +2,7 @@
 //!
 //! 仅在 quicproxy 核心进程运行时可用。
 
-use crate::proxy::outbound::{OUTBOUNDS_MAP, get_outbound_by_tag};
+use crate::proxy::outbound::OUTBOUNDS_MAP;
 use crate::proxy::{
     observe::{Observer, get_observer},
     router::get_router,
@@ -383,7 +383,10 @@ async fn get_trace(
 ) -> Result<impl IntoResponse, StatusCode> {
     check_auth(&headers, &state.password)?;
 
-    let outbound = get_outbound_by_tag(&params.tag);
+    let outbound = OUTBOUNDS_MAP
+        .get(&params.tag)
+        .map(|entry| entry.value().clone())
+        .ok_or(StatusCode::NOT_FOUND)?;
     let dns = params.dns.as_deref().or_else(|| outbound.dns_server_name());
     match get_outbound_info(&params.tag, state.observer.clone(), dns).await {
         Ok(r) => {
@@ -407,7 +410,10 @@ pub async fn get_outbound_info(
     dns: Option<&str>,
 ) -> Result<TraceResponse> {
     let start = std::time::Instant::now();
-    let outbound = get_outbound_by_tag(outbound_tag);
+    let outbound = OUTBOUNDS_MAP
+        .get(outbound_tag)
+        .map(|entry| entry.value().clone())
+        .ok_or_else(|| anyhow::anyhow!("outbound not found: {outbound_tag}"))?;
 
     let response = request_via_outbound_with_dns(
         outbound.clone(),
@@ -494,7 +500,10 @@ async fn get_request(
     check_auth(&headers, &state.password)?;
 
     let start = std::time::Instant::now();
-    let outbound = get_outbound_by_tag(&params.tag);
+    let outbound = OUTBOUNDS_MAP
+        .get(&params.tag)
+        .map(|entry| entry.value().clone())
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     let response = request_via_outbound_with_dns(
         outbound.clone(),
