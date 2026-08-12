@@ -32,7 +32,7 @@ impl MixInbound {
             _ => None,
         };
 
-        let addr = cfg.socket_addr(&tag)?;
+        let addr = cfg.socket_addr()?;
 
         Ok(Self {
             tag,
@@ -55,7 +55,7 @@ impl AnyInbound for MixInbound {
     }
 
     async fn listen(&self) -> anyhow::Result<()> {
-        let listener = create_tcp_listener(self.addr).await?;
+        let listener = create_tcp_listener(self.addr)?;
         info!("Mix Inbound listening on {}", self.addr);
 
         let _proxy_guard = setup_system_proxy(

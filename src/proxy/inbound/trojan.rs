@@ -101,7 +101,7 @@ impl TrojanInbound {
 
         let tls = TlsConfig::from_inbound(cfg)?;
 
-        let address = cfg.socket_addr(&tag)?;
+        let address = cfg.socket_addr()?;
 
         Ok(Self {
             tag,
@@ -113,7 +113,7 @@ impl TrojanInbound {
     }
 
     async fn listen_tcp(&self) -> anyhow::Result<()> {
-        let listener = super::create_tcp_listener(self.address).await?;
+        let listener = super::create_tcp_listener(self.address)?;
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 

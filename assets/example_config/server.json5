@@ -2,7 +2,7 @@
   "inbounds": {
     "shadowquic_inbound": {
       "type": "shadowquic",
-      "address": "0.0.0.0",
+      "address": "::",
       "port": 13431,
       "idle_timeout": 500,
       "mtu_discoveriy": false,
@@ -17,7 +17,7 @@
     },
     "anytls_inbound": {
       "type": "anytls",
-      "address": "0.0.0.0",
+      "address": "::",
       "port": 13431,
       "password": "pwd",
       "idle_timeout": 500,
@@ -29,7 +29,7 @@
     },
     "trojan_inbound": {
       "type": "trojan",
-      "address": "0.0.0.0",
+      "address": "::",
       "port": 13441,
       "password": "pwd",
       "idle_timeout": 500,

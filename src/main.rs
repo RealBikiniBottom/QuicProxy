@@ -7,19 +7,22 @@
 use anyhow::{Context, Result};
 use axum::{Router, response::Json, routing::get};
 use clap::Parser;
-use quicproxy::api::{
-    common::cors_middleware,
-    core_manager::CoreManager,
-    management::{self, ManagementState},
-    persist_handler::{self, PersistHandlerState},
-    persist_store::PersistStore,
-    static_files,
-};
 use quicproxy::bootstrap;
 use quicproxy::config::Config;
 use quicproxy::utils::elevate::{self, ElevateConfig};
+use quicproxy::{
+    api::{
+        common::cors_middleware,
+        core_manager::CoreManager,
+        management::{self, ManagementState},
+        persist_handler::{self, PersistHandlerState},
+        persist_store::PersistStore,
+        static_files,
+    },
+    proxy::inbound::create_tcp_listener,
+};
 use serde_json::json;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::process;
 use tracing::info;
@@ -53,7 +56,7 @@ struct Args {
     manage: bool,
 
     /// 管理服务器监听地址
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "::")]
     host: String,
 
     /// 管理服务器监听端口
@@ -242,8 +245,8 @@ async fn run_manage(args: Args) -> Result<()> {
         core_api_router.layer(axum::middleware::from_fn(cors_middleware))
     };
 
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = SocketAddr::new(args.host.parse::<IpAddr>()?, args.port);
+    let listener = create_tcp_listener(addr)?;
 
     info!("Manage server listening on {}", addr);
     info!("core_path: {}", core_path_display);

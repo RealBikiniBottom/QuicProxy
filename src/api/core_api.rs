@@ -19,7 +19,7 @@ use axum::{
 use hashbrown::HashMap;
 use hyper::http::Method;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use sysinfo::System;
 use tokio::sync::mpsc::Sender;
@@ -53,10 +53,10 @@ pub async fn init_core_api(
         }
     };
 
-    let addr_str = format!("{}:{}", api.address, api.port);
-    let addr: SocketAddr = addr_str
-        .parse()
-        .map_err(|e| std::io::Error::other(format!("Invalid API address '{}': {}", addr_str, e)))?;
+    let ip = api.address.parse::<IpAddr>().map_err(|e| {
+        std::io::Error::other(format!("Invalid API address '{}': {}", api.address, e))
+    })?;
+    let addr = SocketAddr::new(ip, api.port);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
 
@@ -87,7 +87,7 @@ pub async fn init_core_api(
             },
         });
 
-    let listener = create_tcp_listener(addr).await?;
+    let listener = create_tcp_listener(addr)?;
 
     shutdown::spawn(async move {
         info!("Core API server listening on {}", addr);

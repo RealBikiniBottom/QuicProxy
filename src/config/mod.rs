@@ -5,7 +5,7 @@ use serde_json;
 use serde_json5;
 use std::fs::File;
 use std::io::Read;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
@@ -353,20 +353,23 @@ impl InboundConfig {
     }
 
     /// Returns the required host and port for this inbound.
-    pub fn endpoint(&self, tag: &str) -> anyhow::Result<(&str, u16)> {
-        let bound = format!("{} inbound '{}'", self.protocol_type, tag);
+    pub fn endpoint(&self) -> anyhow::Result<(&str, u16)> {
+        let bound = format!("{} inbound", self.protocol_type);
         required_endpoint(&self.address, self.port, &bound)
     }
 
     /// Returns the inbound endpoint parsed as a socket address.
-    pub fn socket_addr(&self, tag: &str) -> anyhow::Result<SocketAddr> {
-        let (address, port) = self.endpoint(tag)?;
-        format!("{address}:{port}").parse().with_context(|| {
-            format!(
-                "{} inbound '{}' has an invalid socket address",
-                self.protocol_type, tag
-            )
-        })
+    pub fn socket_addr(&self) -> anyhow::Result<SocketAddr> {
+        let (address, port) = self.endpoint()?;
+        address
+            .parse::<IpAddr>()
+            .map(|ip| SocketAddr::new(ip, port))
+            .with_context(|| {
+                format!(
+                    "{} inbound has an invalid socket address",
+                    self.protocol_type
+                )
+            })
     }
 
     /// Returns the required username and password for this inbound.
@@ -627,7 +630,7 @@ mod tests {
             "port": 1080
         }))
         .unwrap();
-        assert_eq!(inbound.socket_addr("local").unwrap().port(), 1080);
+        assert_eq!(inbound.socket_addr().unwrap().port(), 1080);
         assert_eq!(inbound.idle_timeout(), Duration::from_secs(30));
 
         let outbound: OutboundConfig = serde_json::from_value(json!({
@@ -645,5 +648,17 @@ mod tests {
         assert_eq!(outbound.credentials("proxy").unwrap(), ("user", "secret"));
         assert_eq!(outbound.connect_timeout(), Duration::from_secs(30));
         assert_eq!(outbound.udp_mode_or("stream"), "datagram");
+    }
+
+    #[test]
+    fn inbound_socket_addr_accepts_ipv6_without_brackets() {
+        let inbound: InboundConfig = serde_json::from_value(json!({
+            "type": "socks5",
+            "address": "::",
+            "port": 1080
+        }))
+        .unwrap();
+
+        assert_eq!(inbound.socket_addr().unwrap(), "[::]:1080".parse().unwrap());
     }
 }

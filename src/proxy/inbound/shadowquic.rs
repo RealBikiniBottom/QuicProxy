@@ -1,6 +1,7 @@
 use anyhow::bail;
 use async_trait::async_trait;
 use quinn::VarInt;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU16;
 use std::time::Duration;
@@ -57,7 +58,7 @@ impl ShadowQuicInbound {
             auth_hash = Some(gen_sunny_auth_hash(username, password));
         }
 
-        let (address, port) = cfg.endpoint(&tag)?;
+        let (address, port) = cfg.endpoint()?;
 
         Ok(Self {
             tag,
@@ -147,9 +148,9 @@ impl AnyInbound for ShadowQuicInbound {
     }
 
     async fn listen(&self) -> anyhow::Result<()> {
-        let listen_addr = format!("{}:{}", self.address, self.port);
+        let listen_addr = SocketAddr::new(self.address.parse::<IpAddr>()?, self.port);
         let mut listener = QuinnServer::new(
-            &listen_addr,
+            listen_addr,
             self.idle_timeout,
             self.tls.cert.as_deref(),
             self.tls.key.as_deref(),

@@ -46,7 +46,7 @@ WEB_DIR="${WEB_DIR:-}"
 WEB_UI_MODE="${WEB_UI_MODE:-ask}"
 VERSION="${VERSION:-}"
 WORK_DIR="${WORK_DIR:-${INSTALL_DIR}}"
-HOST="${HOST:-0.0.0.0}"
+HOST="${HOST:-::}"
 PERSIST_PATH="${WORK_DIR}/persist.json"
 
 TMPDIR=""
@@ -844,7 +844,7 @@ while [[ $# -gt 0 ]]; do
       VERSION="$2"; shift 2 ;;
     *)
       log_error "未知参数: $1"
-      echo "用法: sudo bash linux_install.sh [--password PASS] [--port 8080] [--host 0.0.0.0] [--web-ui ask|with|without] [--web-dir /path] [--work-dir /path] [--version v1.0.0]"
+      echo "用法: sudo bash linux_install.sh [--password PASS] [--port 8080] [--host ::] [--web-ui ask|with|without] [--web-dir /path] [--work-dir /path] [--version v1.0.0]"
       exit 1
       ;;
   esac

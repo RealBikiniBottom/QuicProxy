@@ -192,13 +192,13 @@ pub fn try_create_dualstack_socket(
             dualstack = true;
         }
     };
+    socket.set_nonblocking(true)?;
     Ok((socket, dualstack))
 }
 
 pub fn try_create_dualstack_tcplistener(addr: SocketAddr) -> io::Result<TcpListener> {
     let (socket, _dualstack) = try_create_dualstack_socket(addr, socket2::Type::STREAM)?;
 
-    socket.set_nonblocking(true)?;
     // For fast restart avoid Address In Use Error
     socket.set_reuse_address(true)?;
     socket.bind(&addr.into())?;
@@ -206,4 +206,12 @@ pub fn try_create_dualstack_tcplistener(addr: SocketAddr) -> io::Result<TcpListe
 
     let listener = TcpListener::from_std(socket.into())?;
     Ok(listener)
+}
+
+pub fn try_create_dualstack_udpsocket(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    let (socket, _dualstack) = try_create_dualstack_socket(addr, socket2::Type::DGRAM)?;
+
+    socket.bind(&addr.into())?;
+
+    Ok(socket.into())
 }

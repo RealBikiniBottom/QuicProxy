@@ -20,13 +20,12 @@ use crate::proxy::inbound::trojan::TrojanInbound;
 use crate::proxy::observe::get_observer;
 use crate::utils::interface::InterfaceManager;
 use crate::utils::shutdown;
+pub use crate::utils::socket::socket_helpers::try_create_dualstack_tcplistener as create_tcp_listener;
 use crate::utils::system_proxy::{SystemProxyGuard, set_system_proxy};
 use anyhow::bail;
 use async_trait::async_trait;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tracing::error;
 
 pub fn init_inbounds(cfg: &Config) -> anyhow::Result<()> {
@@ -72,30 +71,6 @@ pub fn init_inbounds(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 创建TCP监听器，支持IPv4/IPv6双栈
-pub async fn create_tcp_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
-    let socket = socket2::Socket::new(
-        if addr.is_ipv6() {
-            socket2::Domain::IPV6
-        } else {
-            socket2::Domain::IPV4
-        },
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-
-    if addr.is_ipv6() {
-        socket.set_only_v6(false)?;
-    }
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(1024)?;
-
-    let listener = TcpListener::from_std(socket.into())?;
-    Ok(listener)
-}
-
 /// 设置系统代理（如果启用），返回代理Guard
 pub fn setup_system_proxy(
     set_proxy: bool,
@@ -131,4 +106,26 @@ pub trait AnyInbound: Send + Sync {
     fn idle_timeout(&self) -> Duration;
 
     async fn listen(&self) -> anyhow::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_tcp_listener;
+    use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn unspecified_ipv6_listener_accepts_both_ip_families() {
+        let listener = create_tcp_listener("[::]:0".parse().unwrap()).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        TcpStream::connect(("::1", port)).await.unwrap();
+        TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unspecified_ipv4_listener_stays_ipv4() {
+        let listener = create_tcp_listener("0.0.0.0:0".parse().unwrap()).unwrap();
+
+        assert!(listener.local_addr().unwrap().is_ipv4());
+    }
 }

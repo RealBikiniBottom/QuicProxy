@@ -35,7 +35,7 @@ pub struct Socks5Inbound {
 
 impl Socks5Inbound {
     pub fn new(tag: String, cfg: &InboundConfig) -> anyhow::Result<Self> {
-        let addr = cfg.socket_addr(&tag)?;
+        let addr = cfg.socket_addr()?;
 
         let users = match (&cfg.username, &cfg.password) {
             (Some(u), Some(p)) => Some(vec![User {
@@ -66,7 +66,7 @@ impl AnyInbound for Socks5Inbound {
     }
 
     async fn listen(&self) -> anyhow::Result<()> {
-        let listener = create_tcp_listener(self.addr).await?;
+        let listener = create_tcp_listener(self.addr)?;
         info!("Socks5 Inbound listening on {}", self.addr);
 
         let _proxy_guard = setup_system_proxy(

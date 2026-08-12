@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, trace};
 
 use crate::utils::new_io_other_error;
+use crate::utils::socket::socket_helpers::try_create_dualstack_udpsocket;
 
 use super::{QuicBistream, QuicConnection, QuicUnistream};
 
@@ -199,7 +200,7 @@ pub struct QuinnServer {
 
 impl QuinnServer {
     pub async fn new(
-        addr: &str,
+        addr: SocketAddr,
         idle_timeout: Duration,
         cert_path: Option<&str>,
         key_path: Option<&str>,
@@ -319,8 +320,15 @@ impl QuinnServer {
 
         server_config.transport_config(Arc::new(transport_config));
 
-        let server_addr: SocketAddr = addr.parse()?;
-        let endpoint = quinn::Endpoint::server(server_config, server_addr)?;
+        let socket = try_create_dualstack_udpsocket(addr)?;
+        let runtime =
+            quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )?;
 
         let (tx, rx): (
             mpsc::Sender<Arc<quinn::Connection>>,

@@ -373,9 +373,18 @@ detect_available_port() {
 detect_server_ip() {
   log_step "检测公网 IP..."
 
+  SERVER_IPV4="${SERVER_IPV4:-}"
+  SERVER_IPV6="${SERVER_IPV6:-}"
+
   if [[ -n "${SERVER_IP:-}" ]]; then
+    SERVER_IP="${SERVER_IP#[}"
+    SERVER_IP="${SERVER_IP%]}"
+    if [[ "$SERVER_IP" == *:* ]]; then
+      SERVER_IPV6="$SERVER_IP"
+    else
+      SERVER_IPV4="$SERVER_IP"
+    fi
     log_info "使用手动指定的公网 IP: ${SERVER_IP}"
-    return
   fi
 
   local ip=""
@@ -390,45 +399,69 @@ detect_server_ip() {
     "https://ip.seeip.org"
   )
 
-  for svc in "${http_services[@]}"; do
-    ip=$(curl -sf4 --connect-timeout 5 --max-time 10 "$svc" 2>/dev/null | tr -d '[:space:]' || true)
-    if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      SERVER_IP="$ip"
-      log_info "检测到服务器公网 IP: ${SERVER_IP} (来源: ${svc})"
-      return
-    fi
-  done
+  if [[ -z "$SERVER_IPV4" ]]; then
+    for svc in "${http_services[@]}"; do
+      ip=$(curl -sf4 --connect-timeout 5 --max-time 10 "$svc" 2>/dev/null | tr -d '[:space:]' || true)
+      if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        SERVER_IPV4="$ip"
+        log_info "检测到服务器公网 IPv4: ${SERVER_IPV4} (来源: ${svc})"
+        break
+      fi
+    done
+  fi
 
-  if command -v dig &>/dev/null; then
+  if [[ -z "$SERVER_IPV4" ]] && command -v dig &>/dev/null; then
     ip=$(dig +short +timeout=5 myip.opendns.com @resolver1.opendns.com 2>/dev/null | tr -d '[:space:]' || true)
     if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      SERVER_IP="$ip"
-      log_info "检测到服务器公网 IP: ${SERVER_IP} (来源: DNS/OpenDNS)"
-      return
+      SERVER_IPV4="$ip"
+      log_info "检测到服务器公网 IPv4: ${SERVER_IPV4} (来源: DNS/OpenDNS)"
     fi
 
-    ip=$(dig +short +timeout=5 whoami.akamai.net @ns1-1.akamaitech.net 2>/dev/null | tr -d '[:space:]' || true)
-    if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      SERVER_IP="$ip"
-      log_info "检测到服务器公网 IP: ${SERVER_IP} (来源: DNS/Akamai)"
-      return
+    if [[ -z "$SERVER_IPV4" ]]; then
+      ip=$(dig +short +timeout=5 whoami.akamai.net @ns1-1.akamaitech.net 2>/dev/null | tr -d '[:space:]' || true)
+      if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        SERVER_IPV4="$ip"
+        log_info "检测到服务器公网 IPv4: ${SERVER_IPV4} (来源: DNS/Akamai)"
+      fi
     fi
   fi
 
-  if command -v nslookup &>/dev/null; then
+  if [[ -z "$SERVER_IPV4" ]] && command -v nslookup &>/dev/null; then
     ip=$(nslookup myip.opendns.com resolver1.opendns.com 2>/dev/null | grep -A1 "Name:" | grep "Address:" | tail -1 | awk '{print $2}' | tr -d '[:space:]' || true)
     if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      SERVER_IP="$ip"
-      log_info "检测到服务器公网 IP: ${SERVER_IP} (来源: nslookup/OpenDNS)"
-      return
+      SERVER_IPV4="$ip"
+      log_info "检测到服务器公网 IPv4: ${SERVER_IPV4} (来源: nslookup/OpenDNS)"
     fi
   fi
 
-  log_error "无法自动检测公网 IP, 请确认服务器能访问外网"
-  log_info "将直接退出, 避免生成无效的订阅链接"
-  log_info "如果你的服务器有固定公网 IP, 可用以下方式手动指定:"
-  log_info "  SERVER_IP=1.2.3.4 sudo bash server_install.sh"
-  exit 1
+  if [[ -z "$SERVER_IPV6" ]]; then
+    local ipv6_services=(
+      "https://api64.ipify.org"
+      "https://ifconfig.me/ip"
+      "https://icanhazip.com"
+      "https://api.ip.sb/ip"
+    )
+    for svc in "${ipv6_services[@]}"; do
+      ip=$(curl -sf6 --connect-timeout 5 --max-time 10 "$svc" 2>/dev/null | tr -d '[:space:]' || true)
+      if [[ -n "$ip" ]] && [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]]; then
+        SERVER_IPV6="$ip"
+        log_info "检测到服务器公网 IPv6: ${SERVER_IPV6} (来源: ${svc})"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "$SERVER_IPV4" ]] && [[ -z "$SERVER_IPV6" ]]; then
+    log_error "无法自动检测公网 IPv4 或 IPv6, 请确认服务器能访问外网"
+    log_info "将直接退出, 避免生成无效的订阅链接"
+    log_info "如果你的服务器有固定公网 IP, 可用以下方式手动指定:"
+    log_info "  SERVER_IP=1.2.3.4 sudo bash server_install.sh"
+    log_info "  SERVER_IP=2001:db8::1 sudo bash server_install.sh"
+    exit 1
+  fi
+
+  # 保留 SERVER_IP，兼容国家检测及脚本的原有调用方式。
+  SERVER_IP="${SERVER_IPV4:-$SERVER_IPV6}"
 }
 
 detect_server_country() {
@@ -442,9 +475,14 @@ detect_server_country() {
   local country=""
 
   # 优先用 ipinfo.io（有免费额度），备选 ip-api.com
-  country=$(curl -sf4 --connect-timeout 5 --max-time 10 "https://ipinfo.io/${SERVER_IP}/country" 2>/dev/null | tr -d '[:space:]' || true)
-  if [[ -z "$country" ]]; then
-    country=$(curl -sf4 --connect-timeout 5 --max-time 10 "http://ip-api.com/line/${SERVER_IP}?fields=countryCode" 2>/dev/null | tr -d '[:space:]' || true)
+  if [[ -n "${SERVER_IPV4:-}" ]]; then
+    country=$(curl -sf4 --connect-timeout 5 --max-time 10 "https://ipinfo.io/${SERVER_IPV4}/country" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ -z "$country" ]]; then
+      country=$(curl -sf4 --connect-timeout 5 --max-time 10 "http://ip-api.com/line/${SERVER_IPV4}?fields=countryCode" 2>/dev/null | tr -d '[:space:]' || true)
+    fi
+  else
+    # 仅 IPv6 的服务器直接通过 IPv6 出口查询本机国家，避免把裸 IPv6 拼入 URL 路径。
+    country=$(curl -sf6 --connect-timeout 5 --max-time 10 "https://ipinfo.io/country" 2>/dev/null | tr -d '[:space:]' || true)
   fi
 
   if [[ -n "$country" ]] && [[ "$country" =~ ^[A-Z]{2}$ ]]; then
@@ -491,7 +529,7 @@ JSON5EOF
     cat >> "$CONFIG_PATH" << JSON5EOF
     "shadowquic_inbound": {
       "type": "shadowquic",
-      "address": "0.0.0.0",
+      "address": "::",
       "port": ${port},
       "tls": {
         "enable_jls": true,
@@ -511,7 +549,7 @@ JSON5EOF
     cat >> "$CONFIG_PATH" << JSON5EOF
     "anytls_inbound": {
       "type": "anytls",
-      "address": "0.0.0.0",
+      "address": "::",
       "port": ${ANYTLS_PORT},
       "password": "${PASSWORD}",
       "tls": {
@@ -532,7 +570,7 @@ JSON5EOF
     cat >> "$CONFIG_PATH" << JSON5EOF
     "trojan_inbound": {
       "type": "trojan",
-      "address": "0.0.0.0",
+      "address": "::",
       "port": ${TROJAN_PORT},
       "password": "${PASSWORD}",
       "transport": {
@@ -627,7 +665,6 @@ UNITEOF
 generate_subscription_url() {
   log_step "生成订阅链接..."
 
-  local host="${SERVER_IP}"
   local sni="www.apple.com"
 
   local anytls_enabled=false
@@ -638,49 +675,40 @@ generate_subscription_url() {
   [[ "${ENABLE_TROJAN:-yes}" == "yes" ]] && trojan_enabled=true
 
   local node_num=1
-  local sq_url=""
-  local anytls_url=""
-  local trojan_url=""
+  local urls=()
+  local addresses=()
+  local families=()
+  [[ -n "${SERVER_IPV4:-}" ]] && addresses+=("${SERVER_IPV4}") && families+=("IPv4")
+  [[ -n "${SERVER_IPV6:-}" ]] && addresses+=("${SERVER_IPV6}") && families+=("IPv6")
 
-  if $sq_enabled; then
-    local sq_tag
-    sq_tag=$(printf "%s-%02d" "${SERVER_COUNTRY}" "${node_num}")
-    node_num=$((node_num + 1))
-    local encoded_tag
-    encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${sq_tag}', safe=''))" 2>/dev/null || echo "${sq_tag}")
-    sq_url="sq://${USERNAME}:${PASSWORD}@${host}:${SQ_PORT}?sni=${sni}&zero_rtt=true#${encoded_tag}"
-  fi
+  local index host family uri_host tag
+  for index in "${!addresses[@]}"; do
+    host="${addresses[$index]}"
+    family="${families[$index]}"
+    uri_host="$host"
+    [[ "$host" == *:* ]] && uri_host="[$host]"
 
-  if $anytls_enabled; then
-    local anytls_tag
-    anytls_tag=$(printf "%s-%02d" "${SERVER_COUNTRY}" "${node_num}")
-    node_num=$((node_num + 1))
-    local anytls_encoded_tag
-    anytls_encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${anytls_tag}', safe=''))" 2>/dev/null || echo "${anytls_tag}")
-    anytls_url="anytls://${PASSWORD}@${host}:${ANYTLS_PORT}?sni=${sni}&jls_u=${USERNAME}&jls_p=${PASSWORD}#${anytls_encoded_tag}"
-  fi
+    if $sq_enabled; then
+      tag=$(printf "%s-%02d-%s" "${SERVER_COUNTRY}" "${node_num}" "$family")
+      node_num=$((node_num + 1))
+      urls+=("sq://${USERNAME}:${PASSWORD}@${uri_host}:${SQ_PORT}?sni=${sni}&zero_rtt=true#${tag}")
+    fi
 
-  if $trojan_enabled; then
-    local trojan_tag
-    trojan_tag=$(printf "%s-%02d" "${SERVER_COUNTRY}" "${node_num}")
-    node_num=$((node_num + 1))
-    local trojan_encoded_tag
-    trojan_encoded_tag=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${trojan_tag}', safe=''))" 2>/dev/null || echo "${trojan_tag}")
-    trojan_url="trojan://${PASSWORD}@${host}:${TROJAN_PORT}?sni=${sni}&type=tcp&insecure=true#${trojan_encoded_tag}"
-  fi
+    if $anytls_enabled; then
+      tag=$(printf "%s-%02d-%s" "${SERVER_COUNTRY}" "${node_num}" "$family")
+      node_num=$((node_num + 1))
+      urls+=("anytls://${PASSWORD}@${uri_host}:${ANYTLS_PORT}?sni=${sni}&jls_u=${USERNAME}&jls_p=${PASSWORD}#${tag}")
+    fi
+
+    if $trojan_enabled; then
+      tag=$(printf "%s-%02d-%s" "${SERVER_COUNTRY}" "${node_num}" "$family")
+      node_num=$((node_num + 1))
+      urls+=("trojan://${PASSWORD}@${uri_host}:${TROJAN_PORT}?sni=${sni}&type=tcp&insecure=true#${tag}")
+    fi
+  done
 
   # 将订阅写入文件，方便之后查看、systemd 日志也会引用这个路径
-  {
-    if $sq_enabled; then
-      echo "$sq_url"
-    fi
-    if $anytls_enabled; then
-      echo "$anytls_url"
-    fi
-    if $trojan_enabled; then
-      echo "$trojan_url"
-    fi
-  } > "${INSTALL_DIR}/subscription.txt"
+  printf '%s\n' "${urls[@]}" > "${INSTALL_DIR}/subscription.txt"
 
   # 突出显示订阅链接
   local BOLD='\033[1m'
@@ -692,17 +720,10 @@ generate_subscription_url() {
   echo -e "  ${YELLOW}║${NC}  ${CYAN}请复制下面单独一整行链接，或复制备份文件内容${NC}                ${YELLOW}║${NC}"
   echo -e "  ${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
 
-  if $sq_enabled; then
-    echo -e "${GREEN}${BOLD}${sq_url}${NC}"
-  fi
-
-  if $anytls_enabled; then
-    echo -e "${GREEN}${BOLD}${anytls_url}${NC}"
-  fi
-
-  if $trojan_enabled; then
-    echo -e "${GREEN}${BOLD}${trojan_url}${NC}"
-  fi
+  local url
+  for url in "${urls[@]}"; do
+    echo -e "${GREEN}${BOLD}${url}${NC}"
+  done
 
   echo ""
 
