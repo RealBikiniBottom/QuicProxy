@@ -12,8 +12,7 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::timeout;
 use tracing::Instrument;
 use tracing::debug;
@@ -33,6 +32,9 @@ use super::SourceAddr;
 pub type UdpRecvMap = Arc<DashMap<u16, Arc<ShadowUdpReceiver>>>;
 pub type WaitingDatagramBuffer = Arc<DashMap<u16, Arc<ShadowUdpDatagramBuffer>>>;
 pub type SenderMapItem = (u16, Option<Arc<Mutex<quinn::SendStream>>>);
+
+const UDP_RECEIVE_QUEUE_CAPACITY: usize = 64;
+const WAITING_DATAGRAM_QUEUE_CAPACITY: usize = 8;
 
 pub struct PerConnectionState {
     pub next_context_id: Arc<AtomicU16>,
@@ -54,13 +56,13 @@ impl PerConnectionState {
 }
 
 pub struct ShadowUdpDatagramBuffer {
-    recveiver_sender: UnboundedSender<Bytes>,
-    recveiver: Mutex<UnboundedReceiver<Bytes>>,
+    recveiver_sender: Sender<Bytes>,
+    recveiver: Mutex<Receiver<Bytes>>,
 }
 
 impl ShadowUdpDatagramBuffer {
     pub fn new() -> Self {
-        let (sender, recver) = mpsc::unbounded_channel();
+        let (sender, recver) = mpsc::channel(WAITING_DATAGRAM_QUEUE_CAPACITY);
 
         Self {
             recveiver_sender: sender,
@@ -70,8 +72,8 @@ impl ShadowUdpDatagramBuffer {
 }
 
 pub struct ShadowUdpReceiver {
-    recveiver_sender: UnboundedSender<(TargetAddr, Bytes)>,
-    recveiver: Mutex<UnboundedReceiver<(TargetAddr, Bytes)>>,
+    recveiver_sender: Sender<(TargetAddr, Bytes)>,
+    recveiver: Mutex<Receiver<(TargetAddr, Bytes)>>,
 
     binded_coontext_id: DashMap<u16, TargetAddr>,
     udp_recv_map_notify: Arc<KeyedNotify>,
@@ -84,7 +86,7 @@ pub struct ShadowUdpReceiver {
 
 impl ShadowUdpReceiver {
     pub fn new(udp_recv_map: UdpRecvMap, udp_recv_map_notify: Arc<KeyedNotify>) -> Self {
-        let (sender, recver) = mpsc::unbounded_channel();
+        let (sender, recver) = mpsc::channel(UDP_RECEIVE_QUEUE_CAPACITY);
         let closer = Arc::new(SessionCloser::new());
 
         Self {
@@ -134,10 +136,17 @@ impl ShadowUdpReceiver {
                     } => {
                         match res {
                             Ok(data) => {
-                                if let Err(e) = sender_clone.send((remote_src.clone(), data)) {
-                                    closer_clone.close();
-                                    error!("unistream failed to send packet to sender: {}, id: {}", e, context_id);
-                                    break;
+                                tokio::select! {
+                                    _ = closer_clone.wait() => {
+                                        break;
+                                    }
+                                    result = sender_clone.send((remote_src.clone(), data)) => {
+                                        if let Err(e) = result {
+                                            closer_clone.close();
+                                            error!("unistream failed to send packet to sender: {}, id: {}", e, context_id);
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -157,17 +166,16 @@ impl ShadowUdpReceiver {
         Ok(())
     }
 
-    pub fn feed_datagram(&self, payload: Bytes, context_id: u16) -> anyhow::Result<()> {
-        if let Some(target) = self.binded_coontext_id.get(&context_id) {
-            match self.recveiver_sender.send((target.clone(), payload)) {
-                Ok(_) => {}
-                Err(e) => {
-                    self.closer.close();
-                    bail!("failed to feed datagram: {}", e);
-                }
-            };
-        } else {
-            bail!("can not feed_datagram to a unknow context_id");
+    pub async fn feed_datagram(&self, payload: Bytes, context_id: u16) -> anyhow::Result<()> {
+        let target = self
+            .binded_coontext_id
+            .get(&context_id)
+            .map(|target| target.clone())
+            .ok_or_else(|| anyhow::anyhow!("can not feed_datagram to a unknow context_id"))?;
+
+        if let Err(e) = self.recveiver_sender.send((target, payload)).await {
+            self.closer.close();
+            bail!("failed to feed datagram: {}", e);
         }
 
         Ok(())
@@ -377,7 +385,9 @@ pub fn start_datagram_loop(
                         udp_recv_map_notify.clone(),
                         waiting_datagram_buffer.clone(),
                         datagram,
-                    ) {
+                    )
+                    .await
+                    {
                         debug!("handle_datagram error: {}", e);
                     }
                 }
@@ -390,7 +400,7 @@ pub fn start_datagram_loop(
     });
 }
 
-fn handle_datagram(
+async fn handle_datagram(
     udp_recv_map: UdpRecvMap,
     udp_recv_map_notify: Arc<KeyedNotify>,
     waiting_datagram_buffer: WaitingDatagramBuffer,
@@ -409,8 +419,11 @@ fn handle_datagram(
 
     let payload = datagram.slice(2..);
 
-    if let Some(item) = udp_recv_map.get(&recv_context_id) {
-        return item.feed_datagram(payload, recv_context_id);
+    let receiver = udp_recv_map
+        .get(&recv_context_id)
+        .map(|item| item.value().clone());
+    if let Some(item) = receiver {
+        return item.feed_datagram(payload, recv_context_id).await;
     }
 
     let mut is_new = false;
@@ -423,7 +436,7 @@ fn handle_datagram(
         })
         .clone();
 
-    if let Err(e) = item.recveiver_sender.send(Bytes::from(payload)) {
+    if let Err(e) = item.recveiver_sender.send(payload).await {
         waiting_datagram_buffer.remove(&recv_context_id);
         bail!("datagram sender {} closed: {}", recv_context_id, e);
     }
@@ -452,7 +465,7 @@ fn handle_datagram(
                     }
                     payload = lock.recv() => {
                         if let Some(payload) = payload {
-                            if let Err(e) = item.feed_datagram(payload, recv_context_id) {
+                            if let Err(e) = item.feed_datagram(payload, recv_context_id).await {
                                 error!("feed_datagram: {}", e);
                                 break;
                             }
