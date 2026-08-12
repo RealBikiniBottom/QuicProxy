@@ -12,7 +12,6 @@ use serde::Serialize;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Notify;
@@ -283,17 +282,16 @@ impl TlsConfig {
     }
 }
 
-#[derive(Clone)]
 pub struct SessionCloser {
-    closed: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+    closed: AtomicBool,
+    notify: Notify,
 }
 
 impl SessionCloser {
     pub fn new() -> Self {
         Self {
-            closed: Arc::new(AtomicBool::new(false)),
-            notify: Arc::new(Notify::new()),
+            closed: AtomicBool::new(false),
+            notify: Notify::new(),
         }
     }
 

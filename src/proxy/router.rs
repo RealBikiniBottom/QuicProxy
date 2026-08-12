@@ -21,6 +21,8 @@ pub use rule::{Rule, RuleAction};
 
 use super::outbound::SessionMap;
 
+const UDP_SESSION_QUEUE_CAPACITY: usize = 16;
+
 static GLOBAL_ROUTER: LazyLock<StdRwLock<Option<Arc<Router>>>> =
     LazyLock::new(|| StdRwLock::new(None));
 
@@ -91,6 +93,68 @@ fn sniff_dns_target(
             (None, None, None)
         }
     }
+}
+
+async fn forward_udp_inbound_once(
+    in_packet: &Arc<dyn AnyPacket>,
+    out_packet: &Arc<dyn AnyPacket>,
+    source_addr: &SourceAddr,
+    original_target: &TargetAddr,
+    final_target: &TargetAddr,
+) -> anyhow::Result<()> {
+    let packets = in_packet
+        .recv_many()
+        .await
+        .context("receive inbound UDP packets")?;
+
+    for (_from, target, buf) in &packets {
+        let target = if *target == *original_target {
+            final_target
+        } else {
+            target
+        };
+        trace!(
+            "sending {} from {} to {}({})",
+            buf.len(),
+            source_addr,
+            original_target,
+            target
+        );
+        out_packet
+            .send_to(buf.clone(), source_addr, target)
+            .await
+            .context("send outbound UDP packet")?;
+    }
+
+    Ok(())
+}
+
+async fn forward_udp_outbound_once(
+    in_packet: &Arc<dyn AnyPacket>,
+    out_packet: &Arc<dyn AnyPacket>,
+    source_addr: &SourceAddr,
+    original_target: &TargetAddr,
+    final_target: &TargetAddr,
+) -> anyhow::Result<()> {
+    let packets = out_packet
+        .recv_many()
+        .await
+        .context("receive outbound UDP packets")?;
+
+    for (from, _target, buf) in &packets {
+        let from = if *from == *final_target {
+            original_target
+        } else {
+            from
+        };
+        trace!("receiving {} from {} to {}", buf.len(), from, source_addr,);
+        in_packet
+            .send_to(buf.clone(), from, source_addr)
+            .await
+            .context("send inbound UDP packet")?;
+    }
+
+    Ok(())
 }
 
 impl Router {
@@ -462,12 +526,17 @@ impl Router {
         original_target: &TargetAddr,
         source_addr: &SourceAddr,
         inbound_tag: &str,
-        payload: Option<&[u8]>,
+        payload: Option<Bytes>,
         timeout_duration: Duration,
         reset: Option<Arc<Notify>>,
     ) -> anyhow::Result<()> {
         let (out_packet, final_target) = self
-            ._dispatch_packet(source_addr, original_target, inbound_tag, payload)
+            ._dispatch_packet(
+                source_addr,
+                original_target,
+                inbound_tag,
+                payload.as_deref(),
+            )
             .await?;
         let out_packet_closer = out_packet.closer();
         let in_packet_closer = in_packet.closer();
@@ -481,161 +550,106 @@ impl Router {
                 final_target
             );
             out_packet
-                .send_to(Bytes::copy_from_slice(packet), source_addr, &final_target)
+                .send_to(packet, source_addr, &final_target)
                 .await?;
         }
 
-        // ==========================================
-        // Time Touch 核心：记录最后一次活跃时间
-        // ==========================================
-        // 使用 std::sync::Mutex 即可，因为它只在同步代码块中被极短时间持有，不存在跨 await 阻塞的问题。
-        let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
-
-        // ==========================================
-        // Spawn: Inbound -> Outbound (发往目标服务器)
-        // ==========================================
-        let t1_in = in_packet.clone();
-        let t1_out = out_packet.clone();
-        let t1_activity = last_activity.clone();
-        let t1_source = source_addr.clone();
-        let t1_target = original_target.clone();
-        let t1_final_target = final_target.clone();
-
-        let mut t1 = tokio::spawn(
-            async move {
-                loop {
-                    match t1_in.recv_many().await {
-                        Ok(packets) => {
-                            for (_from, target, buf) in &packets {
-                                let mut t = target;
-                                if *target == t1_target {
-                                    t = &t1_final_target;
-                                }
-                                trace!(
-                                    "sending {} from {} to {}({})",
-                                    buf.len(),
-                                    t1_source,
-                                    t1_target,
-                                    t
-                                );
-                                if let Err(e) = t1_out.send_to(buf.clone(), &t1_source, t).await {
-                                    error!("UDP session quit because [outbound err: {:?}]", e);
-                                    break;
-                                }
-                            }
-                            *t1_activity.lock().unwrap() = Instant::now();
-                        }
-                        Err(e) => {
-                            info!("UDP session quit because [inbound err: {:?}]", e);
-                            break;
-                        }
-                    }
-                }
+        let mut last_activity = Instant::now();
+        let check_timer = sleep(timeout_duration);
+        let inbound_forward = forward_udp_inbound_once(
+            &in_packet,
+            &out_packet,
+            source_addr,
+            original_target,
+            &final_target,
+        );
+        let outbound_forward = forward_udp_outbound_once(
+            &in_packet,
+            &out_packet,
+            source_addr,
+            original_target,
+            &final_target,
+        );
+        let out_packet_closed = out_packet_closer.wait();
+        let in_packet_closed = in_packet_closer.wait();
+        let reset_notified = async {
+            if let Some(reset) = reset {
+                reset.notified().await;
+            } else {
+                std::future::pending::<()>().await;
             }
-            .in_current_span(),
+        };
+        tokio::pin!(
+            check_timer,
+            inbound_forward,
+            outbound_forward,
+            out_packet_closed,
+            in_packet_closed,
+            reset_notified
         );
 
-        // ==========================================
-        // Spawn: Outbound -> Inbound (接收目标服务器返回)
-        // ==========================================
-        let t2_in = in_packet.clone();
-        let t2_out = out_packet.clone();
-        let t2_activity = last_activity.clone();
-        let t2_source = source_addr.clone();
-        let t2_target = original_target.clone();
-        let t2_final_target = final_target.clone();
-
-        let mut t2 = tokio::spawn(
-            async move {
-                loop {
-                    match t2_out.recv_many().await {
-                        Ok(packets) => {
-                            for (from, _target, buf) in &packets {
-                                let mut f = from;
-                                if *from == t2_final_target {
-                                    f = &t2_target;
-                                }
-                                trace!(
-                                    "receiving {} from {}({}) to {}",
-                                    buf.len(),
-                                    from,
-                                    f,
-                                    t2_source,
-                                );
-                                if let Err(e) = t2_in.send_to(buf.clone(), f, &t2_source).await {
-                                    error!("UDP session quit because [inbound err: {:#}]", e);
-                                    break;
-                                }
-                            }
-                            *t2_activity.lock().unwrap() = Instant::now();
-                        }
-                        Err(e) => {
-                            info!("UDP session quit because [outbound err: {:#}]", e);
-                            break;
-                        }
-                    }
-                }
-            }
-            .in_current_span(),
-        );
-
-        // 初始化检查定时器
-        let mut check_timer = Box::pin(sleep(timeout_duration));
-
-        // ==========================================
-        // 主监控循环
-        // ==========================================
         loop {
             tokio::select! {
-                // 1. 定期/按需检查 Idle Timeout
+                result = &mut inbound_forward => {
+                    match result {
+                        Ok(()) => {
+                            last_activity = Instant::now();
+                            inbound_forward.set(forward_udp_inbound_once(
+                                &in_packet,
+                                &out_packet,
+                                source_addr,
+                                original_target,
+                                &final_target,
+                            ));
+                        }
+                        Err(e) => {
+                            info!("UDP session quit because [inbound forwarding err: {:#}]", e);
+                            break;
+                        }
+                    }
+                },
+                result = &mut outbound_forward => {
+                    match result {
+                        Ok(()) => {
+                            last_activity = Instant::now();
+                            outbound_forward.set(forward_udp_outbound_once(
+                                &in_packet,
+                                &out_packet,
+                                source_addr,
+                                original_target,
+                                &final_target,
+                            ));
+                        }
+                        Err(e) => {
+                            info!("UDP session quit because [outbound forwarding err: {:#}]", e);
+                            break;
+                        }
+                    }
+                },
                 _ = &mut check_timer => {
-                    let last = *last_activity.lock().unwrap();
-                    let elapsed = last.elapsed();
-
-                    if elapsed >= timeout_duration {
-                        // 距离上一次 Time Touch 的时间已经超过超时阈值，真正超时
+                    if last_activity.elapsed() >= timeout_duration {
                         info!("UDP session quit because [idle timeout]");
                         break;
                     } else {
-                        // 期间有流量发生，重新将定时器拨到预期的下一次超时时间点
-                        check_timer.as_mut().reset((last + timeout_duration).into());
+                        check_timer
+                            .as_mut()
+                            .reset((last_activity + timeout_duration).into());
                     }
                 },
-                // 2. 通道关闭通知
-                _ = out_packet_closer.wait() => {
+                _ = &mut out_packet_closed => {
                     info!("UDP session quit because [outbound actively closed]");
                     break;
                 },
-                _ = in_packet_closer.wait() => {
+                _ = &mut in_packet_closed => {
                     info!("UDP session quit because [inbound actively closed]");
                     break;
                 },
-                // 3. 重置信号触发
-                _ = async {
-                    if let Some(n) = &reset {
-                        n.notified().await
-                    } else {
-                        std::future::pending().await // 永远挂起
-                    }
-                } => {
+                _ = &mut reset_notified => {
                     info!("UDP session quit because [reset notified]");
                     break;
                 },
-                // 4. 子任务退出监控
-                _ = &mut t1 => {
-                    break;
-                },
-                _ = &mut t2 => {
-                    break;
-                }
             }
         }
-
-        // ==========================================
-        // 资源清理
-        // ==========================================
-        t1.abort();
-        t2.abort();
 
         out_packet_closer.close();
         in_packet_closer.close();
@@ -740,22 +754,20 @@ pub async fn start_udp_loop(
     let inbound_packet_clone = inbound_packet.clone();
 
     let sessions: SessionMap = Arc::new(DashMap::new());
-    let timeout_duration = timeout_duration.clone();
-
     loop {
         match inbound_packet.recv_from().await {
             Ok((src, dst, payload)) => {
                 let key = (src.clone(), dst.clone());
 
-                if let Some(tx) = sessions.get(&key) {
+                let existing_tx = sessions.get(&key).map(|entry| entry.value().clone());
+                if let Some(tx) = existing_tx {
                     if tx.send(payload).await.is_err() {
-                        drop(tx);
-                        sessions.remove(&key);
+                        sessions.remove_if(&key, |_, active_tx| active_tx.is_closed());
                     }
                     continue;
                 }
 
-                let (new_tx, new_rx) = mpsc::channel::<Bytes>(32);
+                let (new_tx, new_rx) = mpsc::channel::<Bytes>(UDP_SESSION_QUEUE_CAPACITY);
                 sessions.insert(key.clone(), new_tx);
 
                 let handler = Arc::new(UdpHandler::new(
@@ -767,7 +779,6 @@ pub async fn start_udp_loop(
 
                 let router_clone = router.clone();
                 let inbound_tag_clone = inbound_tag.clone();
-                let timeout_duration = timeout_duration;
                 let sessions = sessions.clone();
                 let reset = reset.clone();
 
@@ -785,10 +796,10 @@ pub async fn start_udp_loop(
                         if let Err(err) = router_clone
                             .dispatch_packet(
                                 handler,
-                                &dst.clone(),
-                                &src.clone(),
+                                &dst,
+                                &src,
                                 &inbound_tag_clone,
-                                Some(payload.as_ref()),
+                                Some(payload),
                                 timeout_duration,
                                 Some(reset),
                             )
@@ -796,7 +807,7 @@ pub async fn start_udp_loop(
                         {
                             error!("Session {} handler error: {:?}", src, err);
                         }
-                        sessions.remove(&key);
+                        sessions.remove_if(&key, |_, active_tx| active_tx.is_closed());
                     }
                     .instrument(span),
                 );

@@ -17,12 +17,27 @@ use tokio::sync::mpsc;
 
 use tracing::{error, info, trace};
 
+use crate::utils::new_io_other_error;
 use crate::utils::socket::socket_helpers::try_create_dualstack_udpsocket;
-use crate::utils::{BUFFER_SIZE, new_io_other_error};
 
 use super::{QuicBistream, QuicConnection, QuicUnistream};
 
-pub const MAX_DATAGRAM_WINDOW: usize = BUFFER_SIZE * 128;
+// 300Mbps has a bandwidth-delay product of about 3.75MB at 100ms RTT. These
+// windows leave enough headroom for that workload while keeping each QUIC
+// connection's stream buffering bounded under the Network Extension budget.
+#[cfg(target_os = "ios")]
+const STREAM_RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
+#[cfg(target_os = "ios")]
+const CONNECTION_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+#[cfg(target_os = "ios")]
+const SEND_WINDOW: u64 = 8 * 1024 * 1024;
+#[cfg(target_os = "ios")]
+const MAX_CONCURRENT_STREAMS: u32 = 128;
+
+#[cfg(target_os = "ios")]
+const ACCEPT_CONNECTION_QUEUE_CAPACITY: usize = 64;
+#[cfg(not(target_os = "ios"))]
+const ACCEPT_CONNECTION_QUEUE_CAPACITY: usize = 200;
 
 fn keep_alive_interval_for(idle_timeout: Duration) -> Option<Duration> {
     if idle_timeout.is_zero() {
@@ -30,6 +45,72 @@ fn keep_alive_interval_for(idle_timeout: Duration) -> Option<Duration> {
     }
 
     Some(std::cmp::max(idle_timeout / 2, Duration::from_secs(1)))
+}
+
+fn make_transport_config(
+    idle_timeout: Duration,
+    congestion_controller: Option<&str>,
+    enable_gso: bool,
+    enable_mtudis: bool,
+    initial_mtu: u16,
+    min_mtu: u16,
+    default_max_concurrent_streams: Option<u32>,
+) -> TransportConfig {
+    let mut transport_config = TransportConfig::default();
+
+    if idle_timeout.is_zero() {
+        transport_config.max_idle_timeout(None);
+        transport_config.keep_alive_interval(None);
+    } else {
+        let timeout_ms = u32::try_from(idle_timeout.as_millis()).unwrap_or(u32::MAX);
+        transport_config.max_idle_timeout(Some(VarInt::from_u32(timeout_ms).into()));
+        transport_config.keep_alive_interval(keep_alive_interval_for(idle_timeout));
+    }
+
+    transport_config.enable_segmentation_offload(enable_gso);
+    transport_config.initial_mtu(initial_mtu);
+    transport_config.min_mtu(min_mtu);
+
+    #[cfg(target_os = "ios")]
+    {
+        transport_config.stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW));
+        transport_config.receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW));
+        transport_config.send_window(SEND_WINDOW);
+        transport_config.max_concurrent_bidi_streams(MAX_CONCURRENT_STREAMS.into());
+        transport_config.max_concurrent_uni_streams(MAX_CONCURRENT_STREAMS.into());
+    }
+
+    if let Some(max_streams) = default_max_concurrent_streams {
+        transport_config.max_concurrent_bidi_streams(max_streams.into());
+        transport_config.max_concurrent_uni_streams(max_streams.into());
+    }
+
+    let mtudis = if enable_mtudis {
+        let mut config = MtuDiscoveryConfig::default();
+        config.black_hole_cooldown(Duration::from_secs(120));
+        config.interval(Duration::from_secs(90));
+        Some(config)
+    } else {
+        None
+    };
+    transport_config.mtu_discovery_config(mtudis);
+
+    match congestion_controller
+        .unwrap_or("bbr")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "bbr" => transport_config
+            .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+        "cubic" => transport_config
+            .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
+        "newreno" => transport_config
+            .congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default())),
+        _ => transport_config
+            .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+    };
+
+    transport_config
 }
 
 pub struct QuinnUnistream {
@@ -266,57 +347,15 @@ impl QuinnServer {
 
             ServerConfig::with_single_cert(certs, key)?
         };
-        let mut transport_config = TransportConfig::default();
-        let t = idle_timeout.as_millis() as u32;
-        if t > 0 {
-            transport_config.max_idle_timeout(Some(VarInt::from_u32(t).into()));
-            transport_config.keep_alive_interval(keep_alive_interval_for(idle_timeout));
-        } else {
-            transport_config.max_idle_timeout(None);
-            transport_config.keep_alive_interval(None);
-        }
-        transport_config.datagram_receive_buffer_size(Some(MAX_DATAGRAM_WINDOW as usize));
-        transport_config.datagram_send_buffer_size(MAX_DATAGRAM_WINDOW.try_into().unwrap());
-        transport_config.max_concurrent_bidi_streams(500u32.into());
-        transport_config.max_concurrent_uni_streams(500u32.into());
-        transport_config.enable_segmentation_offload(enable_gso);
-        transport_config.initial_mtu(initial_mtu);
-        transport_config.min_mtu(min_mtu);
-
-        let mtudis = if enable_mtudis {
-            let mut mtudis = MtuDiscoveryConfig::default();
-            mtudis.black_hole_cooldown(Duration::from_secs(120));
-            mtudis.interval(Duration::from_secs(90));
-            Some(mtudis)
-        } else {
-            None
-        };
-        transport_config.mtu_discovery_config(mtudis);
-
-        // Set congestion controller
-        let cc_name = congestion_controller.as_deref().unwrap_or("bbr");
-        match cc_name.to_lowercase().as_str() {
-            "bbr" => {
-                transport_config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::BbrConfig::default(),
-                ));
-            }
-            "cubic" => {
-                transport_config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::CubicConfig::default(),
-                ));
-            }
-            "newreno" => {
-                transport_config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::NewRenoConfig::default(),
-                ));
-            }
-            _ => {
-                transport_config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::BbrConfig::default(),
-                ));
-            }
-        }
+        let transport_config = make_transport_config(
+            idle_timeout,
+            congestion_controller.as_deref(),
+            enable_gso,
+            enable_mtudis,
+            initial_mtu,
+            min_mtu,
+            Some(500),
+        );
 
         server_config.transport_config(Arc::new(transport_config));
 
@@ -333,7 +372,7 @@ impl QuinnServer {
         let (tx, rx): (
             mpsc::Sender<Arc<quinn::Connection>>,
             mpsc::Receiver<Arc<quinn::Connection>>,
-        ) = mpsc::channel(200);
+        ) = mpsc::channel(ACCEPT_CONNECTION_QUEUE_CAPACITY);
 
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
@@ -454,55 +493,15 @@ impl QuinnClient {
         let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
             .context("Failed to build QUIC client TLS config")?;
         let mut client_config = ClientConfig::new(Arc::new(quic_client_config));
-        let mut transport_config = TransportConfig::default();
-        let t = idle_timeout.as_millis() as u32;
-        if t > 0 {
-            transport_config.max_idle_timeout(Some(VarInt::from_u32(t).into()));
-            transport_config.keep_alive_interval(keep_alive_interval_for(idle_timeout));
-        } else {
-            transport_config.max_idle_timeout(None);
-            transport_config.keep_alive_interval(None);
-        }
-        transport_config.datagram_receive_buffer_size(Some(MAX_DATAGRAM_WINDOW as usize));
-        transport_config.datagram_send_buffer_size(MAX_DATAGRAM_WINDOW.try_into().unwrap());
-        transport_config.enable_segmentation_offload(enable_gso);
-        transport_config.initial_mtu(initial_mtu);
-        transport_config.min_mtu(min_mtu);
-
-        let mtudis = if enable_mtudis {
-            let mut mtudis = MtuDiscoveryConfig::default();
-            mtudis.black_hole_cooldown(Duration::from_secs(120));
-            mtudis.interval(Duration::from_secs(90));
-            Some(mtudis)
-        } else {
-            None
-        };
-        transport_config.mtu_discovery_config(mtudis);
-
-        // Set congestion controller
-        let cc_name = congestion_controller.as_deref().unwrap_or("bbr");
-        match cc_name.to_lowercase().as_str() {
-            "bbr" => {
-                transport_config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::BbrConfig::default(),
-                ));
-            }
-            "cubic" => {
-                transport_config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::CubicConfig::default(),
-                ));
-            }
-            "newreno" => {
-                transport_config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::NewRenoConfig::default(),
-                ));
-            }
-            _ => {
-                transport_config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::BbrConfig::default(),
-                ));
-            }
-        }
+        let transport_config = make_transport_config(
+            idle_timeout,
+            congestion_controller.as_deref(),
+            enable_gso,
+            enable_mtudis,
+            initial_mtu,
+            min_mtu,
+            None,
+        );
 
         client_config.transport_config(Arc::new(transport_config));
 
