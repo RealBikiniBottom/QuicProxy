@@ -388,7 +388,7 @@ fn handle_datagram(
     waiting_datagram_buffer: WaitingDatagramBuffer,
     datagram: Bytes,
 ) -> anyhow::Result<()> {
-    if datagram.len() <= 2 {
+    if datagram.len() < 2 {
         warn!("Received invalid shadowquic datagram, ignored");
         return Ok(());
     }
@@ -599,8 +599,10 @@ impl AnyPacket for ShadowQuicUdpPacket {
             let (_, lock) = self.get_send_context_id(context_addr).await?;
             let lock = lock.expect("should be unistream");
             let mut stream = lock.lock().await;
+            let payload_len = u16::try_from(buf.len())
+                .context("ShadowQUIC UDP payload exceeds the u16 stream length limit")?;
             let mut packet = Vec::with_capacity(2 + buf.len());
-            packet.extend_from_slice(&(buf.len() as u16).to_be_bytes());
+            packet.extend_from_slice(&payload_len.to_be_bytes());
             packet.extend_from_slice(&buf);
             stream.write_all(&packet).await?;
             stream.flush().await?;
