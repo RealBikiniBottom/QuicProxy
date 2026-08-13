@@ -16,8 +16,8 @@ use crate::proxy::router::get_router;
 use crate::proxy::shadowquic_udp::{
     ExtensionRequest, PerConnectionState, ShadowQuicUdpPacket, ShadowUdpReceiver, UdpRecvMap,
     auth_sunnyquic, gen_sunny_auth_hash, read_context_id, read_extension_request,
-    read_request_head, run_bistream_recv_listener, start_datagram_loop, start_udp_session_cleaner,
-    start_unistream_listener, write_conn_stats_response, write_ext_error_not_available,
+    read_request_head, run_bistream_recv_listener, start_datagram_loop, start_unistream_listener,
+    write_conn_stats_response, write_ext_error_not_available,
 };
 use crate::proxy::{TargetAddr, TlsConfig};
 use anyhow::Context;
@@ -183,11 +183,6 @@ impl AnyInbound for ShadowQuicInbound {
                     info!("Accepted QUIC connection from {}", conn.remote_address());
 
                     let per_conn = Arc::new(PerConnectionState::new());
-                    start_udp_session_cleaner(
-                        per_conn.udp_recv_map.clone(),
-                        session_timeout,
-                        session_timeout,
-                    );
 
                     let conn_clone = conn.clone();
                     let session_timeout_val = session_timeout;

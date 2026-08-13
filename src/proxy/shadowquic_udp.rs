@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
@@ -82,8 +81,6 @@ pub struct ShadowUdpReceiver {
 
     udp_recv_map: UdpRecvMap,
     closer: Arc<SessionCloser>,
-
-    create_at: Instant, // check for bistream delay but packet(unistream or datagram) had arrived
 }
 
 impl ShadowUdpReceiver {
@@ -94,7 +91,6 @@ impl ShadowUdpReceiver {
         Self {
             recveiver_sender: sender,
             recveiver: Mutex::new(recver),
-            create_at: now(),
             udp_recv_map,
             binded_coontext_id: DashMap::new(),
             udp_recv_map_notify,
@@ -254,36 +250,6 @@ pub fn run_bistream_recv_listener(mut recv: quinn::RecvStream, receiver: Arc<Sha
         }
         .instrument(current_span),
     );
-}
-
-pub fn start_udp_session_cleaner(
-    udp_recv_map: UdpRecvMap,
-    check_interval: Duration,
-    timeout: Duration,
-) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(check_interval).await;
-
-            let mut expired_ids = Vec::new();
-
-            for entry in udp_recv_map.iter() {
-                let receiver = entry.value();
-                if receiver.binded_coontext_id.len() == 0
-                    && now().duration_since(receiver.create_at) >= timeout
-                {
-                    expired_ids.push(*entry.key());
-                }
-            }
-
-            for id in expired_ids {
-                debug!("clean context_id {}", id);
-                if let Some((_, receiver)) = udp_recv_map.remove(&id) {
-                    receiver.closer.close();
-                }
-            }
-        }
-    });
 }
 
 async fn get_receiver(

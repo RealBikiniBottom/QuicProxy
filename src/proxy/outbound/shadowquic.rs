@@ -1,7 +1,6 @@
 use crate::proxy::shadowquic_udp::{
     PerConnectionState, ShadowQuicUdpPacket, ShadowUdpReceiver, gen_sunny_auth_hash,
-    run_bistream_recv_listener, start_datagram_loop, start_udp_session_cleaner,
-    start_unistream_listener,
+    run_bistream_recv_listener, start_datagram_loop, start_unistream_listener,
 };
 use crate::utils::interface::InterfaceManager;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
@@ -187,11 +186,6 @@ impl ShadowQuicOutbound {
             })?;
 
         let state = Arc::new(PerConnectionState::new());
-        start_udp_session_cleaner(
-            state.udp_recv_map.clone(),
-            self.idle_timeout,
-            self.idle_timeout,
-        );
 
         if let Some(auth_hash) = self.auth_hash {
             match conn.open_bi().await {
