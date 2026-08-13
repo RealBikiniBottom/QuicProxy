@@ -38,8 +38,8 @@ impl AnyPacket for _PoolUdpOutbound {
         self.inner.recv_from().await
     }
 
-    fn closer(&self) -> Arc<crate::proxy::SessionCloser> {
-        self.inner.closer().clone()
+    fn closer(&self) -> Option<Arc<crate::proxy::SessionCloser>> {
+        self.inner.closer()
     }
 }
 

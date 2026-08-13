@@ -41,8 +41,8 @@ impl DirectUdpOutbound {
 
 #[async_trait]
 impl AnyPacket for DirectUdpOutbound {
-    fn closer(&self) -> Arc<SessionCloser> {
-        self.closer.clone()
+    fn closer(&self) -> Option<Arc<SessionCloser>> {
+        Some(self.closer.clone())
     }
 
     async fn send_to(&self, buf: Bytes, _from: &SourceAddr, target: &TargetAddr) -> Result<usize> {
@@ -76,19 +76,20 @@ impl AnyPacket for DirectUdpOutbound {
         Ok((self.reverse(addr)?, TargetAddr::dummy(), buf.freeze()))
     }
 
-    async fn recv_many(&self) -> anyhow::Result<Vec<PacketInfo>> {
+    async fn recv_many(&self, packets: &mut Vec<PacketInfo>) -> anyhow::Result<()> {
         let first = self.recv_from().await?;
-        let mut results = vec![first];
+        packets.clear();
+        packets.push(first);
         loop {
             let mut buf = BytesMut::with_capacity(1024 * 2);
             if let Result::Ok((n, addr)) = self.socket.try_recv_buf_from(&mut buf) {
                 buf.truncate(n);
-                results.push((self.reverse(addr)?, TargetAddr::dummy(), buf.freeze()));
+                packets.push((self.reverse(addr)?, TargetAddr::dummy(), buf.freeze()));
             } else {
                 break;
             }
         }
-        Ok(results)
+        Ok(())
     }
 }
 

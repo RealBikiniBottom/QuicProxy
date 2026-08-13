@@ -230,8 +230,8 @@ impl AnyPacket for AnytlsInboundUdp {
         ))
     }
 
-    fn closer(&self) -> Arc<SessionCloser> {
-        self.closer.clone()
+    fn closer(&self) -> Option<Arc<SessionCloser>> {
+        Some(self.closer.clone())
     }
 }
 

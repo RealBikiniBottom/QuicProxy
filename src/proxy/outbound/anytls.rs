@@ -835,8 +835,8 @@ impl AnyPacket for AnytlsUdpSocket {
         ))
     }
 
-    fn closer(&self) -> Arc<SessionCloser> {
-        self.session.closer.clone()
+    fn closer(&self) -> Option<Arc<SessionCloser>> {
+        Some(self.session.closer.clone())
     }
 }
 

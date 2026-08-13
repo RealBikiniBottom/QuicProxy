@@ -31,8 +31,6 @@ const STREAM_RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 #[cfg(target_os = "ios")]
 const SEND_WINDOW: u64 = 8 * 1024 * 1024;
-#[cfg(target_os = "ios")]
-const MAX_CONCURRENT_STREAMS: u32 = 128;
 
 #[cfg(target_os = "ios")]
 const ACCEPT_CONNECTION_QUEUE_CAPACITY: usize = 64;

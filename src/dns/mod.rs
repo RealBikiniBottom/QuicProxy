@@ -700,7 +700,9 @@ impl AnyDNS for UdpDns {
         }
         .await;
 
-        closer.close();
+        if let Some(closer) = closer {
+            closer.close();
+        }
 
         result
     }

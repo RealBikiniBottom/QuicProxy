@@ -296,12 +296,14 @@ pub trait AnyPacket: Send + Sync {
         Ok(r)
     }
 
-    async fn recv_many(&self) -> anyhow::Result<Vec<PacketInfo>> {
-        Ok(vec![self.recv_from().await?])
+    async fn recv_many(&self, packets: &mut Vec<PacketInfo>) -> anyhow::Result<()> {
+        packets.clear();
+        packets.push(self.recv_from().await?);
+        Ok(())
     }
 
-    fn closer(&self) -> Arc<SessionCloser> {
-        Arc::new(SessionCloser::new())
+    fn closer(&self) -> Option<Arc<SessionCloser>> {
+        None
     }
 
     fn get_udp_stats(&self) -> Option<(u64, u64, u64)> {
@@ -421,27 +423,24 @@ pub enum UdpMode {
 }
 
 pub type SessionKey = (SourceAddr, TargetAddr);
-pub type SessionMap = Arc<DashMap<SessionKey, Sender<Bytes>>>;
+pub type SessionMap = Arc<DashMap<Arc<SessionKey>, Sender<Bytes>>>;
 
 pub struct UdpHandler {
     udp_tx: Arc<dyn AnyPacket>,
     udp_rx: Mutex<Receiver<Bytes>>,
-    src_addr: SourceAddr,
-    dst_addr: TargetAddr,
+    session_key: Arc<SessionKey>,
 }
 
 impl UdpHandler {
     pub fn new(
         udp_tx: Arc<dyn AnyPacket>,
         udp_rx: Receiver<Bytes>,
-        src_addr: SourceAddr,
-        dst_addr: TargetAddr,
+        session_key: Arc<SessionKey>,
     ) -> Self {
         UdpHandler {
             udp_tx,
             udp_rx: Mutex::new(udp_rx),
-            src_addr,
-            dst_addr,
+            session_key,
         }
     }
 }
@@ -460,21 +459,26 @@ impl AnyPacket for UdpHandler {
     async fn recv_from(&self) -> anyhow::Result<PacketInfo> {
         let mut rx = self.udp_rx.lock().await;
         match rx.recv().await {
-            Some(data) => Ok((self.src_addr.clone(), self.dst_addr.clone(), data)),
+            Some(data) => Ok((self.session_key.0.clone(), self.session_key.1.clone(), data)),
             None => bail!("UDP session channel closed"),
         }
     }
 
-    async fn recv_many(&self) -> anyhow::Result<Vec<PacketInfo>> {
+    async fn recv_many(&self, packets: &mut Vec<PacketInfo>) -> anyhow::Result<()> {
         let mut rx = self.udp_rx.lock().await;
         let first = match rx.recv().await {
             Some(data) => data,
             None => bail!("recv channel closed"),
         };
-        let mut results = vec![(self.src_addr.clone(), self.dst_addr.clone(), first)];
+        packets.clear();
+        packets.push((
+            self.session_key.0.clone(),
+            self.session_key.1.clone(),
+            first,
+        ));
         while let Result::Ok(data) = rx.try_recv() {
-            results.push((self.src_addr.clone(), self.dst_addr.clone(), data));
+            packets.push((self.session_key.0.clone(), self.session_key.1.clone(), data));
         }
-        Ok(results)
+        Ok(())
     }
 }

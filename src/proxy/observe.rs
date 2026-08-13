@@ -21,9 +21,12 @@ where
 
 #[derive(Debug, Serialize)]
 pub struct ConnectionTracker {
-    pub id: String,
-    pub inbound_tag: String,
-    pub outbound_tag: String,
+    #[serde(serialize_with = "serialize_uuid")]
+    pub id: Uuid,
+    #[serde(serialize_with = "serialize_shared_str")]
+    pub inbound_tag: Arc<str>,
+    #[serde(serialize_with = "serialize_shared_str")]
+    pub outbound_tag: Arc<str>,
     pub matched_rule_index: Option<usize>,
     pub final_target: TargetAddr,
     pub origin_target: TargetAddr,
@@ -36,10 +39,24 @@ pub struct ConnectionTracker {
     pub start_time: u64,
 }
 
+fn serialize_uuid<S>(value: &Uuid, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.collect_str(value.as_hyphenated())
+}
+
+fn serialize_shared_str<S>(value: &Arc<str>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(value)
+}
+
 impl ConnectionTracker {
     pub fn new(
-        inbound_tag: String,
-        outbound_tag: String,
+        inbound_tag: Arc<str>,
+        outbound_tag: Arc<str>,
         matched_rule_index: Option<usize>,
         final_target: TargetAddr,
         origin_target: TargetAddr,
@@ -47,7 +64,7 @@ impl ConnectionTracker {
         is_udp: bool,
     ) -> Self {
         Self {
-            id: Uuid::new_v4().to_string(),
+            id: Uuid::new_v4(),
             inbound_tag,
             outbound_tag,
             matched_rule_index,
@@ -240,10 +257,14 @@ pub struct Observer {
     outbound_traces: DashMap<String, OutboundTraceInfo>,
     pub realip2domain: DashMap<String, String>,
     global_stats: Arc<Stats>,
-    connections: DashMap<String, Arc<ConnectionTracker>>,
-    closers: DashMap<String, Arc<SessionCloser>>,
+    connections: DashMap<Uuid, ConnectionRecord>,
     dst_traffic: DashMap<String, DstTrafficEntry>,
     mem_stats: Mutex<(u64, u64, u64)>,
+}
+
+struct ConnectionRecord {
+    tracker: Arc<ConnectionTracker>,
+    closer: Option<Arc<SessionCloser>>,
 }
 
 impl Observer {
@@ -255,7 +276,6 @@ impl Observer {
             outbound_traces: DashMap::new(),
             global_stats: Arc::new(Stats::default()),
             connections: DashMap::new(),
-            closers: DashMap::new(),
             dst_traffic: DashMap::new(),
             mem_stats: Mutex::new((0, 0, 0)),
         }
@@ -264,17 +284,22 @@ impl Observer {
     pub fn add_connection(
         &self,
         conn: ConnectionTracker,
-        closer: Arc<SessionCloser>,
+        closer: Option<Arc<SessionCloser>>,
     ) -> Arc<ConnectionTracker> {
         let tracker = Arc::new(conn);
-        self.connections.insert(tracker.id.clone(), tracker.clone());
-        self.closers.insert(tracker.id.clone(), closer);
+        self.connections.insert(
+            tracker.id,
+            ConnectionRecord {
+                tracker: tracker.clone(),
+                closer,
+            },
+        );
         tracker
     }
 
-    pub fn remove_connection(&self, id: &str) {
-        if let Some((_, conn)) = self.connections.remove(id) {
-            self.closers.remove(id);
+    pub fn remove_connection(&self, id: &Uuid) {
+        if let Some((_, record)) = self.connections.remove(id) {
+            let conn = record.tracker;
             let upload = conn.upload.load(Ordering::Relaxed);
             let download = conn.download.load(Ordering::Relaxed);
             if upload > 0 || download > 0 {
@@ -300,13 +325,13 @@ impl Observer {
                         e.download = e.download.wrapping_add(download);
                         e.last_active = now;
                         if !conn.outbound_tag.is_empty() {
-                            e.outbound_tag = conn.outbound_tag.clone();
+                            e.outbound_tag = conn.outbound_tag.to_string();
                         }
                     })
                     .or_insert(DstTrafficEntry {
                         domain: domain,
                         ip: ip,
-                        outbound_tag: conn.outbound_tag.clone(),
+                        outbound_tag: conn.outbound_tag.to_string(),
                         upload,
                         download,
                         last_active: now,
@@ -316,28 +341,37 @@ impl Observer {
     }
 
     pub fn kill_connection(&self, id: &str) {
-        if let Some(closer) = self.closers.get(id) {
+        let Ok(id) = Uuid::parse_str(id) else {
+            return;
+        };
+        if let Some(record) = self.connections.get(&id)
+            && let Some(closer) = &record.closer
+        {
             closer.close();
         }
     }
 
     pub fn kill_all_connections(&self) {
-        for closer in self.closers.iter() {
-            closer.close();
+        for record in self.connections.iter() {
+            if let Some(closer) = &record.closer {
+                closer.close();
+            }
         }
     }
 
     pub fn kill_connections_by_outbound(&self, tag: &str) {
-        let to_close: Vec<String> = self
+        let to_close: Vec<Uuid> = self
             .connections
             .iter()
-            .filter(|entry| entry.value().outbound_tag == tag)
-            .map(|entry| entry.key().clone())
+            .filter(|entry| entry.value().tracker.outbound_tag.as_ref() == tag)
+            .map(|entry| *entry.key())
             .collect();
 
         info!("{} connection to delete", to_close.len());
         for id in to_close {
-            if let Some((_, closer)) = self.closers.remove(&id) {
+            if let Some(record) = self.connections.get(&id)
+                && let Some(closer) = &record.closer
+            {
                 closer.close();
                 info!("Closed connection: {}", id);
             }
@@ -345,7 +379,10 @@ impl Observer {
     }
 
     pub fn get_all_connections(&self) -> Vec<Arc<ConnectionTracker>> {
-        self.connections.iter().map(|r| r.value().clone()).collect()
+        self.connections
+            .iter()
+            .map(|r| r.value().tracker.clone())
+            .collect()
     }
 
     pub fn drain_dst_traffic(&self) -> Vec<DstTrafficEntry> {

@@ -140,9 +140,9 @@ async fn get_connections(
     let data: Vec<ConnectionData> = connections
         .iter()
         .map(|c| ConnectionData {
-            id: c.id.clone(),
-            inbound_tag: c.inbound_tag.clone(),
-            outbound_tag: c.outbound_tag.clone(),
+            id: c.id.to_string(),
+            inbound_tag: c.inbound_tag.to_string(),
+            outbound_tag: c.outbound_tag.to_string(),
             matched_rule_index: c.matched_rule_index,
             dst: c.final_target.to_string(),
             ip: c.origin_target.to_string(),

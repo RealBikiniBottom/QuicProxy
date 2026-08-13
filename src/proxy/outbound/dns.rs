@@ -45,8 +45,8 @@ struct DnsUdpOutbound {
 
 #[async_trait]
 impl AnyPacket for DnsUdpOutbound {
-    fn closer(&self) -> Arc<SessionCloser> {
-        self.closer.clone()
+    fn closer(&self) -> Option<Arc<SessionCloser>> {
+        Some(self.closer.clone())
     }
 
     async fn send_to(&self, buf: Bytes, from: &SourceAddr, target: &TargetAddr) -> Result<usize> {

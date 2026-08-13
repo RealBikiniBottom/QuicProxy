@@ -328,8 +328,8 @@ use bytes::{Bytes, BytesMut};
 
 #[async_trait]
 impl AnyPacket for Socks5UdpSocket {
-    fn closer(&self) -> Arc<crate::proxy::SessionCloser> {
-        self.closer.clone()
+    fn closer(&self) -> Option<Arc<crate::proxy::SessionCloser>> {
+        Some(self.closer.clone())
     }
 
     async fn send_to(

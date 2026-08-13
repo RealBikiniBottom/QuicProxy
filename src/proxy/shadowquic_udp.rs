@@ -572,8 +572,8 @@ impl ShadowQuicUdpPacket {
 
 #[async_trait]
 impl AnyPacket for ShadowQuicUdpPacket {
-    fn closer(&self) -> Arc<SessionCloser> {
-        self.receiver.closer.clone()
+    fn closer(&self) -> Option<Arc<SessionCloser>> {
+        Some(self.receiver.closer.clone())
     }
 
     async fn send_to(
@@ -609,20 +609,19 @@ impl AnyPacket for ShadowQuicUdpPacket {
         Ok(buf.len())
     }
 
-    async fn recv_many(&self) -> anyhow::Result<Vec<PacketInfo>> {
+    async fn recv_many(&self, packets: &mut Vec<PacketInfo>) -> anyhow::Result<()> {
         let mut rx = self.receiver.recveiver.lock().await;
-
-        let mut buffer = Vec::new();
-        let _left = rx.recv_many(&mut buffer, 10).await;
-        let mut results = Vec::with_capacity(buffer.len());
-        for item in buffer {
+        let first = rx.recv().await.context("recv_many closed")?;
+        packets.clear();
+        for item in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok()).take(9))
+        {
             if self.is_client {
-                results.push((item.0, TargetAddr::dummy(), item.1));
+                packets.push((item.0, TargetAddr::dummy(), item.1));
             } else {
-                results.push((TargetAddr::Ip(self.conn.remote_address()), item.0, item.1));
+                packets.push((TargetAddr::Ip(self.conn.remote_address()), item.0, item.1));
             }
         }
-        Ok(results)
+        Ok(())
     }
 
     async fn recv_from(&self) -> anyhow::Result<PacketInfo> {

@@ -11,9 +11,8 @@ pub struct ObservedPacket {
     pub inner: Arc<dyn AnyPacket>,
     pub observer: Arc<Observer>,
     pub tracker: Arc<ConnectionTracker>,
-    pub outbound_tag: String,
-    pub inbound_tag: String,
-    pub extra_outbound_tag: Option<String>,
+    pub outbound_tag: Arc<str>,
+    pub extra_outbound_tag: Option<Arc<str>>,
 }
 
 #[async_trait]
@@ -28,7 +27,7 @@ impl AnyPacket for ObservedPacket {
         self.observer
             .update_outbound_traffic(&self.outbound_tag, n as u64, 0);
         self.observer
-            .update_inbound_traffic(&self.inbound_tag, n as u64, 0);
+            .update_inbound_traffic(&self.tracker.inbound_tag, n as u64, 0);
         if let Some(ref tag) = self.extra_outbound_tag {
             self.observer.update_outbound_traffic(tag, n as u64, 0);
         }
@@ -42,7 +41,7 @@ impl AnyPacket for ObservedPacket {
         self.observer
             .update_outbound_traffic(&self.outbound_tag, 0, n as u64);
         self.observer
-            .update_inbound_traffic(&self.inbound_tag, 0, n as u64);
+            .update_inbound_traffic(&self.tracker.inbound_tag, 0, n as u64);
         if let Some(ref tag) = self.extra_outbound_tag {
             self.observer.update_outbound_traffic(tag, 0, n as u64);
         }
@@ -50,7 +49,21 @@ impl AnyPacket for ObservedPacket {
         Ok((src, dst, data))
     }
 
-    fn closer(&self) -> Arc<SessionCloser> {
+    async fn recv_many(&self, packets: &mut Vec<PacketInfo>) -> anyhow::Result<()> {
+        self.inner.recv_many(packets).await?;
+        let n = packets.iter().map(|(_, _, data)| data.len() as u64).sum();
+        self.observer
+            .update_outbound_traffic(&self.outbound_tag, 0, n);
+        self.observer
+            .update_inbound_traffic(&self.tracker.inbound_tag, 0, n);
+        if let Some(ref tag) = self.extra_outbound_tag {
+            self.observer.update_outbound_traffic(tag, 0, n);
+        }
+        self.tracker.inc_download(n);
+        Ok(())
+    }
+
+    fn closer(&self) -> Option<Arc<SessionCloser>> {
         self.inner.closer()
     }
 
@@ -70,7 +83,8 @@ impl AnyPacket for ObservedPacket {
 impl Drop for ObservedPacket {
     fn drop(&mut self) {
         self.observer.on_outbound_close_udp(&self.outbound_tag);
-        self.observer.on_inbound_close_udp(&self.inbound_tag);
+        self.observer
+            .on_inbound_close_udp(&self.tracker.inbound_tag);
         if let Some(ref tag) = self.extra_outbound_tag {
             self.observer.on_outbound_close_udp(tag);
         }

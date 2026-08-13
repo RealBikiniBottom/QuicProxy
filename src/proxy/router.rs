@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use std::future::Future;
 use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
+use tokio::select;
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::time::sleep;
 use tracing::{Instrument, Span, debug, error, field, info, info_span, trace};
@@ -101,17 +102,18 @@ async fn forward_udp_inbound_once(
     source_addr: &SourceAddr,
     original_target: &TargetAddr,
     final_target: &TargetAddr,
-) -> anyhow::Result<()> {
-    let packets = in_packet
-        .recv_many()
+    mut packets: Vec<super::outbound::PacketInfo>,
+) -> anyhow::Result<Vec<super::outbound::PacketInfo>> {
+    in_packet
+        .recv_many(&mut packets)
         .await
         .context("receive inbound UDP packets")?;
 
-    for (_from, target, buf) in &packets {
-        let target = if *target == *original_target {
+    for (_from, target, buf) in packets.drain(..) {
+        let target = if target == *original_target {
             final_target
         } else {
-            target
+            &target
         };
         trace!(
             "sending {} from {} to {}({})",
@@ -121,12 +123,12 @@ async fn forward_udp_inbound_once(
             target
         );
         out_packet
-            .send_to(buf.clone(), source_addr, target)
+            .send_to(buf, source_addr, target)
             .await
             .context("send outbound UDP packet")?;
     }
 
-    Ok(())
+    Ok(packets)
 }
 
 async fn forward_udp_outbound_once(
@@ -135,26 +137,27 @@ async fn forward_udp_outbound_once(
     source_addr: &SourceAddr,
     original_target: &TargetAddr,
     final_target: &TargetAddr,
-) -> anyhow::Result<()> {
-    let packets = out_packet
-        .recv_many()
+    mut packets: Vec<super::outbound::PacketInfo>,
+) -> anyhow::Result<Vec<super::outbound::PacketInfo>> {
+    out_packet
+        .recv_many(&mut packets)
         .await
         .context("receive outbound UDP packets")?;
 
-    for (from, _target, buf) in &packets {
-        let from = if *from == *final_target {
+    for (from, _target, buf) in packets.drain(..) {
+        let from = if from == *final_target {
             original_target
         } else {
-            from
+            &from
         };
         trace!("receiving {} from {} to {}", buf.len(), from, source_addr,);
         in_packet
-            .send_to(buf.clone(), from, source_addr)
+            .send_to(buf, from, source_addr)
             .await
             .context("send inbound UDP packet")?;
     }
 
-    Ok(())
+    Ok(packets)
 }
 
 impl Router {
@@ -195,13 +198,13 @@ impl Router {
             return (inbound_stream, outbound_stream, None);
         };
 
-        let inbound_tag_str = inbound_tag.to_string();
+        let inbound_tag_str: Arc<str> = Arc::from(inbound_tag);
 
-        let outbound_tag = outbound.tag().to_string();
-        let outbound_stats_tag = outbound
+        let outbound_tag: Arc<str> = Arc::from(outbound.tag());
+        let outbound_stats_tag: Arc<str> = outbound
             .as_selector()
-            .map(|s| s.get_effective_tag())
-            .unwrap_or_else(|| outbound.tag().to_string());
+            .map(|s| Arc::from(s.get_effective_tag()))
+            .unwrap_or_else(|| outbound_tag.clone());
 
         let inbound_stats = obs
             .get_inbound_stats(&inbound_tag_str)
@@ -221,7 +224,7 @@ impl Router {
 
         let tracker = ConnectionTracker::new(
             inbound_tag_str,
-            outbound_tag.to_string(),
+            outbound_tag,
             matched_idx,
             final_target.clone(),
             target.clone(),
@@ -230,7 +233,7 @@ impl Router {
         );
 
         let closer = Arc::new(SessionCloser::new());
-        let tracker_arc = obs.add_connection(tracker, closer.clone());
+        let tracker_arc = obs.add_connection(tracker, Some(closer.clone()));
 
         (
             Box::new(ObservedStream::new(
@@ -265,7 +268,7 @@ impl Router {
 
         match (session_closer, stop_notify) {
             (Some(c), Some(stop)) => {
-                tokio::select! {
+                select! {
                     r = &mut copy_fut => r,
                     _ = c.wait() => {
                         info!("Connection closed by API");
@@ -278,7 +281,7 @@ impl Router {
                 }
             }
             (Some(c), None) => {
-                tokio::select! {
+                select! {
                     r = &mut copy_fut => r,
                     _ = c.wait() => {
                         info!("Connection closed by API");
@@ -287,7 +290,7 @@ impl Router {
                 }
             }
             (None, Some(stop)) => {
-                tokio::select! {
+                select! {
                     r = &mut copy_fut => r,
                     _ = stop.notified() => {
                         info!("Connection closed by stop signal");
@@ -555,6 +558,8 @@ impl Router {
         }
 
         let mut last_activity = Instant::now();
+        let inbound_packets = Vec::with_capacity(UDP_SESSION_QUEUE_CAPACITY);
+        let outbound_packets = Vec::with_capacity(10);
         let check_timer = sleep(timeout_duration);
         let inbound_forward = forward_udp_inbound_once(
             &in_packet,
@@ -562,6 +567,7 @@ impl Router {
             source_addr,
             original_target,
             &final_target,
+            inbound_packets,
         );
         let outbound_forward = forward_udp_outbound_once(
             &in_packet,
@@ -569,9 +575,22 @@ impl Router {
             source_addr,
             original_target,
             &final_target,
+            outbound_packets,
         );
-        let out_packet_closed = out_packet_closer.wait();
-        let in_packet_closed = in_packet_closer.wait();
+        let out_packet_closed = async move {
+            if let Some(closer) = out_packet_closer {
+                closer.wait().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let in_packet_closed = async move {
+            if let Some(closer) = in_packet_closer {
+                closer.wait().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         let reset_notified = async {
             if let Some(reset) = reset {
                 reset.notified().await;
@@ -589,10 +608,10 @@ impl Router {
         );
 
         loop {
-            tokio::select! {
+            select! {
                 result = &mut inbound_forward => {
                     match result {
-                        Ok(()) => {
+                        Ok(packets) => {
                             last_activity = Instant::now();
                             inbound_forward.set(forward_udp_inbound_once(
                                 &in_packet,
@@ -600,6 +619,7 @@ impl Router {
                                 source_addr,
                                 original_target,
                                 &final_target,
+                                packets,
                             ));
                         }
                         Err(e) => {
@@ -610,7 +630,7 @@ impl Router {
                 },
                 result = &mut outbound_forward => {
                     match result {
-                        Ok(()) => {
+                        Ok(packets) => {
                             last_activity = Instant::now();
                             outbound_forward.set(forward_udp_outbound_once(
                                 &in_packet,
@@ -618,6 +638,7 @@ impl Router {
                                 source_addr,
                                 original_target,
                                 &final_target,
+                                packets,
                             ));
                         }
                         Err(e) => {
@@ -651,8 +672,12 @@ impl Router {
             }
         }
 
-        out_packet_closer.close();
-        in_packet_closer.close();
+        if let Some(closer) = out_packet.closer() {
+            closer.close();
+        }
+        if let Some(closer) = in_packet.closer() {
+            closer.close();
+        }
 
         if let Some((upload, download, start_time)) = out_packet.get_udp_stats() {
             let now = std::time::SystemTime::now()
@@ -684,11 +709,11 @@ impl Router {
         let (outbound, final_target, matched_idx, is_fakeip) = self
             .select_out(target_addr, inbound_tag, Some(NetworkType::Udp), payload)
             .await;
-        let tracker_tag = outbound.tag().to_string();
-        let stats_tag = outbound
+        let tracker_tag: Arc<str> = Arc::from(outbound.tag());
+        let stats_tag: Arc<str> = outbound
             .as_selector()
-            .map(|s| s.get_effective_tag())
-            .unwrap_or_else(|| outbound.tag().to_string());
+            .map(|s| Arc::from(s.get_effective_tag()))
+            .unwrap_or_else(|| tracker_tag.clone());
 
         info!("New UDP session: {} -> {}", source_addr, final_target);
 
@@ -701,12 +726,12 @@ impl Router {
                 );
                 // s is already Arc<TrackedPacket>
                 if let Some(obs) = get_observer() {
-                    let inbound_tag_str = inbound_tag.to_string();
+                    let inbound_tag_str: Arc<str> = Arc::from(inbound_tag);
                     obs.on_inbound_open_udp(&inbound_tag_str);
                     obs.on_outbound_open_udp(&stats_tag);
 
                     let tracker = ConnectionTracker::new(
-                        inbound_tag_str.clone(),
+                        inbound_tag_str,
                         tracker_tag.clone(),
                         matched_idx,
                         final_target.clone(),
@@ -729,7 +754,6 @@ impl Router {
                         observer: obs.clone(),
                         tracker: tracker_arc,
                         outbound_tag: stats_tag,
-                        inbound_tag: inbound_tag_str,
                         extra_outbound_tag,
                     };
                     Ok((Arc::new(wrapped), final_target))
@@ -757,7 +781,7 @@ pub async fn start_udp_loop(
     loop {
         match inbound_packet.recv_from().await {
             Ok((src, dst, payload)) => {
-                let key = (src.clone(), dst.clone());
+                let key = (src, dst);
 
                 let existing_tx = sessions.get(&key).map(|entry| entry.value().clone());
                 if let Some(tx) = existing_tx {
@@ -767,14 +791,14 @@ pub async fn start_udp_loop(
                     continue;
                 }
 
+                let session_key = Arc::new(key);
                 let (new_tx, new_rx) = mpsc::channel::<Bytes>(UDP_SESSION_QUEUE_CAPACITY);
-                sessions.insert(key.clone(), new_tx);
+                sessions.insert(session_key.clone(), new_tx);
 
                 let handler = Arc::new(UdpHandler::new(
                     inbound_packet_clone.clone(),
                     new_rx,
-                    src.clone(),
-                    dst.clone(),
+                    session_key.clone(),
                 ));
 
                 let router_clone = router.clone();
@@ -785,7 +809,7 @@ pub async fn start_udp_loop(
                 let span = info_span!(
                     "udp",
                     i = inbound_tag,
-                    s = %src,
+                    s = %session_key.0,
                     d = field::Empty,
                     r = field::Empty,
                     o = field::Empty
@@ -796,8 +820,8 @@ pub async fn start_udp_loop(
                         if let Err(err) = router_clone
                             .dispatch_packet(
                                 handler,
-                                &dst,
-                                &src,
+                                &session_key.1,
+                                &session_key.0,
                                 &inbound_tag_clone,
                                 Some(payload),
                                 timeout_duration,
@@ -805,9 +829,10 @@ pub async fn start_udp_loop(
                             )
                             .await
                         {
-                            error!("Session {} handler error: {:?}", src, err);
+                            error!("Session {} handler error: {:?}", session_key.0, err);
                         }
-                        sessions.remove_if(&key, |_, active_tx| active_tx.is_closed());
+                        sessions
+                            .remove_if(session_key.as_ref(), |_, active_tx| active_tx.is_closed());
                     }
                     .instrument(span),
                 );
