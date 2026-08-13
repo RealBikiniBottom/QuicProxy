@@ -77,7 +77,7 @@ pub struct ShadowUdpReceiver {
     recveiver_sender: Sender<(TargetAddr, Bytes)>,
     recveiver: Mutex<Receiver<(TargetAddr, Bytes)>>,
 
-    binded_coontext_id: DashMap<u16, TargetAddr>,
+    binded_context_id: DashMap<u16, TargetAddr>,
     udp_recv_map_notify: Arc<KeyedNotify>,
 
     udp_recv_map: UdpRecvMap,
@@ -93,7 +93,7 @@ impl ShadowUdpReceiver {
             recveiver_sender: sender,
             recveiver: Mutex::new(recver),
             udp_recv_map,
-            binded_coontext_id: DashMap::new(),
+            binded_context_id: DashMap::new(),
             udp_recv_map_notify,
             closer,
         }
@@ -102,10 +102,10 @@ impl ShadowUdpReceiver {
     // for udp OverStream
     pub fn run_unistream_worker(
         self: &Arc<Self>,
-        unistream: Arc<Mutex<quinn::RecvStream>>,
+        mut unistream: quinn::RecvStream,
         context_id: u16,
     ) -> anyhow::Result<()> {
-        let remote_src = match self.binded_coontext_id.get(&context_id) {
+        let remote_src = match self.binded_context_id.get(&context_id) {
             Some(r) => r,
             None => bail!("can not find binded context_id"),
         };
@@ -123,14 +123,12 @@ impl ShadowUdpReceiver {
                     }
 
                     res = async {
-                        let mut lock = unistream.lock().await;
-
                         let mut len_buf = [0u8; 2];
-                        lock.read_exact(&mut len_buf).await?;
+                        unistream.read_exact(&mut len_buf).await?;
                         let len = u16::from_be_bytes(len_buf);
 
                         let mut payload = vec![0u8; len as usize];
-                        lock.read_exact(&mut payload).await?;
+                        unistream.read_exact(&mut payload).await?;
 
                         Ok::<Bytes, anyhow::Error>(Bytes::from(payload))
                     } => {
@@ -159,12 +157,12 @@ impl ShadowUdpReceiver {
             }
 
             debug!("unistream_worker {} closed", context_id);
-            receiver_clone.binded_coontext_id.remove(&context_id);
+            receiver_clone.binded_context_id.remove(&context_id);
             udp_recv_map_clone.remove_if(&context_id, |_, receiver| {
                 Arc::ptr_eq(receiver, &receiver_clone)
             });
 
-            if receiver_clone.binded_coontext_id.is_empty() {
+            if receiver_clone.binded_context_id.is_empty() {
                 closer_clone.close();
             }
         });
@@ -174,7 +172,7 @@ impl ShadowUdpReceiver {
 
     pub fn feed_datagram(&self, payload: Bytes, context_id: u16) -> anyhow::Result<()> {
         let target = self
-            .binded_coontext_id
+            .binded_context_id
             .get(&context_id)
             .map(|target| target.clone())
             .ok_or_else(|| anyhow::anyhow!("can not feed_datagram to a unknow context_id"))?;
@@ -196,27 +194,37 @@ impl ShadowUdpReceiver {
     }
 
     pub fn bind_context_id(
-        &self,
+        self: &Arc<Self>,
         target: TargetAddr,
         context_id: u16,
-        myself: Arc<ShadowUdpReceiver>,
-    ) {
-        self.binded_coontext_id.insert(context_id, target.clone());
-        self.udp_recv_map.insert(context_id, myself);
+    ) -> anyhow::Result<()> {
+        match self.udp_recv_map.entry(context_id) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                self.binded_context_id.insert(context_id, target.clone());
+                entry.insert(self.clone());
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                bail!("context_id {} is already bound", context_id);
+            }
+        }
+
         self.udp_recv_map_notify.notify(&context_id.to_string());
         debug!("receive context_id {} with address {}", context_id, target);
+        Ok(())
     }
 
-    pub fn clean(&self) {
+    pub fn clean(self: &Arc<Self>) {
         let keys: Vec<u16> = self
-            .binded_coontext_id
+            .binded_context_id
             .iter()
             .map(|item| *item.key())
             .collect();
 
         for item in keys {
+            self.binded_context_id.remove(&item);
+            self.udp_recv_map
+                .remove_if(&item, |_, receiver| Arc::ptr_eq(receiver, self));
             self.udp_recv_map_notify.notify(&item.to_string());
-            self.udp_recv_map.remove(&item);
             debug!("removing context_id {} from UdpRecvMap", item);
         }
     }
@@ -249,7 +257,10 @@ pub fn run_bistream_recv_listener(mut recv: quinn::RecvStream, receiver: Arc<Sha
                     res = read_addr_and_context_id(&mut recv) => {
                         match res {
                             Ok((id, source)) => {
-                                receiver_for_spawn.bind_context_id(source, id, receiver_for_spawn.clone());
+                                if let Err(e) = receiver_for_spawn.bind_context_id(source, id) {
+                                    error!("failed to bind context_id {}: {}", id, e);
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 error!("recv read error: {}", e);
@@ -317,7 +328,7 @@ pub fn start_unistream_listener(
                             )
                             .await?;
 
-                            item.run_unistream_worker(Arc::new(Mutex::new(recv)), recv_context_id)?;
+                            item.run_unistream_worker(recv, recv_context_id)?;
 
                             Ok(())
                         }
@@ -487,7 +498,7 @@ fn handle_datagram(
         waiting_datagram_buffer.remove(&recv_context_id);
 
         if let Err(e) = result {
-            eprintln!("Task failed: {}", e);
+            error!("datagram {} handler failed: {:#}", recv_context_id, e);
         }
     });
 
@@ -531,14 +542,16 @@ impl ShadowQuicUdpPacket {
         send_context_id: u16,
         target: &SourceAddr,
     ) -> anyhow::Result<SenderMapItem> {
-        let mut lock = self.control_stream.lock().await;
+        {
+            let mut lock = self.control_stream.lock().await;
 
-        let target_bytes = target.to_bytes();
-        let mut packet = Vec::with_capacity(target_bytes.len() + 2);
-        packet.extend_from_slice(&target_bytes);
-        packet.extend_from_slice(&send_context_id.to_be_bytes());
-        lock.write_all(&packet).await?;
-        lock.flush().await?;
+            let target_bytes = target.to_bytes();
+            let mut packet = Vec::with_capacity(target_bytes.len() + 2);
+            packet.extend_from_slice(&target_bytes);
+            packet.extend_from_slice(&send_context_id.to_be_bytes());
+            lock.write_all(&packet).await?;
+            lock.flush().await?;
+        }
 
         if self.is_over_unistream {
             let uni_send = self.conn.open_uni().await?;
@@ -804,4 +817,33 @@ pub async fn write_ext_error_not_available(send: &mut quinn::SendStream) -> anyh
     send.write_u8(0x01).await?; // Result::Err tag
     send.write_u8(0x00).await?; // SQExtError::NotAvailable
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_context_id_does_not_replace_or_remove_current_receiver() {
+        let udp_recv_map = Arc::new(DashMap::new());
+        let notify = Arc::new(KeyedNotify::new());
+        let first = Arc::new(ShadowUdpReceiver::new(udp_recv_map.clone(), notify.clone()));
+        let stale = Arc::new(ShadowUdpReceiver::new(udp_recv_map.clone(), notify));
+        let target = TargetAddr::Ip("127.0.0.1:53".parse().unwrap());
+
+        first.bind_context_id(target.clone(), 7).unwrap();
+        assert!(stale.bind_context_id(target.clone(), 7).is_err());
+
+        // Simulate stale local state left by an older receiver. Its cleanup must
+        // not remove the receiver currently registered for the same ID.
+        stale.binded_context_id.insert(7, target);
+        stale.clean();
+
+        let current = udp_recv_map.get(&7).unwrap();
+        assert!(Arc::ptr_eq(current.value(), &first));
+        drop(current);
+
+        first.clean();
+        assert!(udp_recv_map.is_empty());
+    }
 }

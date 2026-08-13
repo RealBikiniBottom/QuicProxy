@@ -89,17 +89,11 @@ impl ShadowQuicInbound {
     ) -> anyhow::Result<()> {
         let recv_context_id = read_context_id(&mut bistream, idle_timeout).await?;
 
-        let receiver = udp_recv_map
-            .entry(recv_context_id)
-            .or_insert_with(|| {
-                Arc::new(ShadowUdpReceiver::new(
-                    udp_recv_map.clone(),
-                    udp_recv_map_notify.clone(),
-                ))
-            })
-            .clone();
-
-        receiver.bind_context_id(target.clone(), recv_context_id, receiver.clone());
+        let receiver = Arc::new(ShadowUdpReceiver::new(
+            udp_recv_map.clone(),
+            udp_recv_map_notify.clone(),
+        ));
+        receiver.bind_context_id(target.clone(), recv_context_id)?;
         run_bistream_recv_listener(bistream.recv, receiver.clone());
 
         let mut is_over_unistream = false;
