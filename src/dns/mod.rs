@@ -9,7 +9,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use hyper::header::HeaderMap;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use simple_dns::rdata::RData;
 use simple_dns::{
     CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, ResourceRecord, TYPE,
@@ -92,7 +92,7 @@ pub async fn resolve_domain(domain: &str, dns_server: Arc<dyn AnyDNS>) -> Result
     let res = dns_server.lookup(domain, false, &outbound).await?;
 
     let ip = res
-        .choose(&mut rand::thread_rng())
+        .choose(&mut rand::rng())
         .copied()
         .with_context(|| format!("DNS lookup failed for: {domain}"))?;
 

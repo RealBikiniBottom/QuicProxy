@@ -15,7 +15,7 @@ use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
-use rand::Rng;
+use rand::RngExt;
 use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -150,8 +150,8 @@ impl PaddingScheme {
                 .map(|e| match e {
                     PaddingEntry::Fixed(v) => *v as i64,
                     PaddingEntry::Range(min, max) => {
-                        let mut rng = rand::thread_rng();
-                        rng.gen_range(*min..=*max) as i64
+                        let mut rng = rand::rng();
+                        rng.random_range(*min..=*max) as i64
                     }
                     PaddingEntry::CheckMark => CHECK_MARK,
                 })

@@ -387,14 +387,37 @@ async fn get_trace(
         .get(&params.tag)
         .map(|entry| entry.value().clone())
         .ok_or(StatusCode::NOT_FOUND)?;
+
+    if let Some(selector) = outbound.as_selector() {
+        selector.try_url_test_reselect();
+
+        let selected_tag = selector.get_effective_tag();
+        let trace = state
+            .observer
+            .get_outbound_trace(&selected_tag)
+            .filter(|trace| trace.latency_ms > 0)
+            .ok_or(StatusCode::BAD_GATEWAY)?;
+        state.observer.update_outbound_trace(
+            &params.tag,
+            trace.latency_ms,
+            trace.ip.clone(),
+            trace.loc.clone(),
+            trace.uplink_path_stats.clone(),
+            trace.downlink_path_stats.clone(),
+        );
+
+        return Ok(Json(TraceResponse {
+            ip: trace.ip,
+            loc: trace.loc,
+            duration_ms: trace.latency_ms.max(0) as u64,
+            uplink_path_stats: trace.uplink_path_stats,
+            downlink_path_stats: trace.downlink_path_stats,
+        }));
+    }
+
     let dns = params.dns.as_deref().or_else(|| outbound.dns_server_name());
     match get_outbound_info(&params.tag, state.observer.clone(), dns).await {
-        Ok(r) => {
-            if let Some(sel) = outbound.as_selector() {
-                sel.try_url_test_reselect();
-            }
-            Ok(Json(r))
-        }
+        Ok(r) => Ok(Json(r)),
         Err(_) => {
             state
                 .observer

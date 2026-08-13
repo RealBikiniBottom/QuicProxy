@@ -1,5 +1,5 @@
 use bytes::{Buf, BytesMut};
-use rand::Rng;
+use rand::RngExt;
 use sha2::Digest;
 use std::io;
 use std::pin::Pin;
@@ -135,18 +135,18 @@ where
 
 pub fn rand_range<T>(range: std::ops::Range<T>) -> T
 where
-    T: rand::distributions::uniform::SampleUniform + std::cmp::PartialOrd,
+    T: rand::distr::uniform::SampleUniform + std::cmp::PartialOrd,
 {
-    let mut rng = rand::thread_rng();
-    rng.gen_range(range)
+    let mut rng = rand::rng();
+    rng.random_range(range)
 }
 
-pub fn rand_fill<T>(buf: &mut T)
+pub fn rand_fill<T>(buf: &mut [T])
 where
-    T: rand::Fill + ?Sized,
+    T: rand::Fill,
 {
-    let mut rng = rand::thread_rng();
-    buf.try_fill(&mut rng).unwrap_or(());
+    let mut rng = rand::rng();
+    rng.fill(buf);
 }
 
 pub fn sha256(bytes: &[u8]) -> Vec<u8> {

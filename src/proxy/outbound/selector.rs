@@ -326,12 +326,17 @@ impl SelectorOutbound {
         }
 
         info!(
-            "{} [{}] updated selected from [{}] to [{}]",
+            "{} [{}] updated node from [{}] to [{}]",
             self.protocol(),
             self.tag,
             self.outbounds[old_idx].tag(),
             self.outbounds[new_idx].tag()
         );
+
+        if let Some(observer) = get_observer() {
+            observer.kill_connections_by_outbound(&self.tag);
+        }
+
         if let Some(ref cache) = self.cache {
             if let Err(e) = cache.set("selected", &self.outbound_tags[new_idx]) {
                 warn!(
