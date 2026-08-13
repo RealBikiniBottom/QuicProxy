@@ -268,30 +268,14 @@ async fn get_receiver(
 ) -> anyhow::Result<Arc<ShadowUdpReceiver>> {
     let start_time = now();
     let notify_key = context_id.to_string();
-    let notifier = keyed_notify.get_or_create(&notify_key);
-
-    let receiver = timeout(Duration::from_secs(10), async {
-        let notified = notifier.notified();
-        tokio::pin!(notified);
-
-        loop {
-            // Register the waiter before checking the map so a concurrent
-            // insert + notify cannot happen between the check and await.
-            notified.as_mut().enable();
-
-            if let Some(entry) = udp_recv_map.get(&context_id) {
-                return entry.value().clone();
-            }
-
-            notified.as_mut().await;
-            notified.set(notifier.notified());
-        }
-    })
-    .await
-    .context("timeout waiting for receiver");
-
-    keyed_notify.remove(&notify_key);
-    let res = receiver?;
+    let receiver = keyed_notify
+        .wait_until(&notify_key, Duration::from_secs(10), || {
+            udp_recv_map
+                .get(&context_id)
+                .map(|entry| entry.value().clone())
+        })
+        .await
+        .context("timeout waiting for receiver")?;
 
     debug!(
         "get_receiver id {} cost: {}",
@@ -299,7 +283,7 @@ async fn get_receiver(
         format_duration(start_time.elapsed())
     );
 
-    Ok(res)
+    Ok(receiver)
 }
 
 pub fn start_unistream_listener(
