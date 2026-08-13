@@ -291,24 +291,39 @@ async fn get_receiver(
     context_id: u16,
     keyed_notify: Arc<KeyedNotify>,
 ) -> anyhow::Result<Arc<ShadowUdpReceiver>> {
-    if let Some(entry) = udp_recv_map.get(&context_id) {
-        return Ok(entry.value().clone());
-    }
-
     let start_time = now();
-    keyed_notify
-        .wait(&context_id.to_string(), Duration::from_secs(10))
-        .await?;
+    let notify_key = context_id.to_string();
+    let notifier = keyed_notify.get_or_create(&notify_key);
 
-    if let Some(entry) = udp_recv_map.get(&context_id) {
-        debug!(
-            "get_receiver id {} cost: {}",
-            context_id,
-            format_duration(start_time.elapsed())
-        );
-        return Ok(entry.value().clone());
-    }
-    bail!("failed to get_receiver");
+    let receiver = timeout(Duration::from_secs(10), async {
+        let notified = notifier.notified();
+        tokio::pin!(notified);
+
+        loop {
+            // Register the waiter before checking the map so a concurrent
+            // insert + notify cannot happen between the check and await.
+            notified.as_mut().enable();
+
+            if let Some(entry) = udp_recv_map.get(&context_id) {
+                return entry.value().clone();
+            }
+
+            notified.as_mut().await;
+            notified.set(notifier.notified());
+        }
+    })
+    .await
+    .context("timeout waiting for receiver")?;
+
+    keyed_notify.remove(&notify_key);
+
+    debug!(
+        "get_receiver id {} cost: {}",
+        context_id,
+        format_duration(start_time.elapsed())
+    );
+
+    Ok(receiver)
 }
 
 pub fn start_unistream_listener(
@@ -604,9 +619,9 @@ impl AnyPacket for ShadowQuicUdpPacket {
         packet.extend_from_slice(&send_context_id.to_be_bytes());
         packet.extend_from_slice(&buf);
         // self.conn.send_datagram_wait(Bytes::from(packet));
-        if let Err(e) = self.conn.send_datagram(Bytes::from(packet)) {
-            warn!("send_datagram: {}", e);
-        }
+        self.conn
+            .send_datagram(Bytes::from(packet))
+            .context("failed to send ShadowQUIC datagram")?;
         Ok(buf.len())
     }
 
