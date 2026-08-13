@@ -5,7 +5,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU16;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,9 +36,10 @@ type SenderMap = DashMap<SourceAddr, Arc<OnceCell<SenderMapItem>>>;
 
 const UDP_RECEIVE_QUEUE_CAPACITY: usize = 64;
 const WAITING_DATAGRAM_QUEUE_CAPACITY: usize = 8;
+const MAX_WAITING_DATAGRAM_CONTEXTS: usize = 1024;
 
 pub struct PerConnectionState {
-    pub next_context_id: Arc<AtomicU16>,
+    pub next_context_id: Arc<AtomicU32>,
     pub udp_recv_map: UdpRecvMap,
     pub udp_recv_map_notify: Arc<KeyedNotify>,
     pub waiting_datagram_buffer: WaitingDatagramBuffer,
@@ -48,7 +49,7 @@ impl PerConnectionState {
     pub fn new() -> Self {
         let udp_recv_map: UdpRecvMap = Arc::new(DashMap::new());
         Self {
-            next_context_id: Arc::new(AtomicU16::new(1)),
+            next_context_id: Arc::new(AtomicU32::new(1)),
             udp_recv_map,
             udp_recv_map_notify: Arc::new(KeyedNotify::new()),
             waiting_datagram_buffer: Arc::new(DashMap::new()),
@@ -164,19 +165,27 @@ impl ShadowUdpReceiver {
         Ok(())
     }
 
-    pub async fn feed_datagram(&self, payload: Bytes, context_id: u16) -> anyhow::Result<()> {
+    pub fn feed_datagram(&self, payload: Bytes, context_id: u16) -> anyhow::Result<()> {
         let target = self
             .binded_coontext_id
             .get(&context_id)
             .map(|target| target.clone())
             .ok_or_else(|| anyhow::anyhow!("can not feed_datagram to a unknow context_id"))?;
 
-        if let Err(e) = self.recveiver_sender.send((target, payload)).await {
-            self.closer.close();
-            bail!("failed to feed datagram: {}", e);
+        match self.recveiver_sender.try_send((target, payload)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!(
+                    "drop datagram because receive queue is full: {}",
+                    context_id
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.closer.close();
+                bail!("failed to feed datagram: receive queue closed");
+            }
         }
-
-        Ok(())
     }
 
     pub fn bind_context_id(
@@ -279,9 +288,10 @@ async fn get_receiver(
         }
     })
     .await
-    .context("timeout waiting for receiver")?;
+    .context("timeout waiting for receiver");
 
     keyed_notify.remove(&notify_key);
+    let res = receiver?;
 
     debug!(
         "get_receiver id {} cost: {}",
@@ -289,7 +299,7 @@ async fn get_receiver(
         format_duration(start_time.elapsed())
     );
 
-    Ok(receiver)
+    Ok(res)
 }
 
 pub fn start_unistream_listener(
@@ -368,9 +378,7 @@ pub fn start_datagram_loop(
                         udp_recv_map_notify.clone(),
                         waiting_datagram_buffer.clone(),
                         datagram,
-                    )
-                    .await
-                    {
+                    ) {
                         debug!("handle_datagram error: {}", e);
                     }
                 }
@@ -383,7 +391,7 @@ pub fn start_datagram_loop(
     });
 }
 
-async fn handle_datagram(
+fn handle_datagram(
     udp_recv_map: UdpRecvMap,
     udp_recv_map_notify: Arc<KeyedNotify>,
     waiting_datagram_buffer: WaitingDatagramBuffer,
@@ -406,10 +414,20 @@ async fn handle_datagram(
         .get(&recv_context_id)
         .map(|item| item.value().clone());
     if let Some(item) = receiver {
-        return item.feed_datagram(payload, recv_context_id).await;
+        return item.feed_datagram(payload, recv_context_id);
     }
 
     let mut is_new = false;
+
+    if !waiting_datagram_buffer.contains_key(&recv_context_id)
+        && waiting_datagram_buffer.len() >= MAX_WAITING_DATAGRAM_CONTEXTS
+    {
+        debug!(
+            "drop datagram because too many contexts are waiting: {}",
+            recv_context_id
+        );
+        return Ok(());
+    }
 
     let item = waiting_datagram_buffer
         .entry(recv_context_id)
@@ -419,9 +437,20 @@ async fn handle_datagram(
         })
         .clone();
 
-    if let Err(e) = item.recveiver_sender.send(payload).await {
-        waiting_datagram_buffer.remove(&recv_context_id);
-        bail!("datagram sender {} closed: {}", recv_context_id, e);
+    match item.recveiver_sender.try_send(payload) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            debug!(
+                "drop datagram because waiting queue is full: {}",
+                recv_context_id
+            );
+            return Ok(());
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            waiting_datagram_buffer
+                .remove_if(&recv_context_id, |_, value| Arc::ptr_eq(value, &item));
+            bail!("datagram sender {} closed", recv_context_id);
+        }
     }
     if !is_new {
         return Ok(());
@@ -448,7 +477,7 @@ async fn handle_datagram(
                     }
                     payload = lock.recv() => {
                         if let Some(payload) = payload {
-                            if let Err(e) = item.feed_datagram(payload, recv_context_id).await {
+                            if let Err(e) = item.feed_datagram(payload, recv_context_id) {
                                 error!("feed_datagram: {}", e);
                                 break;
                             }
@@ -481,7 +510,7 @@ pub struct ShadowQuicUdpPacket {
 
     conn: Arc<quinn::Connection>,
     control_stream: Arc<Mutex<quinn::SendStream>>,
-    next_context_id: Arc<AtomicU16>,
+    next_context_id: Arc<AtomicU32>,
 
     receiver: Arc<ShadowUdpReceiver>,
 }
@@ -491,7 +520,7 @@ impl ShadowQuicUdpPacket {
         is_over_unistream: bool,
         is_client: bool,
         receiver: Arc<ShadowUdpReceiver>,
-        next_context_id: Arc<AtomicU16>,
+        next_context_id: Arc<AtomicU32>,
         control_stream: Arc<Mutex<quinn::SendStream>>,
         conn: Arc<quinn::Connection>,
     ) -> Self {
@@ -544,7 +573,14 @@ impl ShadowQuicUdpPacket {
 
         sender_cell
             .get_or_try_init(|| async {
-                let send_context_id = self.next_context_id.fetch_add(1, Ordering::SeqCst);
+                let context_id = self.next_context_id.fetch_add(1, Ordering::Relaxed);
+                let send_context_id = match u16::try_from(context_id) {
+                    Ok(context_id) => context_id,
+                    Err(_) => {
+                        self.conn.close(0u32.into(), b"context id exhausted");
+                        bail!("ShadowQUIC context id exhausted; connection closed");
+                    }
+                };
                 self.create_sender(send_context_id, target).await
             })
             .await

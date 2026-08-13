@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use quinn::VarInt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU16;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -83,7 +83,7 @@ impl ShadowQuicInbound {
         inbound_tag: &str,
         udp_recv_map: UdpRecvMap,
         conn: Arc<quinn::Connection>,
-        send_context_id: Arc<AtomicU16>,
+        send_context_id: Arc<AtomicU32>,
         idle_timeout: Duration,
         udp_recv_map_notify: Arc<KeyedNotify>,
     ) -> anyhow::Result<()> {

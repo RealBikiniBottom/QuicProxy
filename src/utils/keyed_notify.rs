@@ -24,8 +24,9 @@ impl KeyedNotify {
     }
 
     pub fn notify(&self, key: &str) {
-        let notifier = self.get_or_create(key);
-        notifier.notify_waiters();
+        if let Some(notifier) = self.notifiers.get(key) {
+            notifier.notify_waiters();
+        }
     }
 
     pub async fn wait(&self, key: &str, wait_timeout: Duration) -> anyhow::Result<()> {
