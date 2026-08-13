@@ -101,7 +101,7 @@ impl ShadowUdpReceiver {
 
     // for udp OverStream
     pub fn run_unistream_worker(
-        &self,
+        self: &Arc<Self>,
         unistream: Arc<Mutex<quinn::RecvStream>>,
         context_id: u16,
     ) -> anyhow::Result<()> {
@@ -112,6 +112,7 @@ impl ShadowUdpReceiver {
         let closer_clone = self.closer.clone();
         let sender_clone = self.recveiver_sender.clone();
         let udp_recv_map_clone = self.udp_recv_map.clone();
+        let receiver_clone = self.clone();
         let remote_src = remote_src.clone();
         debug!("accept_uni for udp session: {}", context_id);
         tokio::spawn(async move {
@@ -158,8 +159,14 @@ impl ShadowUdpReceiver {
             }
 
             debug!("unistream_worker {} closed", context_id);
-            udp_recv_map_clone.remove(&context_id);
-            closer_clone.close();
+            receiver_clone.binded_coontext_id.remove(&context_id);
+            udp_recv_map_clone.remove_if(&context_id, |_, receiver| {
+                Arc::ptr_eq(receiver, &receiver_clone)
+            });
+
+            if receiver_clone.binded_coontext_id.is_empty() {
+                closer_clone.close();
+            }
         });
 
         Ok(())
