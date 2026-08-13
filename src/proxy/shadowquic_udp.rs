@@ -11,6 +11,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio::sync::OnceCell;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::timeout;
@@ -32,6 +33,7 @@ use super::SourceAddr;
 pub type UdpRecvMap = Arc<DashMap<u16, Arc<ShadowUdpReceiver>>>;
 pub type WaitingDatagramBuffer = Arc<DashMap<u16, Arc<ShadowUdpDatagramBuffer>>>;
 pub type SenderMapItem = (u16, Option<Arc<Mutex<quinn::SendStream>>>);
+type SenderMap = DashMap<SourceAddr, Arc<OnceCell<SenderMapItem>>>;
 
 const UDP_RECEIVE_QUEUE_CAPACITY: usize = 64;
 const WAITING_DATAGRAM_QUEUE_CAPACITY: usize = 8;
@@ -492,7 +494,7 @@ async fn handle_datagram(
 }
 
 pub struct ShadowQuicUdpPacket {
-    sender_map: DashMap<SourceAddr, SenderMapItem>,
+    sender_map: SenderMap,
     is_over_unistream: bool,
     is_client: bool,
 
@@ -523,11 +525,11 @@ impl ShadowQuicUdpPacket {
         }
     }
 
-    pub async fn build_sender(
+    async fn create_sender(
         &self,
         send_context_id: u16,
         target: &SourceAddr,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SenderMapItem> {
         let mut lock = self.control_stream.lock().await;
 
         let target_bytes = target.to_bytes();
@@ -546,27 +548,26 @@ impl ShadowQuicUdpPacket {
                 lock.write_all(&send_context_id.to_be_bytes()).await?;
                 lock.flush().await?;
             }
-            self.sender_map
-                .insert(target.clone(), (send_context_id, Some(send_mutex)));
+            Ok((send_context_id, Some(send_mutex)))
         } else {
-            self.sender_map
-                .insert(target.clone(), (send_context_id, None));
+            Ok((send_context_id, None))
         }
-        Ok(())
     }
 
-    pub async fn get_send_context_id(&self, target: &SourceAddr) -> anyhow::Result<SenderMapItem> {
-        if let Some(unistream) = self.sender_map.get(&target) {
-            return Ok(unistream.clone());
-        }
+    pub async fn get_send_context_id(&self, target: &TargetAddr) -> anyhow::Result<SenderMapItem> {
+        let sender_cell = self
+            .sender_map
+            .entry(target.clone())
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone();
 
-        let send_context_id = self.next_context_id.fetch_add(1, Ordering::SeqCst);
-        self.build_sender(send_context_id, target).await?;
-
-        if let Some(unistream) = self.sender_map.get(&target) {
-            return Ok(unistream.clone());
-        }
-        bail!("failed to init sender.");
+        sender_cell
+            .get_or_try_init(|| async {
+                let send_context_id = self.next_context_id.fetch_add(1, Ordering::SeqCst);
+                self.create_sender(send_context_id, target).await
+            })
+            .await
+            .cloned()
     }
 }
 
