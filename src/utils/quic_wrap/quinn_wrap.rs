@@ -76,8 +76,6 @@ fn make_transport_config(
         transport_config.stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW));
         transport_config.receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW));
         transport_config.send_window(SEND_WINDOW);
-        transport_config.max_concurrent_bidi_streams(MAX_CONCURRENT_STREAMS.into());
-        transport_config.max_concurrent_uni_streams(MAX_CONCURRENT_STREAMS.into());
     }
 
     if let Some(max_streams) = default_max_concurrent_streams {
