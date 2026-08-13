@@ -77,10 +77,10 @@ impl ShadowQuicOutbound {
 
         let cached_client = Arc::new(Mutex::new(None));
         if let Some(mut rx) = InterfaceManager::subscribe() {
-            let cached_client_cloen = cached_client.clone();
+            let temp = cached_client.clone();
             tokio::spawn(async move {
                 while let Ok(_) = rx.recv().await {
-                    let mut lock = cached_client_cloen.lock().await;
+                    let mut lock = temp.lock().await;
                     *lock = None;
                     info!("reset shadowquic outbound because iface changed");
                 }

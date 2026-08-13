@@ -12,7 +12,7 @@ use crate::{config::RouterMode, proxy::inbound::create_tcp_listener};
 use axum::{
     Router,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, put},
 };
@@ -25,13 +25,12 @@ use sysinfo::System;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info};
 
-use super::common::{check_auth, cors_middleware};
+use super::common::{auth_middleware, cors_middleware};
 
 // ─── State ───
 
 #[derive(Clone)]
 pub struct CoreApiState {
-    pub password: String,
     pub observer: Arc<Observer>,
     pub router: Arc<crate::proxy::router::Router>,
     pub shutdown_tx: Sender<()>,
@@ -59,6 +58,7 @@ pub async fn init_core_api(
     let addr = SocketAddr::new(ip, api.port);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+    let password: Arc<str> = Arc::from(api.password);
 
     let app = Router::new()
         .route("/observe", get(get_observe))
@@ -74,9 +74,12 @@ pub async fn init_core_api(
         .route("/quit", get(get_quit))
         .route("/traffic", get(get_traffic))
         .route("/version", get(get_runtime_core_version))
+        .route_layer(axum::middleware::from_fn_with_state(
+            password,
+            auth_middleware,
+        ))
         .layer(axum::middleware::from_fn(cors_middleware))
         .with_state(CoreApiState {
-            password: api.password,
             shutdown_tx,
             router: get_router()?,
             observer: match get_observer() {
@@ -112,11 +115,8 @@ struct DeleteConnectionParams {
 
 async fn delete_connections(
     State(state): State<CoreApiState>,
-    headers: HeaderMap,
     Query(params): Query<DeleteConnectionParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
     if params.all {
         state.observer.kill_all_connections();
     } else if let Some(id) = &params.id {
@@ -132,10 +132,7 @@ async fn delete_connections(
 
 async fn get_connections(
     State(state): State<CoreApiState>,
-    headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
     let connections = state.observer.get_all_connections();
     let data: Vec<ConnectionData> = connections
         .iter()
@@ -158,12 +155,7 @@ async fn get_connections(
 
 // ─── Handler: Observe ───
 
-async fn get_observe(
-    State(state): State<CoreApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
+async fn get_observe(State(state): State<CoreApiState>) -> Result<impl IntoResponse, StatusCode> {
     let mut inbounds = HashMap::new();
     for (tag, node) in state.observer.get_all_inbounds() {
         inbounds.insert(
@@ -235,12 +227,7 @@ async fn get_observe(
 
 // ─── Handler: Mode ───
 
-async fn get_mode(
-    State(state): State<CoreApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
+async fn get_mode(State(state): State<CoreApiState>) -> Result<impl IntoResponse, StatusCode> {
     let mode = state.router.get_mode().await;
     Ok(Json(serde_json::json!({ "mode": mode })))
 }
@@ -252,22 +239,15 @@ struct ModeUpdate {
 
 async fn put_mode(
     State(state): State<CoreApiState>,
-    headers: HeaderMap,
     Json(payload): Json<ModeUpdate>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
     state.router.set_mode(payload.mode).await;
     Ok(StatusCode::OK)
 }
 
 // ─── Handler: Outbounds ───
 
-async fn get_outbounds(
-    State(state): State<CoreApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
+async fn get_outbounds(State(state): State<CoreApiState>) -> Result<impl IntoResponse, StatusCode> {
     // Collect all entries first to avoid lifetime issues with DashMap iterator
     let entries: Vec<_> = OUTBOUNDS_MAP
         .iter()
@@ -331,12 +311,8 @@ struct SelectorUpdate {
 }
 
 async fn put_selector(
-    State(state): State<CoreApiState>,
-    headers: HeaderMap,
     Json(payload): Json<SelectorUpdate>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
     if let Some(entry) = OUTBOUNDS_MAP.get(&payload.outbound) {
         if let Some(selector) = entry.value().as_selector() {
             if selector.select_by_tag(&payload.selected) {
@@ -350,11 +326,7 @@ async fn put_selector(
 
 // ─── Handler: Quit ───
 
-async fn get_quit(
-    State(state): State<CoreApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
+async fn get_quit(State(state): State<CoreApiState>) -> Result<impl IntoResponse, StatusCode> {
     let _ = state.shutdown_tx.send(()).await;
     Ok(StatusCode::OK)
 }
@@ -372,17 +344,16 @@ pub struct TraceResponse {
     pub ip: String,
     pub loc: String,
     pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_node: Option<String>,
     pub uplink_path_stats: Option<crate::proxy::outbound::PathState>,
     pub downlink_path_stats: Option<crate::proxy::outbound::PathState>,
 }
 
 async fn get_trace(
     State(state): State<CoreApiState>,
-    headers: HeaderMap,
     Query(params): Query<TraceParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
     let outbound = OUTBOUNDS_MAP
         .get(&params.tag)
         .map(|entry| entry.value().clone())
@@ -391,6 +362,7 @@ async fn get_trace(
     if let Some(selector) = outbound.as_selector() {
         selector.try_url_test_reselect();
 
+        let selected_node = selector.get_selected_tag().map(str::to_owned);
         let selected_tag = selector.get_effective_tag();
         let trace = state
             .observer
@@ -410,6 +382,7 @@ async fn get_trace(
             ip: trace.ip,
             loc: trace.loc,
             duration_ms: trace.latency_ms.max(0) as u64,
+            selected_node,
             uplink_path_stats: trace.uplink_path_stats,
             downlink_path_stats: trace.downlink_path_stats,
         }));
@@ -488,6 +461,7 @@ pub async fn get_outbound_info(
         ip,
         loc,
         duration_ms,
+        selected_node: None,
         uplink_path_stats,
         downlink_path_stats,
     })
@@ -515,13 +489,7 @@ struct RequestResponse {
     duration_ms: u64,
 }
 
-async fn get_request(
-    State(state): State<CoreApiState>,
-    headers: HeaderMap,
-    Query(params): Query<RequestParams>,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
+async fn get_request(Query(params): Query<RequestParams>) -> Result<impl IntoResponse, StatusCode> {
     let start = std::time::Instant::now();
     let outbound = OUTBOUNDS_MAP
         .get(&params.tag)
@@ -569,23 +537,13 @@ async fn get_request(
 
 // ─── Handler: Traffic ───
 
-async fn get_traffic(
-    State(state): State<CoreApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
+async fn get_traffic(State(state): State<CoreApiState>) -> Result<impl IntoResponse, StatusCode> {
     Ok(Json(state.observer.drain_dst_traffic()))
 }
 
 // ─── Handler: Version & System Info ───
 
-async fn get_runtime_core_version(
-    State(state): State<CoreApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&headers, &state.password)?;
-
+async fn get_runtime_core_version() -> Result<impl IntoResponse, StatusCode> {
     let mut system = System::new_all();
     system.refresh_memory();
 
