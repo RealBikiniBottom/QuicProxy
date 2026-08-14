@@ -302,10 +302,24 @@ impl SessionCloser {
         }
     }
 
-    /// 等待关闭信号
+    /// 等待关闭信号。
+    ///
+    /// 支持多个并发监听者；close() 之后所有已注册的监听者都会被唤醒，
+    /// 之后新调用 wait() 的监听者也会立刻返回（不会挂起）。
     pub async fn wait(&self) {
-        while !self.is_closed() {
-            self.notify.notified().await;
+        // 先注册通知再检查标志位，避免 close() 恰好发生在"检查标志位"和
+        // "注册 waker"之间时通知丢失（tokio Notify 经典的 lost-wakeup 竞态）。
+        // 被唤醒后再查一次标志位，过滤掉虚假唤醒。
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.is_closed() {
+                return;
+            }
+
+            notified.await;
         }
     }
 
@@ -390,5 +404,163 @@ mod jls_tests {
         };
 
         assert!(verify_jls_connection(&tls, rustls::jls::JlsState::NotAuthed).is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_closer_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    /// 多个并发监听者：close() 之后全部被唤醒，无一挂起。
+    #[tokio::test]
+    async fn close_wakes_all_registered_waiters() {
+        let closer = Arc::new(SessionCloser::new());
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let c = closer.clone();
+            handles.push(tokio::spawn(async move { c.wait().await }));
+        }
+
+        // 让所有 waiter 有机会注册后再关闭。
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!closer.is_closed());
+
+        closer.close();
+
+        for h in handles {
+            tokio::time::timeout(Duration::from_secs(2), h)
+                .await
+                .expect("waiter did not wake up after close()")
+                .unwrap();
+        }
+        assert!(closer.is_closed());
+    }
+
+    /// 允许多次 close()：幂等，所有监听者照样被唤醒。
+    #[tokio::test]
+    async fn multiple_close_calls_are_idempotent() {
+        let closer = Arc::new(SessionCloser::new());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = closer.clone();
+            handles.push(tokio::spawn(async move { c.wait().await }));
+        }
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        closer.close();
+        closer.close();
+        closer.close();
+
+        for h in handles {
+            tokio::time::timeout(Duration::from_secs(2), h)
+                .await
+                .expect("waiter did not wake up after close()")
+                .unwrap();
+        }
+        assert!(closer.is_closed());
+    }
+
+    /// close() 之后新调用 wait() 的监听者立即返回，不挂起。
+    #[tokio::test]
+    async fn wait_after_close_returns_immediately() {
+        let closer = Arc::new(SessionCloser::new());
+        closer.close();
+
+        tokio::time::timeout(Duration::from_secs(1), closer.wait())
+            .await
+            .expect("wait() on an already-closed closer must return immediately");
+    }
+
+    /// close() 之后才启动的监听者也立即返回。
+    #[tokio::test]
+    async fn new_waiter_after_close_returns_immediately() {
+        let closer = Arc::new(SessionCloser::new());
+        closer.close();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = closer.clone();
+            handles.push(tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(1), c.wait())
+                    .await
+                    .expect("new waiter after close() must return immediately");
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    /// 等待者被唤醒后可以反复 wait()，已关闭状态下每次都立即返回。
+    #[tokio::test]
+    async fn wait_is_reusable_after_wake() {
+        let closer = Arc::new(SessionCloser::new());
+        let c = closer.clone();
+        let handle = tokio::spawn(async move {
+            c.wait().await;
+            // 再次 wait() 也必须立即返回。
+            c.wait().await;
+            c.wait().await;
+        });
+
+        closer.close();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("repeated wait() after close() must return immediately")
+            .unwrap();
+    }
+
+    /// 多线程压力：并发监听 + close 竞争，所有 waiter 在超时内返回。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn close_racing_wait_never_hangs() {
+        for round in 0..50 {
+            let closer = Arc::new(SessionCloser::new());
+            let mut waiters = Vec::new();
+            for _ in 0..32 {
+                let c = closer.clone();
+                waiters.push(tokio::spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(5), c.wait())
+                        .await
+                        .expect("wait() must never hang");
+                }));
+            }
+            closer.close();
+            for w in waiters {
+                w.await.unwrap();
+            }
+            assert!(closer.is_closed(), "round {round} not closed");
+        }
+    }
+
+    /// 统计所有监听者都被通知到。
+    #[tokio::test]
+    async fn every_waiter_is_notified_once() {
+        let closer = Arc::new(SessionCloser::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let c = closer.clone();
+            let cnt = counter.clone();
+            handles.push(tokio::spawn(async move {
+                c.wait().await;
+                cnt.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        closer.close();
+
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 10);
     }
 }
