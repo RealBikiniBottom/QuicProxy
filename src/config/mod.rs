@@ -219,6 +219,9 @@ pub struct DnsConfig {
     pub servers: HashMap<String, DnsServerConfig>,
     #[serde(default)]
     pub default_server: Option<String>,
+    /// Locally return NODATA for resolver.arpa to disable DDR discovery.
+    #[serde(default)]
+    pub block_ddr: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -235,6 +238,7 @@ impl Default for DnsConfig {
         Self {
             servers: HashMap::new(),
             default_server: None,
+            block_ddr: false,
         }
     }
 }
@@ -607,7 +611,7 @@ impl Default for RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{InboundConfig, OutboundConfig, duration_from_secs_or};
+    use super::{DnsConfig, InboundConfig, OutboundConfig, duration_from_secs_or};
     use serde_json::json;
     use std::time::Duration;
 
@@ -620,6 +624,15 @@ mod tests {
             Duration::from_secs(12)
         );
         assert_eq!(duration_from_secs_or(None, default), default);
+    }
+
+    #[test]
+    fn dns_block_ddr_defaults_to_false_and_can_be_enabled() {
+        let default: DnsConfig = serde_json::from_value(json!({})).unwrap();
+        assert!(!default.block_ddr);
+
+        let enabled: DnsConfig = serde_json::from_value(json!({ "block_ddr": true })).unwrap();
+        assert!(enabled.block_ddr);
     }
 
     #[test]

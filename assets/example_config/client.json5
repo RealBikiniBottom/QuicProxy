@@ -169,6 +169,8 @@
     ]
   },
   "dns": {
+    // Prevent automatic discovery of DoH/DoT/DoQ through resolver.arpa (DDR).
+    "block_ddr": true,
     "default_server": "local_dns",
     "servers": {
       "remote_dns": {

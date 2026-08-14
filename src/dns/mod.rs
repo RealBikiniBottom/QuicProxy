@@ -16,7 +16,7 @@ use simple_dns::{
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::utils::http_outbound;
 
 static DNS_MAP: LazyLock<DashMap<String, Arc<dyn AnyDNS>>> = LazyLock::new(DashMap::new);
-pub type DnsCache = Option<CacheWithExpire<Vec<IpAddr>>>;
+static BLOCK_DDR: AtomicBool = AtomicBool::new(false);
 pub type DnsByteCache = Option<CacheWithExpire<Vec<u8>>>;
 
 pub fn init_dns(cfg: &Config) -> Result<()> {
@@ -66,13 +66,105 @@ pub fn init_dns(cfg: &Config) -> Result<()> {
         }
     };
     DNS_MAP.insert("default_server".to_string(), default_dns);
+    BLOCK_DDR.store(cfg.dns.block_ddr, Ordering::Relaxed);
+    if cfg.dns.block_ddr {
+        info!("DDR discovery blocking enabled for resolver.arpa");
+    }
     Ok(())
 }
 
 /// 关闭所有 DNS 服务器并清空 DNS 缓存，释放底层的 redb 数据库引用。
 /// 应在进程退出前调用，确保 redb 文件锁能被正常释放。
 pub fn shutdown_dns() {
+    BLOCK_DDR.store(false, Ordering::Relaxed);
     DNS_MAP.clear();
+}
+
+fn is_resolver_arpa_name(name: &Name<'_>) -> bool {
+    let normalized = name.to_string().trim_end_matches('.').to_ascii_lowercase();
+
+    normalized == "resolver.arpa" || normalized.ends_with(".resolver.arpa")
+}
+
+fn build_ddr_nodata_response(packet: &Packet<'_>) -> Result<Option<Vec<u8>>> {
+    if !packet
+        .questions
+        .iter()
+        .any(|question| is_resolver_arpa_name(&question.qname))
+    {
+        return Ok(None);
+    }
+
+    let mut reply = Packet::new_reply(packet.id());
+    reply.questions.extend(packet.questions.iter().cloned());
+    if packet.has_flags(PacketFlag::RECURSION_DESIRED) {
+        reply.set_flags(PacketFlag::RECURSION_DESIRED);
+    }
+    reply.set_flags(PacketFlag::RECURSION_AVAILABLE);
+    *reply.rcode_mut() = RCODE::NoError;
+
+    debug!(
+        questions = ?packet
+            .questions
+            .iter()
+            .map(|question| (question.qname.to_string(), question.qtype))
+            .collect::<Vec<_>>(),
+        "blocked DDR discovery query with NODATA"
+    );
+
+    reply
+        .build_bytes_vec()
+        .map(|bytes| Some(bytes.to_vec()))
+        .map_err(|e| anyhow!("Failed to build DDR NODATA reply: {e}"))
+}
+
+fn into_owned_packet(packet: Packet<'_>) -> Packet<'static> {
+    let mut owned = Packet::new_query(packet.id());
+    *owned.opcode_mut() = packet.opcode();
+    *owned.rcode_mut() = packet.rcode();
+
+    for flag in [
+        PacketFlag::RESPONSE,
+        PacketFlag::AUTHORITATIVE_ANSWER,
+        PacketFlag::TRUNCATION,
+        PacketFlag::RECURSION_DESIRED,
+        PacketFlag::RECURSION_AVAILABLE,
+        PacketFlag::AUTHENTIC_DATA,
+        PacketFlag::CHECKING_DISABLED,
+    ] {
+        if packet.has_flags(flag) {
+            owned.set_flags(flag);
+        }
+    }
+
+    *owned.opt_mut() = packet.opt().cloned().map(|opt| opt.into_owned());
+    owned.questions = packet
+        .questions
+        .into_iter()
+        .map(|question| question.into_owned())
+        .collect();
+    owned.answers = packet
+        .answers
+        .into_iter()
+        .map(|record| record.into_owned())
+        .collect();
+    owned.name_servers = packet
+        .name_servers
+        .into_iter()
+        .map(|record| record.into_owned())
+        .collect();
+    owned.additional_records = packet
+        .additional_records
+        .into_iter()
+        .map(|record| record.into_owned())
+        .collect();
+    owned
+}
+
+fn parse_owned_packet(packet_bytes: &[u8], kind: &str) -> Result<Packet<'static>> {
+    Packet::parse(packet_bytes)
+        .map(into_owned_packet)
+        .map_err(|e| anyhow!("Failed to parse DNS {kind}: {e}"))
 }
 
 pub fn get_dns_by_tag(tag: &str) -> Result<Arc<dyn AnyDNS>> {
@@ -227,11 +319,16 @@ fn apply_ttl_to_response(
     packet: &mut Packet<'_>,
     min_ttl: Option<Duration>,
     max_ttl: Option<Duration>,
-) -> Result<(Vec<u8>, u32)> {
-    let mut min_effective_ttl = 0;
+) -> Option<u32> {
+    let mut min_effective_ttl = None;
 
-    for answer in &mut packet.answers {
-        let mut effective_ttl = answer.ttl;
+    for record in packet
+        .answers
+        .iter_mut()
+        .chain(packet.name_servers.iter_mut())
+        .chain(packet.additional_records.iter_mut())
+    {
+        let mut effective_ttl = record.ttl;
         if let Some(min) = min_ttl {
             let min_secs = min.as_secs() as u32;
             if effective_ttl < min_secs {
@@ -244,42 +341,32 @@ fn apply_ttl_to_response(
                 effective_ttl = max_secs;
             }
         }
-        answer.ttl = effective_ttl;
+        record.ttl = effective_ttl;
 
-        if effective_ttl > min_effective_ttl {
-            min_effective_ttl = effective_ttl;
-        }
+        min_effective_ttl = Some(
+            min_effective_ttl.map_or(effective_ttl, |current: u32| current.min(effective_ttl)),
+        );
     }
 
-    let bytes = packet
-        .build_bytes_vec()
-        .map(|b| b.to_vec())
-        .map_err(|e| anyhow::anyhow!("Failed to rebuild DNS response: {e}"))?;
+    min_effective_ttl
+}
 
-    Ok((bytes, min_effective_ttl))
+fn cap_record_ttls(packet: &mut Packet<'_>, remaining_ttl: u32) {
+    for record in packet
+        .answers
+        .iter_mut()
+        .chain(packet.name_servers.iter_mut())
+        .chain(packet.additional_records.iter_mut())
+    {
+        record.ttl = record.ttl.min(remaining_ttl);
+    }
 }
 
 #[async_trait::async_trait]
 pub trait AnyDNS: Send + Sync + 'static {
     fn tag(&self) -> &str;
-    fn cache(&self) -> &DnsCache;
     fn byte_cache(&self) -> &DnsByteCache {
         &None
-    }
-
-    async fn lookup_query(
-        &self,
-        domain: &str,
-        qtype: QTYPE,
-        outbound: &Arc<dyn AnyOutbound>,
-    ) -> Result<Vec<u8>> {
-        let packet = build_dns_query_packet(domain, qtype)?;
-        let packet_bytes = packet
-            .build_bytes_vec()
-            .map_err(|e| anyhow::anyhow!("Failed to build DNS query packet: {e}"))?
-            .to_vec();
-        self.exchange_without_cache(&packet_bytes, outbound.clone())
-            .await
     }
 
     async fn lookup_with_type(
@@ -288,40 +375,14 @@ pub trait AnyDNS: Send + Sync + 'static {
         qtype: QTYPE,
         outbound: &Arc<dyn AnyOutbound>,
     ) -> Result<Vec<IpAddr>> {
-        let cache_key = match qtype {
-            QTYPE::TYPE(TYPE::A) => format!("{}:A", domain),
-            QTYPE::TYPE(TYPE::AAAA) => format!("{}:AAAA", domain),
-            _ => return Ok(Vec::new()),
-        };
-
-        let cache_key = format!("{}:{}", outbound.tag(), cache_key);
-
-        if let Some(cache) = self.cache() {
-            if let Ok(Some((ips, remaining_ttl, source))) = cache.get(&cache_key) {
-                let remaining = Duration::from_secs(remaining_ttl.saturating_sub(now_timestamp()));
-                info!(
-                    "hit dns cache from {:?}({}) for {}({:?}) [{}]",
-                    source,
-                    format_duration(remaining),
-                    domain,
-                    ips,
-                    outbound.tag()
-                );
-                return Ok(ips);
-            }
+        if !matches!(qtype, QTYPE::TYPE(TYPE::A) | QTYPE::TYPE(TYPE::AAAA)) {
+            return Ok(Vec::new());
         }
 
-        let response_bytes = self.lookup_query(domain, qtype, outbound).await?;
-        let packet = match Packet::parse(&response_bytes) {
-            Ok(p) => p,
-            Err(e) => bail!(e),
-        };
+        let temp = build_dns_query_packet(domain, qtype)?;
+        let packet = self.exchange_with_cache(&temp, outbound.clone()).await?;
 
-        let min_ttl = self.min_ttl().map(|t| t.as_secs()).unwrap_or(60);
         if packet.rcode() != RCODE::NoError {
-            if let Some(cache) = self.cache() {
-                let _ = cache.set(&cache_key, &Vec::new(), min_ttl);
-            }
             return Ok(Vec::new());
         }
 
@@ -350,18 +411,6 @@ pub trait AnyDNS: Send + Sync + 'static {
             "resolved for {}({:?}), ttl: {}s",
             domain, ips, min_record_ttl
         );
-        if let Some(cache) = self.cache() {
-            let final_ttl = if !ips.is_empty() {
-                self.min_ttl()
-                    .map(|t| t.as_secs().max(min_record_ttl as u64))
-                    .unwrap_or(min_record_ttl as u64)
-            } else {
-                min_ttl
-            };
-
-            let _ = cache.set(&cache_key, &ips, final_ttl);
-        }
-
         Ok(ips)
     }
 
@@ -448,49 +497,17 @@ pub trait AnyDNS: Send + Sync + 'static {
             }))
     }
 
-    async fn lookup_ipv4_response(
-        &self,
-        domain: &str,
-        outbound: &Arc<dyn AnyOutbound>,
-    ) -> Result<Vec<u8>> {
-        let response_bytes = self
-            .lookup_query(domain, QTYPE::TYPE(TYPE::A), outbound)
-            .await?;
-        let mut packet = Packet::parse(&response_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to parse DNS response: {e}"))?
-            .to_owned();
-        apply_ttl_to_response(&mut packet, self.min_ttl(), self.max_ttl()).map(|(bytes, _)| bytes)
-    }
-
-    async fn lookup_ipv6_response(
-        &self,
-        domain: &str,
-        outbound: &Arc<dyn AnyOutbound>,
-    ) -> Result<Vec<u8>> {
-        let response_bytes = self
-            .lookup_query(domain, QTYPE::TYPE(TYPE::AAAA), outbound)
-            .await?;
-        let mut packet = Packet::parse(&response_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to parse DNS response: {e}"))?
-            .to_owned();
-        apply_ttl_to_response(&mut packet, self.min_ttl(), self.max_ttl()).map(|(bytes, _)| bytes)
-    }
-
     fn dns_server(&self) -> Option<&str> {
         None
     }
 
     async fn exchange_with_cache(
         &self,
-        packet_bytes: &[u8],
+        packet: &Packet<'_>,
         outbound: Arc<dyn AnyOutbound>,
-    ) -> Result<Vec<u8>> {
-        let packet = Packet::parse(packet_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to parse DNS query: {e}"))?
-            .to_owned();
-
+    ) -> Result<Packet<'static>> {
         if packet.questions.is_empty() {
-            return self.exchange_without_cache(packet_bytes, outbound).await;
+            return self.exchange_without_cache(packet, outbound).await;
         }
 
         let question = &packet.questions[0];
@@ -513,33 +530,28 @@ pub trait AnyDNS: Send + Sync + 'static {
                 let query_id = packet.id();
                 response[0] = (query_id >> 8) as u8;
                 response[1] = query_id as u8;
+                let mut response = parse_owned_packet(&response, "cached response")?;
+                cap_record_ttls(
+                    &mut response,
+                    remaining.as_secs().min(u32::MAX as u64) as u32,
+                );
                 return Ok(response);
             }
         }
 
-        let response_bytes = self.exchange_without_cache(packet_bytes, outbound).await?;
-
-        let mut resp_packet = Packet::parse(&response_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to parse DNS response: {e}"))?
-            .to_owned();
+        let mut resp_packet = self.exchange_without_cache(packet, outbound).await?;
 
         let min_ttl = self.min_ttl();
         let max_ttl = self.max_ttl();
 
-        let (adjusted_bytes, min_effective_ttl) =
-            apply_ttl_to_response(&mut resp_packet, min_ttl, max_ttl)?;
+        let min_effective_ttl = apply_ttl_to_response(&mut resp_packet, min_ttl, max_ttl);
 
-        if let Some(byte_cache) = self.byte_cache() {
-            if resp_packet.rcode() == RCODE::NoError {
-                let cache_ttl = if min_effective_ttl != u32::MAX {
-                    min_ttl
-                        .map(|t| t.as_secs().max(min_effective_ttl as u64))
-                        .unwrap_or(min_effective_ttl as u64)
-                } else {
-                    min_ttl.map(|t| t.as_secs()).unwrap_or(60)
-                };
-
-                let _ = byte_cache.set(&cache_key, &adjusted_bytes, cache_ttl);
+        if let Some(cache_ttl) = min_effective_ttl.filter(|ttl| *ttl > 0) {
+            if let Some(byte_cache) = self.byte_cache() {
+                let response_bytes = resp_packet
+                    .build_bytes_vec()
+                    .map_err(|e| anyhow!("Failed to build DNS response for cache: {e}"))?;
+                let _ = byte_cache.set(&cache_key, &response_bytes, cache_ttl as u64);
                 info!(
                     "cached dns response for {}({:?}), ttl: {}s",
                     domain, qtype, cache_ttl
@@ -547,39 +559,48 @@ pub trait AnyDNS: Send + Sync + 'static {
             }
         }
 
-        Ok(adjusted_bytes)
+        Ok(resp_packet)
     }
 
     async fn exchange_without_cache(
         &self,
-        packet_bytes: &[u8],
+        packet: &Packet<'_>,
         outbound: Arc<dyn AnyOutbound>,
-    ) -> Result<Vec<u8>>;
+    ) -> Result<Packet<'static>>;
 
     fn default_outbound(&self) -> Arc<dyn AnyOutbound>;
 
     async fn hijack_exchange(&self, packet_bytes: &[u8]) -> Result<Vec<u8>> {
-        if self.reject_ipv6() {
-            if let Ok(packet) = Packet::parse(packet_bytes) {
-                if packet
-                    .questions
-                    .iter()
-                    .any(|q| q.qtype == QTYPE::TYPE(TYPE::AAAA))
-                {
-                    let mut reply = Packet::new_reply(packet.id());
-                    for question in &packet.questions {
-                        reply.questions.push(question.clone());
-                    }
-                    debug!("rejected ipv6 query with empty reply");
-                    return reply
-                        .build_bytes_vec()
-                        .map(|b| b.to_vec())
-                        .map_err(|e| anyhow!("Failed to build DNS reply: {e}"));
-                }
+        let packet = Packet::parse(packet_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to parse DNS query: {e}"))?
+            .to_owned();
+
+        if BLOCK_DDR.load(Ordering::Relaxed) {
+            if let Some(response) = build_ddr_nodata_response(&packet)? {
+                return Ok(response);
             }
         }
-        self.exchange_with_cache(packet_bytes, self.default_outbound())
-            .await
+
+        if self.reject_ipv6()
+            && packet
+                .questions
+                .iter()
+                .any(|q| q.qtype == QTYPE::TYPE(TYPE::AAAA))
+        {
+            let mut reply = Packet::new_reply(packet.id());
+            for question in &packet.questions {
+                reply.questions.push(question.clone());
+            }
+            debug!("rejected ipv6 query with empty reply");
+            return reply
+                .build_bytes_vec()
+                .map(|b| b.to_vec())
+                .map_err(|e| anyhow!("Failed to build DNS reply: {e}"));
+        }
+        self.exchange_with_cache(&packet, self.default_outbound())
+            .await?
+            .build_bytes_vec()
+            .map_err(|e| anyhow!("Failed to build DNS response: {e}"))
     }
 
     fn reject_ipv6(&self) -> bool {
@@ -604,7 +625,6 @@ pub struct UdpDns {
     pub min_ttl: Option<Duration>,
     pub max_ttl: Option<Duration>,
     pub outbound: Arc<dyn AnyOutbound>,
-    pub cache: DnsCache,
     pub byte_cache: DnsByteCache,
     pub reject_ipv6: bool,
 }
@@ -620,14 +640,6 @@ impl UdpDns {
 
         let min_ttl = cfg.min_ttl.map(Duration::from_secs);
         let max_ttl = cfg.max_ttl.map(Duration::from_secs);
-
-        let cache = match cfg.cache.as_ref() {
-            Some(c) => Some(
-                CacheWithExpire::new_with_tag(c, tag.clone())
-                    .map_err(|e| anyhow!("dns '{}' failed to init cache: {:?}", tag, e))?,
-            ),
-            None => None,
-        };
 
         let byte_cache = match cfg.cache.as_ref() {
             Some(c) => Some(
@@ -651,7 +663,6 @@ impl UdpDns {
             min_ttl,
             max_ttl,
             outbound,
-            cache,
             byte_cache,
             reject_ipv6,
         }))
@@ -664,10 +675,6 @@ impl AnyDNS for UdpDns {
         &self.tag
     }
 
-    fn cache(&self) -> &DnsCache {
-        &self.cache
-    }
-
     fn byte_cache(&self) -> &DnsByteCache {
         &self.byte_cache
     }
@@ -678,9 +685,9 @@ impl AnyDNS for UdpDns {
 
     async fn exchange_without_cache(
         &self,
-        packet_bytes: &[u8],
+        packet: &Packet<'_>,
         outbound: Arc<dyn AnyOutbound>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Packet<'static>> {
         let target = resolve_target(&self.address, self.dns_server()).await?;
         let target = TargetAddr::Ip(target);
         let socket = outbound.connect_packet(&target).await?;
@@ -688,7 +695,10 @@ impl AnyDNS for UdpDns {
         let closer = socket.closer();
 
         let result = async {
-            let buf = bytes::Bytes::copy_from_slice(packet_bytes);
+            let packet_bytes = packet
+                .build_bytes_vec()
+                .map_err(|e| anyhow!("Failed to build DNS query packet: {e}"))?;
+            let buf = Bytes::from(packet_bytes);
 
             socket.send_to(buf, &SourceAddr::dummy(), &target).await?;
 
@@ -696,7 +706,7 @@ impl AnyDNS for UdpDns {
                 .await
                 .map_err(|_| anyhow!("DNS query timed out"))??;
 
-            Ok::<Vec<u8>, anyhow::Error>(payload.to_vec())
+            parse_owned_packet(&payload, "UDP response")
         }
         .await;
 
@@ -725,7 +735,6 @@ pub struct HttpsDns {
     pub min_ttl: Option<Duration>,
     pub max_ttl: Option<Duration>,
     pub outbound: Arc<dyn AnyOutbound>,
-    pub cache: DnsCache,
     pub byte_cache: DnsByteCache,
     url: String,
     dns_server_name: Option<String>,
@@ -743,14 +752,6 @@ impl HttpsDns {
 
         let min_ttl = cfg.min_ttl.map(Duration::from_secs);
         let max_ttl = cfg.max_ttl.map(Duration::from_secs);
-
-        let cache = match cfg.cache.as_ref() {
-            Some(c) => Some(
-                CacheWithExpire::new_with_tag(c, tag.clone())
-                    .map_err(|e| anyhow!("dns '{}' failed to init cache: {:?}", tag, e))?,
-            ),
-            None => None,
-        };
 
         let byte_cache = match cfg.cache.as_ref() {
             Some(c) => Some(
@@ -774,7 +775,6 @@ impl HttpsDns {
             max_ttl,
             outbound,
             dns_server_name: cfg.dns.clone(),
-            cache,
             byte_cache,
             url,
             reject_ipv6,
@@ -786,10 +786,6 @@ impl HttpsDns {
 impl AnyDNS for HttpsDns {
     fn tag(&self) -> &str {
         &self.tag
-    }
-
-    fn cache(&self) -> &DnsCache {
-        &self.cache
     }
 
     fn byte_cache(&self) -> &DnsByteCache {
@@ -806,9 +802,12 @@ impl AnyDNS for HttpsDns {
 
     async fn exchange_without_cache(
         &self,
-        packet_bytes: &[u8],
+        packet: &Packet<'_>,
         outbound: Arc<dyn AnyOutbound>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Packet<'static>> {
+        let packet_bytes = packet
+            .build_bytes_vec()
+            .map_err(|e| anyhow!("Failed to build DNS query packet: {e}"))?;
         let mut headers = HeaderMap::new();
         headers.insert("Content-Type", "application/dns-message".parse().unwrap());
 
@@ -818,7 +817,7 @@ impl AnyDNS for HttpsDns {
             &self.url,
             outbound.connect_timeout(),
             Some(&headers),
-            Bytes::copy_from_slice(packet_bytes),
+            Bytes::from(packet_bytes),
         )
         .await?;
 
@@ -826,7 +825,7 @@ impl AnyDNS for HttpsDns {
             bail!("DoH server returned error: {}", response.status)
         }
 
-        Ok(response.body.to_vec())
+        parse_owned_packet(&response.body, "HTTPS response")
     }
 
     fn default_outbound(&self) -> Arc<dyn AnyOutbound> {
@@ -1034,10 +1033,6 @@ impl AnyDNS for FakeIPDNS {
         &self.tag
     }
 
-    fn cache(&self) -> &DnsCache {
-        &None
-    }
-
     fn reject_ipv6(&self) -> bool {
         self.reject_ipv6
     }
@@ -1099,21 +1094,17 @@ impl AnyDNS for FakeIPDNS {
 
     async fn exchange_with_cache(
         &self,
-        packet_bytes: &[u8],
+        packet: &Packet<'_>,
         outbound: Arc<dyn AnyOutbound>,
-    ) -> Result<Vec<u8>> {
-        self.exchange_without_cache(packet_bytes, outbound).await
+    ) -> Result<Packet<'static>> {
+        self.exchange_without_cache(packet, outbound).await
     }
 
     async fn exchange_without_cache(
         &self,
-        packet_bytes: &[u8],
+        packet: &Packet<'_>,
         _outbound: Arc<dyn AnyOutbound>,
-    ) -> Result<Vec<u8>> {
-        let packet = Packet::parse(packet_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to parse DNS packet: {e}"))?
-            .to_owned();
-
+    ) -> Result<Packet<'static>> {
         if packet.questions.is_empty() {
             bail!("DNS packet has no questions");
         }
@@ -1123,8 +1114,8 @@ impl AnyDNS for FakeIPDNS {
         let qtype = question.qtype;
         let id = packet.id();
 
-        let mut reply = Packet::new_reply(id);
-        reply.questions.push(question.clone());
+        let mut reply: Packet<'static> = Packet::new_reply(id);
+        reply.questions.push(question.clone().into_owned());
 
         let ttl = self.min_ttl().unwrap_or(Duration::from_secs(60)).as_secs() as u32;
 
@@ -1132,7 +1123,7 @@ impl AnyDNS for FakeIPDNS {
             QTYPE::TYPE(TYPE::A) => {
                 if let Ok(ip) = self.resolve_v4(&domain) {
                     reply.answers.push(ResourceRecord {
-                        name: question.qname.clone(),
+                        name: question.qname.clone().into_owned(),
                         class: CLASS::IN,
                         ttl: ttl,
                         rdata: RData::A(simple_dns::rdata::A { address: ip.into() }),
@@ -1143,7 +1134,7 @@ impl AnyDNS for FakeIPDNS {
             QTYPE::TYPE(TYPE::AAAA) => {
                 if let Ok(ip) = self.resolve_v6(&domain) {
                     reply.answers.push(ResourceRecord {
-                        name: question.qname.clone(),
+                        name: question.qname.clone().into_owned(),
                         class: CLASS::IN,
                         ttl: ttl,
                         rdata: RData::AAAA(simple_dns::rdata::AAAA { address: ip.into() }),
@@ -1156,11 +1147,7 @@ impl AnyDNS for FakeIPDNS {
             }
         }
 
-        let reply_bytes = reply
-            .build_bytes_vec()
-            .with_context(|| format!("Failed to build reply"))?;
-
-        Ok(reply_bytes)
+        Ok(reply)
     }
 
     fn default_outbound(&self) -> Arc<dyn AnyOutbound> {
@@ -1173,5 +1160,138 @@ impl AnyDNS for FakeIPDNS {
 
     fn max_ttl(&self) -> Option<Duration> {
         self.min_ttl
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dns_query(name: &'static str, qtype: QTYPE) -> Packet<'static> {
+        build_dns_query_packet(name, qtype).unwrap()
+    }
+
+    #[test]
+    fn ddr_zone_queries_receive_nodata() {
+        for (name, qtype) in [
+            ("_dns.resolver.arpa", QTYPE::TYPE(TYPE::SVCB)),
+            ("_DNS.ReSoLvEr.ArPa.", QTYPE::TYPE(TYPE::SVCB)),
+            ("resolver.arpa", QTYPE::TYPE(TYPE::A)),
+            ("child.resolver.arpa", QTYPE::TYPE(TYPE::HTTPS)),
+        ] {
+            let query = dns_query(name, qtype);
+            let response = build_ddr_nodata_response(&query)
+                .unwrap()
+                .expect("resolver.arpa query should be blocked");
+            let packet = Packet::parse(&response).unwrap();
+
+            assert_eq!(packet.rcode(), RCODE::NoError);
+            assert!(packet.answers.is_empty());
+            assert!(packet.name_servers.is_empty());
+            assert!(packet.additional_records.is_empty());
+            assert!(packet.has_flags(PacketFlag::RESPONSE));
+            assert!(packet.has_flags(PacketFlag::RECURSION_DESIRED));
+            assert!(packet.has_flags(PacketFlag::RECURSION_AVAILABLE));
+            assert_eq!(packet.questions.len(), 1);
+            assert_eq!(packet.questions[0].qtype, qtype);
+        }
+    }
+
+    #[test]
+    fn non_ddr_names_are_not_blocked() {
+        for name in [
+            "example.com",
+            "resolver.arpa.example.com",
+            "notresolver.arpa",
+        ] {
+            let query = dns_query(name, QTYPE::TYPE(TYPE::SVCB));
+            assert!(build_ddr_nodata_response(&query).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn parsed_owned_packet_outlives_source_bytes() {
+        let packet = {
+            let query = dns_query("example.com", QTYPE::TYPE(TYPE::A));
+            let bytes = query.build_bytes_vec().unwrap();
+            parse_owned_packet(&bytes, "test query").unwrap()
+        };
+
+        assert!(packet.has_flags(PacketFlag::RECURSION_DESIRED));
+        assert_eq!(packet.questions.len(), 1);
+        assert_eq!(packet.questions[0].qname.to_string(), "example.com");
+        assert_eq!(packet.questions[0].qtype, QTYPE::TYPE(TYPE::A));
+    }
+
+    #[test]
+    fn ttl_adjustment_returns_earliest_expiry() {
+        let name = Name::new("example.com").unwrap();
+        let mut packet = Packet::new_reply(1);
+        let record = |address: Ipv4Addr, ttl| ResourceRecord {
+            name: name.clone(),
+            class: CLASS::IN,
+            ttl,
+            rdata: RData::A(simple_dns::rdata::A {
+                address: address.into(),
+            }),
+            cache_flush: false,
+        };
+        packet
+            .answers
+            .push(record(Ipv4Addr::new(192, 0, 2, 1), 100));
+        packet
+            .name_servers
+            .push(record(Ipv4Addr::new(192, 0, 2, 2), 10));
+        packet
+            .additional_records
+            .push(record(Ipv4Addr::new(192, 0, 2, 3), 1_000));
+
+        let min_ttl = apply_ttl_to_response(
+            &mut packet,
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(300)),
+        );
+
+        assert_eq!(min_ttl, Some(30));
+        assert_eq!(packet.answers[0].ttl, 100);
+        assert_eq!(packet.name_servers[0].ttl, 30);
+        assert_eq!(packet.additional_records[0].ttl, 300);
+
+        cap_record_ttls(&mut packet, 20);
+        assert_eq!(packet.answers[0].ttl, 20);
+        assert_eq!(packet.name_servers[0].ttl, 20);
+        assert_eq!(packet.additional_records[0].ttl, 20);
+
+        assert_eq!(
+            apply_ttl_to_response(&mut Packet::new_reply(2), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn ddr_nodata_preserves_query_id_and_all_questions() {
+        let mut query = Packet::new_query(0x1234);
+        query.set_flags(PacketFlag::RECURSION_DESIRED);
+        query.questions.push(Question::new(
+            Name::new("_dns.resolver.arpa").unwrap(),
+            QTYPE::TYPE(TYPE::SVCB),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        query.questions.push(Question::new(
+            Name::new("example.com").unwrap(),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+
+        let response = build_ddr_nodata_response(&query)
+            .unwrap()
+            .expect("packet containing a DDR question should be blocked");
+        let response = Packet::parse(&response).unwrap();
+
+        assert_eq!(response.id(), 0x1234);
+        assert_eq!(response.questions.len(), 2);
+        assert!(response.answers.is_empty());
     }
 }
