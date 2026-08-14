@@ -37,6 +37,16 @@ const ACCEPT_CONNECTION_QUEUE_CAPACITY: usize = 64;
 #[cfg(not(target_os = "ios"))]
 const ACCEPT_CONNECTION_QUEUE_CAPACITY: usize = 200;
 
+/// Advertised limit for concurrent QUIC streams (unidirectional and
+/// bidirectional), on the client and the server alike. ShadowQUIC's
+/// UDP-over-stream mode opens one uni-directional stream per distinct UDP peer
+/// on a connection and keeps it cached, so the quinn default (100) is far too
+/// small: Connection::open_uni then blocks forever once the peer's advertised
+/// budget is exhausted, stalling the whole UDP session. A stream limit is only
+/// a number advertised in the transport parameters -- memory is consumed per
+/// actually-opened stream -- so it can be generous.
+const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 1000;
+
 fn keep_alive_interval_for(idle_timeout: Duration) -> Option<Duration> {
     if idle_timeout.is_zero() {
         return None;
@@ -350,7 +360,7 @@ impl QuinnServer {
             enable_mtudis,
             initial_mtu,
             min_mtu,
-            Some(500),
+            Some(DEFAULT_MAX_CONCURRENT_STREAMS),
         );
 
         server_config.transport_config(Arc::new(transport_config));
@@ -496,7 +506,7 @@ impl QuinnClient {
             enable_mtudis,
             initial_mtu,
             min_mtu,
-            None,
+            Some(DEFAULT_MAX_CONCURRENT_STREAMS),
         );
 
         client_config.transport_config(Arc::new(transport_config));

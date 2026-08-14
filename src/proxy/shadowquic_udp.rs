@@ -38,6 +38,15 @@ const UDP_RECEIVE_QUEUE_CAPACITY: usize = 64;
 const WAITING_DATAGRAM_QUEUE_CAPACITY: usize = 8;
 const MAX_WAITING_DATAGRAM_CONTEXTS: usize = 1024;
 
+/// Safety margin kept below the u16 context-id ceiling when deciding whether a
+/// connection still has room for new UDP sessions. The per-connection counter
+/// (PerConnectionState::next_context_id) is shared by every session and never
+/// recycled; the client forces a fresh connection once the counter gets this
+/// close to the limit, while the server refuses new sessions. This keeps a
+/// session from tripping the u16::try_from failure in get_send_context_id
+/// mid-flight, which would otherwise close the whole QUIC connection.
+pub const UDP_CONTEXT_ID_RECONNECT_MARGIN: u32 = 256;
+
 pub struct PerConnectionState {
     pub next_context_id: Arc<AtomicU32>,
     pub udp_recv_map: UdpRecvMap,
@@ -157,6 +166,13 @@ impl ShadowUdpReceiver {
             }
 
             debug!("unistream_worker {} closed", context_id);
+
+            // Reset the stream so the peer's cached SendStream fails loudly
+            // with WriteError::Stopped on its next write, instead of silently
+            // buffering packets into a stream nobody reads anymore. The peer
+            // rebuilds its sender with a fresh stream and context id.
+            let _ = unistream.stop(0u32.into());
+
             receiver_clone.binded_context_id.remove(&context_id);
             udp_recv_map_clone.remove_if(&context_id, |_, receiver| {
                 Arc::ptr_eq(receiver, &receiver_clone)
@@ -318,7 +334,7 @@ pub fn start_unistream_listener(
                     let recv_map_notify_clone = udp_recv_map_notify.clone();
 
                     tokio::spawn(async move {
-                        let res: anyhow::Result<()> = async {
+                        let setup: anyhow::Result<(Arc<ShadowUdpReceiver>, u16)> = async {
                             let recv_context_id =
                                 try_get_recv_context_id(&mut recv, read_timeout).await?;
                             let item = get_receiver(
@@ -327,14 +343,20 @@ pub fn start_unistream_listener(
                                 recv_map_notify_clone,
                             )
                             .await?;
-
-                            item.run_unistream_worker(recv, recv_context_id)?;
-
-                            Ok(())
+                            Ok((item, recv_context_id))
                         }
                         .await;
 
-                        if let Err(e) = res {
+                        let (item, recv_context_id) = match setup {
+                            Ok(x) => x,
+                            Err(e) => {
+                                let _ = recv.stop(0u32.into());
+                                error!("unistream worker error: {:#}", e);
+                                return;
+                            }
+                        };
+
+                        if let Err(e) = item.run_unistream_worker(recv, recv_context_id) {
                             error!("unistream worker error: {:#}", e);
                         }
                     });
@@ -581,8 +603,10 @@ impl ShadowQuicUdpPacket {
                 let send_context_id = match u16::try_from(context_id) {
                     Ok(context_id) => context_id,
                     Err(_) => {
-                        self.conn.close(0u32.into(), b"context id exhausted");
-                        bail!("ShadowQUIC context id exhausted; connection closed");
+                        bail!(
+                            "ShadowQUIC context id exhausted ({} allocated on this connection)",
+                            context_id
+                        );
                     }
                 };
                 self.create_sender(send_context_id, target).await
@@ -609,28 +633,73 @@ impl AnyPacket for ShadowQuicUdpPacket {
             context_addr = target;
         }
         if self.is_over_unistream {
-            let (_, lock) = self.get_send_context_id(context_addr).await?;
-            let lock = lock.expect("should be unistream");
-            let mut stream = lock.lock().await;
-            let payload_len = u16::try_from(buf.len())
-                .context("ShadowQUIC UDP payload exceeds the u16 stream length limit")?;
-            let mut packet = Vec::with_capacity(2 + buf.len());
-            packet.extend_from_slice(&payload_len.to_be_bytes());
-            packet.extend_from_slice(&buf);
-            stream.write_all(&packet).await?;
-            stream.flush().await?;
-            return Ok(buf.len());
+            // If the peer stopped our stream (e.g. its unistream worker exited),
+            // rebuild the cached sender once; after that, fail loudly instead
+            // of silently dropping packets into a dead stream.
+            for _attempt in 0..2 {
+                let (_, lock) = self.get_send_context_id(context_addr).await?;
+                let lock = lock.expect("should be unistream");
+                let payload_len = u16::try_from(buf.len())
+                    .context("ShadowQUIC UDP payload exceeds the u16 stream length limit")?;
+                let mut packet = Vec::with_capacity(2 + buf.len());
+                packet.extend_from_slice(&payload_len.to_be_bytes());
+                packet.extend_from_slice(&buf);
+
+                let mut stream = lock.lock().await;
+                match stream.write_all(&packet).await {
+                    Ok(()) => return Ok(buf.len()),
+                    Err(quinn::WriteError::Stopped(_)) => {
+                        drop(stream);
+                        debug!(
+                            "unistream sender {} stopped by peer, rebuilding sender",
+                            context_addr
+                        );
+                        self.sender_map.remove(context_addr);
+                    }
+                    Err(e) => {
+                        drop(stream);
+                        return Err(e).context("failed to write ShadowQUIC unistream packet");
+                    }
+                }
+            }
+
+            bail!(
+                "ShadowQUIC unistream sender {} keeps getting stopped by peer",
+                context_addr
+            );
         }
 
         let (send_context_id, _) = self.get_send_context_id(context_addr).await?;
         let mut packet = Vec::with_capacity(2 + buf.len());
         packet.extend_from_slice(&send_context_id.to_be_bytes());
         packet.extend_from_slice(&buf);
-        // self.conn.send_datagram_wait(Bytes::from(packet));
-        self.conn
-            .send_datagram(Bytes::from(packet))
-            .context("failed to send ShadowQUIC datagram")?;
-        Ok(buf.len())
+
+        // An oversized datagram (larger than the current path MTU minus QUIC
+        // overhead) must not fail the whole UDP session: dropping it matches
+        // UDP semantics. Congestion needs no special handling either, because
+        // quinn discards the oldest queued datagrams when the send buffer is
+        // full instead of returning an error.
+        if let Some(max_size) = self.conn.max_datagram_size() {
+            if packet.len() > max_size {
+                debug!(
+                    "drop ShadowQUIC datagram: {} bytes exceeds datagram limit {}",
+                    packet.len(),
+                    max_size
+                );
+                return Ok(0);
+            }
+        }
+
+        match self.conn.send_datagram(Bytes::from(packet)) {
+            Ok(()) => Ok(buf.len()),
+            Err(quinn::SendDatagramError::TooLarge) => {
+                // Race with MTU discovery shrinking the path MTU between the
+                // check above and the send.
+                debug!("drop ShadowQUIC datagram: too large for current path MTU");
+                Ok(0)
+            }
+            Err(e) => Err(e).context("failed to send ShadowQUIC datagram"),
+        }
     }
 
     async fn recv_many(&self, packets: &mut Vec<PacketInfo>) -> anyhow::Result<()> {

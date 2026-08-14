@@ -1,6 +1,6 @@
 use crate::proxy::shadowquic_udp::{
-    PerConnectionState, ShadowQuicUdpPacket, ShadowUdpReceiver, gen_sunny_auth_hash,
-    run_bistream_recv_listener, start_datagram_loop, start_unistream_listener,
+    PerConnectionState, ShadowQuicUdpPacket, ShadowUdpReceiver, UDP_CONTEXT_ID_RECONNECT_MARGIN,
+    gen_sunny_auth_hash, run_bistream_recv_listener, start_datagram_loop, start_unistream_listener,
 };
 use crate::utils::interface::InterfaceManager;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -264,6 +265,46 @@ impl ShadowQuicOutbound {
         }
     }
 
+    /// open_bistream_with_retry, but refuses a connection whose shared UDP
+    /// context-id space is (nearly) exhausted and forces a fresh connection.
+    ///
+    /// PerConnectionState::next_context_id is shared by all UDP sessions on
+    /// one QUIC connection and is never recycled, so a long-lived connection
+    /// eventually runs out of u16 ids. Handing it out to another session at
+    /// that point would make that session trip the u16::try_from failure in
+    /// get_send_context_id, which closes the whole connection and kills
+    /// every session on it. Instead the cache is cleared so the next attempt
+    /// establishes a brand-new connection with a fresh counter (starts at 1),
+    /// which ensure_connection always creates.
+    async fn open_udp_bistream_with_capacity(
+        &self,
+    ) -> anyhow::Result<(
+        Arc<quinn::Connection>,
+        quinn::SendStream,
+        quinn::RecvStream,
+        Arc<PerConnectionState>,
+    )> {
+        for _ in 0..2 {
+            let (conn, send, recv, state) = self.open_bistream_with_retry().await?;
+            let used = state.next_context_id.load(Ordering::Relaxed);
+            if used < u16::MAX as u32 - UDP_CONTEXT_ID_RECONNECT_MARGIN {
+                return Ok((conn, send, recv, state));
+            }
+
+            warn!(
+                "[{}] UDP context-id space nearly exhausted ({} used), forcing a new connection",
+                self.tag(),
+                used
+            );
+            self.clear_cache().await;
+        }
+
+        anyhow::bail!(
+            "[{}] could not obtain a connection with available UDP context ids",
+            self.tag()
+        )
+    }
+
     pub async fn open_unistream_with_retry(
         &self,
     ) -> anyhow::Result<(
@@ -429,7 +470,7 @@ impl AnyOutbound for ShadowQuicOutbound {
     }
 
     async fn connect_packet(&self, target: &TargetAddr) -> anyhow::Result<Arc<dyn AnyPacket>> {
-        let (conn, mut send, recv, state) = self.open_bistream_with_retry().await?;
+        let (conn, mut send, recv, state) = self.open_udp_bistream_with_capacity().await?;
 
         let target_bytes_dummy = TargetAddr::dummy().to_bytes();
         let mut packet = Vec::with_capacity(1 + target_bytes_dummy.len());

@@ -4,6 +4,7 @@ use quinn::VarInt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -14,10 +15,11 @@ use crate::proxy::outbound::UdpMode;
 use crate::proxy::router::Router;
 use crate::proxy::router::get_router;
 use crate::proxy::shadowquic_udp::{
-    ExtensionRequest, PerConnectionState, ShadowQuicUdpPacket, ShadowUdpReceiver, UdpRecvMap,
-    auth_sunnyquic, gen_sunny_auth_hash, read_context_id, read_extension_request,
-    read_request_head, run_bistream_recv_listener, start_datagram_loop, start_unistream_listener,
-    write_conn_stats_response, write_ext_error_not_available,
+    ExtensionRequest, PerConnectionState, ShadowQuicUdpPacket, ShadowUdpReceiver,
+    UDP_CONTEXT_ID_RECONNECT_MARGIN, UdpRecvMap, auth_sunnyquic, gen_sunny_auth_hash,
+    read_context_id, read_extension_request, read_request_head, run_bistream_recv_listener,
+    start_datagram_loop, start_unistream_listener, write_conn_stats_response,
+    write_ext_error_not_available,
 };
 use crate::proxy::{TargetAddr, TlsConfig};
 use anyhow::Context;
@@ -88,6 +90,19 @@ impl ShadowQuicInbound {
         udp_recv_map_notify: Arc<KeyedNotify>,
     ) -> anyhow::Result<()> {
         let recv_context_id = read_context_id(&mut bistream, idle_timeout).await?;
+
+        // The server is the acceptor, so it cannot force a fresh connection the
+        // way the client does. Refuse this session instead: letting the shared
+        // per-connection counter run out would trip get_send_context_id's
+        // u16::try_from failure and close the whole QUIC connection, killing
+        // every TCP and UDP session riding on it.
+        let used = send_context_id.load(Ordering::Relaxed);
+        if used >= u16::MAX as u32 - UDP_CONTEXT_ID_RECONNECT_MARGIN {
+            bail!(
+                "UDP context-id space nearly exhausted on this connection ({} used), refusing new UDP session",
+                used
+            );
+        }
 
         let receiver = Arc::new(ShadowUdpReceiver::new(
             udp_recv_map.clone(),
