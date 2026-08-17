@@ -1,8 +1,9 @@
+use arc_swap::ArcSwapOption;
 use bytesize::ByteSize;
 use dashmap::DashMap;
 use serde::{Serialize, Serializer};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use tracing::info;
 use uuid::Uuid;
 
@@ -298,45 +299,52 @@ impl Observer {
     }
 
     pub fn remove_connection(&self, id: &Uuid) {
-        if let Some((_, record)) = self.connections.remove(id) {
-            let conn = record.tracker;
-            let upload = conn.upload.load(Ordering::Relaxed);
-            let download = conn.download.load(Ordering::Relaxed);
-            if upload > 0 || download > 0 {
-                let now = now_timestamp();
+        let Some((_, record)) = self.connections.remove(id) else {
+            return;
+        };
+        let conn = record.tracker;
+        let upload = conn.upload.load(Ordering::Relaxed);
+        let download = conn.download.load(Ordering::Relaxed);
+        if upload == 0 && download == 0 {
+            return;
+        }
 
-                let mut ip = "".to_string();
-                let domain = match &conn.final_target {
-                    TargetAddr::Ip(addr) => {
-                        let ip_str = addr.ip().to_string();
-                        ip = addr.to_string();
-                        self.realip2domain
-                            .get(&ip_str)
-                            .map(|r| format!("{}:{}", r.value().clone(), addr.port()))
-                            .unwrap_or_else(|| "".to_string())
-                    }
-                    TargetAddr::Domain(..) => conn.final_target.to_string(),
-                };
+        let now = now_timestamp();
+        let outbound_tag = conn.outbound_tag.to_string();
 
-                self.dst_traffic
-                    .entry(domain.to_string())
-                    .and_modify(|e| {
-                        e.upload = e.upload.wrapping_add(upload);
-                        e.download = e.download.wrapping_add(download);
-                        e.last_active = now;
-                        if !conn.outbound_tag.is_empty() {
-                            e.outbound_tag = conn.outbound_tag.to_string();
-                        }
-                    })
-                    .or_insert(DstTrafficEntry {
-                        domain: domain,
-                        ip: ip,
-                        outbound_tag: conn.outbound_tag.to_string(),
-                        upload,
-                        download,
-                        last_active: now,
-                    });
+        // 先计算 domain（用于查询/插入 key），ip 延迟到真正插入时才构造
+        let domain = match &conn.final_target {
+            TargetAddr::Ip(addr) => self
+                .realip2domain
+                .get(&addr.ip().to_string())
+                .map(|r| format!("{}:{}", r.value().as_str(), addr.port()))
+                .unwrap_or_default(),
+            TargetAddr::Domain(..) => conn.final_target.to_string(),
+        };
+
+        if let Some(mut entry) = self.dst_traffic.get_mut(domain.as_str()) {
+            entry.upload = entry.upload.wrapping_add(upload);
+            entry.download = entry.download.wrapping_add(download);
+            entry.last_active = now;
+            if !outbound_tag.is_empty() {
+                entry.outbound_tag = outbound_tag;
             }
+        } else {
+            let ip = match &conn.final_target {
+                TargetAddr::Ip(addr) => addr.to_string(),
+                TargetAddr::Domain(..) => String::new(),
+            };
+            self.dst_traffic.insert(
+                domain.clone(),
+                DstTrafficEntry {
+                    domain,
+                    ip,
+                    outbound_tag,
+                    upload,
+                    download,
+                    last_active: now,
+                },
+            );
         }
     }
 
@@ -615,32 +623,23 @@ impl Observer {
     }
 }
 
-static GLOBAL_OBSERVER: LazyLock<RwLock<Option<Arc<Observer>>>> =
-    LazyLock::new(|| RwLock::new(None));
+static GLOBAL_OBSERVER: ArcSwapOption<Observer> = ArcSwapOption::const_empty();
 
 pub fn init_observer(cfg: &crate::config::Config) -> anyhow::Result<()> {
     if let Some(obs_cfg) = cfg.observe.as_ref() {
         if obs_cfg.enabled {
             let observer = Arc::new(Observer::new());
             observer.spawn_periodic_log(obs_cfg.log_interval);
-            *GLOBAL_OBSERVER
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+            GLOBAL_OBSERVER.store(Some(observer));
         }
     }
     Ok(())
 }
 
 pub fn get_observer() -> Option<Arc<Observer>> {
-    GLOBAL_OBSERVER
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+    GLOBAL_OBSERVER.load_full()
 }
 
 pub fn shutdown_observer() {
-    GLOBAL_OBSERVER
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
+    GLOBAL_OBSERVER.store(None);
 }
