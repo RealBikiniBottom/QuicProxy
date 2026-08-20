@@ -4,7 +4,7 @@
 
 use crate::proxy::outbound::OUTBOUNDS_MAP;
 use crate::proxy::{
-    observe::{Observer, get_observer},
+    observe::{NodeStats, Observer, get_observer},
     router::get_router,
 };
 use crate::utils::http_outbound::request_via_outbound_with_dns;
@@ -156,61 +156,8 @@ async fn get_connections(
 // ─── Handler: Observe ───
 
 async fn get_observe(State(state): State<CoreApiState>) -> Result<impl IntoResponse, StatusCode> {
-    let mut inbounds = HashMap::new();
-    for (tag, node) in state.observer.get_all_inbounds() {
-        inbounds.insert(
-            tag.clone(),
-            StatsData {
-                protocol: node.protocol.clone(),
-                tcp_conns: node.stats.get_active_tcp_conns(),
-                udp_sessions: node.stats.get_active_udp_sessions(),
-                upload: node.stats.get_upload_bytes(),
-                download: node.stats.get_download_bytes(),
-                latency: 0,
-                ip: String::new(),
-                loc: String::new(),
-                outbounds: None,
-                selected_node: None,
-            },
-        );
-    }
-
-    let mut outbounds = HashMap::new();
-    for (tag, node) in state.observer.get_all_outbounds() {
-        let trace = state.observer.get_outbound_trace(&tag);
-        let latency = trace
-            .as_ref()
-            .map(|t| t.latency_ms)
-            .unwrap_or_else(|| node.stats.get_latency_ms() as i64);
-        let ip = trace.as_ref().map(|t| t.ip.clone()).unwrap_or_default();
-        let loc = trace.as_ref().map(|t| t.loc.clone()).unwrap_or_default();
-        let (selector_outbounds, selected_node) = OUTBOUNDS_MAP
-            .get(&tag)
-            .and_then(|entry| {
-                let selector = entry.value().as_selector()?;
-                Some((
-                    Some(selector.get_outbound_tags()),
-                    selector.get_selected_tag().map(|s| s.to_string()),
-                ))
-            })
-            .unwrap_or((None, None));
-
-        outbounds.insert(
-            tag.clone(),
-            StatsData {
-                protocol: node.protocol.clone(),
-                tcp_conns: node.stats.get_active_tcp_conns(),
-                udp_sessions: node.stats.get_active_udp_sessions(),
-                upload: node.stats.get_upload_bytes(),
-                download: node.stats.get_download_bytes(),
-                latency,
-                ip,
-                loc,
-                outbounds: selector_outbounds,
-                selected_node,
-            },
-        );
-    }
+    let inbounds = state.observer.get_all_inbounds().into_iter().collect();
+    let outbounds = state.observer.get_all_outbounds().into_iter().collect();
 
     let global_stats = state.observer.get_global_stats();
     let memory_usage = crate::utils::system::get_memory_usage().unwrap_or(0);
@@ -260,17 +207,13 @@ async fn get_outbounds(State(state): State<CoreApiState>) -> Result<impl IntoRes
 
     let mut list = Vec::new();
     for (tag, outbound) in entries {
-        let default_latency = state
+        let latency = state
             .observer
             .get_outbound_stats(&tag)
             .map(|n| n.stats.get_latency_ms() as i64)
             .unwrap_or(0);
 
         let trace = state.observer.get_outbound_trace(&tag);
-        let latency = trace
-            .as_ref()
-            .map(|t| t.latency_ms)
-            .unwrap_or(default_latency);
         let ip = trace.as_ref().map(|t| t.ip.clone()).unwrap_or_default();
         let loc = trace.as_ref().map(|t| t.loc.clone()).unwrap_or_default();
         let (selector_outbounds, selected_node) = outbound
@@ -360,18 +303,25 @@ async fn get_trace(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     if let Some(selector) = outbound.as_selector() {
-        selector.try_url_test_reselect();
+        selector.check_all().await;
 
         let selected_node = selector.get_selected_tag().map(str::to_owned);
         let selected_tag = selector.get_effective_tag();
+        let node_state = state
+            .observer
+            .get_outbound_stats(&selected_tag)
+            .ok_or(StatusCode::BAD_GATEWAY)?;
+        let latency = node_state.stats.get_latency_ms() as i64;
+        if latency <= 0 {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
         let trace = state
             .observer
             .get_outbound_trace(&selected_tag)
-            .filter(|trace| trace.latency_ms > 0)
             .ok_or(StatusCode::BAD_GATEWAY)?;
         state.observer.update_outbound_trace(
-            &params.tag,
-            trace.latency_ms,
+            outbound,
+            latency,
             trace.ip.clone(),
             trace.loc.clone(),
             trace.uplink_path_stats.clone(),
@@ -379,12 +329,12 @@ async fn get_trace(
         );
 
         return Ok(Json(TraceResponse {
-            ip: trace.ip,
-            loc: trace.loc,
-            duration_ms: trace.latency_ms.max(0) as u64,
+            ip: trace.ip.clone(),
+            loc: trace.loc.clone(),
+            duration_ms: latency.max(0) as u64,
             selected_node,
-            uplink_path_stats: trace.uplink_path_stats,
-            downlink_path_stats: trace.downlink_path_stats,
+            uplink_path_stats: trace.uplink_path_stats.clone(),
+            downlink_path_stats: trace.downlink_path_stats.clone(),
         }));
     }
 
@@ -394,9 +344,20 @@ async fn get_trace(
         Err(_) => {
             state
                 .observer
-                .update_outbound_trace(&params.tag, -1, "", "", None, None);
+                .update_outbound_trace(outbound, -1, "", "", None, None);
             Err(StatusCode::BAD_GATEWAY)
         }
+    }
+}
+
+struct TraceTestGuard {
+    observer: Arc<Observer>,
+    tag: String,
+}
+
+impl Drop for TraceTestGuard {
+    fn drop(&mut self) {
+        self.observer.set_outbound_trace_testing(&self.tag, false);
     }
 }
 
@@ -410,6 +371,12 @@ pub async fn get_outbound_info(
         .get(outbound_tag)
         .map(|entry| entry.value().clone())
         .ok_or_else(|| anyhow::anyhow!("outbound not found: {outbound_tag}"))?;
+
+    observer.set_outbound_trace_testing(outbound_tag, true);
+    let _guard = TraceTestGuard {
+        observer: observer.clone(),
+        tag: outbound_tag.to_string(),
+    };
 
     let response = request_via_outbound_with_dns(
         outbound.clone(),
@@ -449,7 +416,7 @@ pub async fn get_outbound_info(
     let uplink_path_stats = outbound.get_uplink_state().await;
     let downlink_path_stats = outbound.get_downlink_state().await;
     observer.update_outbound_trace(
-        outbound_tag,
+        outbound,
         (duration_ms) as i64,
         ip.clone(),
         loc.clone(),
@@ -627,20 +594,6 @@ struct MemoryResponse {
 }
 
 #[derive(Serialize)]
-struct StatsData {
-    protocol: String,
-    tcp_conns: u64,
-    udp_sessions: u64,
-    upload: u64,
-    download: u64,
-    latency: i64,
-    ip: String,
-    loc: String,
-    outbounds: Option<Vec<String>>,
-    selected_node: Option<String>,
-}
-
-#[derive(Serialize)]
 struct ConnectionData {
     id: String,
     inbound_tag: String,
@@ -657,8 +610,8 @@ struct ConnectionData {
 
 #[derive(Serialize)]
 struct ObserveResponse {
-    inbounds: HashMap<String, StatsData>,
-    outbounds: HashMap<String, StatsData>,
+    inbounds: HashMap<String, Arc<NodeStats>>,
+    outbounds: HashMap<String, Arc<NodeStats>>,
     dns_avg_time_us: u64,
     route_avg_time_us: u64,
     memory_usage: u64,

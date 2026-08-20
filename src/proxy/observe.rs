@@ -2,12 +2,12 @@ use arc_swap::ArcSwapOption;
 use bytesize::ByteSize;
 use dashmap::DashMap;
 use serde::{Serialize, Serializer};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::proxy::outbound;
+use crate::proxy::outbound::{self, AnyOutbound, get_outbound_by_tag};
 use crate::utils::now_timestamp;
 use crate::utils::shutdown;
 use crate::utils::system::get_memory_usage;
@@ -97,22 +97,86 @@ pub struct DstTrafficEntry {
 }
 
 #[derive(Debug)]
+pub struct NodeStats {
+    pub tag: String,
+    pub protocol: String,
+    pub stats: Arc<Stats>,
+    pub is_testing_trace: AtomicBool,
+    pub trace: Arc<RwLock<OutboundTraceInfo>>,
+}
+
+impl Serialize for NodeStats {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let trace = self.trace.read().unwrap_or_else(|e| e.into_inner());
+        let mut state = serializer.serialize_struct("NodeStats", 4)?;
+        state.serialize_field("tag", &self.tag)?;
+        state.serialize_field("protocol", &self.protocol)?;
+        state.serialize_field("is_testing_trace", &self.is_testing_trace)?;
+        state.serialize_field("stats", &self.stats)?;
+        state.serialize_field("trace", &*trace)?;
+        if self.protocol == "selector" || self.protocol == "urltest" {
+            let outbound = get_outbound_by_tag(&self.tag);
+            if let Some(selector) = outbound.as_selector() {
+                if let Some(selected_tag) = selector.get_selected_tag() {
+                    state.serialize_field("selector_tag", selected_tag)?;
+                }
+            }
+        }
+        state.end()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct OutboundTraceInfo {
+    pub ip: String,
+    pub loc: String,
+    pub uplink_path_stats: Option<outbound::PathState>,
+    pub downlink_path_stats: Option<outbound::PathState>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct Stats {
+    #[serde(serialize_with = "serialize_atomic_u64")]
     active_tcp_conns: AtomicU64,
+    #[serde(serialize_with = "serialize_atomic_u64")]
     active_udp_conns: AtomicU64,
+    #[serde(serialize_with = "serialize_atomic_u64")]
     total_tcp_conns: AtomicU64,
+    #[serde(serialize_with = "serialize_atomic_u64")]
     total_udp_conns: AtomicU64,
+    #[serde(serialize_with = "serialize_atomic_u64")]
     upload_bytes: AtomicU64,
+    #[serde(serialize_with = "serialize_atomic_u64")]
     download_bytes: AtomicU64,
     // DNS stats (global)
+    #[serde(serialize_with = "serialize_atomic_u64")]
     dns_total_time_us: AtomicU64,
+    #[serde(serialize_with = "serialize_atomic_u64")]
     dns_query_count: AtomicU64,
     // Route stats (global)
+    #[serde(serialize_with = "serialize_atomic_u64")]
     route_total_time_us: AtomicU64,
+    #[serde(serialize_with = "serialize_atomic_u64")]
     route_match_count: AtomicU64,
     // Latency (for outbounds)
-    latency_total_ms: AtomicU64,
-    latency_count: AtomicU64,
+    #[serde(serialize_with = "serialize_atomic_u64")]
+    latency_ms: AtomicU64,
+}
+
+impl NodeStats {
+    pub fn new(tag: &str, protocol: &str) -> Arc<Self> {
+        Arc::new(NodeStats {
+            tag: tag.to_string(),
+            protocol: protocol.to_string(),
+            stats: Arc::new(Stats::default()),
+            is_testing_trace: AtomicBool::new(false),
+            trace: Arc::new(RwLock::new(OutboundTraceInfo::default())),
+        })
+    }
 }
 
 impl Default for Stats {
@@ -132,25 +196,18 @@ impl Default for Stats {
             route_total_time_us: AtomicU64::new(0),
             route_match_count: AtomicU64::new(0),
 
-            latency_total_ms: AtomicU64::new(0),
-            latency_count: AtomicU64::new(0),
+            latency_ms: AtomicU64::new(0),
         }
     }
 }
 
 impl Stats {
     pub fn get_latency_ms(&self) -> u64 {
-        let count = self.latency_count.load(Ordering::Relaxed);
-        if count == 0 {
-            0
-        } else {
-            self.latency_total_ms.load(Ordering::Relaxed) / count
-        }
+        self.latency_ms.load(Ordering::Relaxed)
     }
 
     pub fn record_latency_ms(&self, ms: u64) {
-        self.latency_total_ms.fetch_add(ms, Ordering::Relaxed);
-        self.latency_count.fetch_add(1, Ordering::Relaxed);
+        self.latency_ms.store(ms, Ordering::Relaxed);
     }
 
     pub fn get_upload_bytes(&self) -> u64 {
@@ -232,22 +289,6 @@ impl Stats {
     }
 }
 
-#[derive(Debug)]
-pub struct NodeStats {
-    pub tag: String,
-    pub protocol: String,
-    pub stats: Arc<Stats>,
-}
-
-#[derive(Debug, Clone)]
-pub struct OutboundTraceInfo {
-    pub ip: String,
-    pub loc: String,
-    pub latency_ms: i64,
-    pub uplink_path_stats: Option<outbound::PathState>,
-    pub downlink_path_stats: Option<outbound::PathState>,
-}
-
 use crate::proxy::SessionCloser;
 
 use super::TargetAddr;
@@ -255,7 +296,6 @@ use super::TargetAddr;
 pub struct Observer {
     inbounds: DashMap<String, Arc<NodeStats>>,
     outbounds: DashMap<String, Arc<NodeStats>>,
-    outbound_traces: DashMap<String, OutboundTraceInfo>,
     pub realip2domain: DashMap<String, String>,
     global_stats: Arc<Stats>,
     connections: DashMap<Uuid, ConnectionRecord>,
@@ -274,7 +314,6 @@ impl Observer {
             inbounds: DashMap::new(),
             outbounds: DashMap::new(),
             realip2domain: DashMap::new(),
-            outbound_traces: DashMap::new(),
             global_stats: Arc::new(Stats::default()),
             connections: DashMap::new(),
             dst_traffic: DashMap::new(),
@@ -478,66 +517,51 @@ impl Observer {
 
     pub fn register_inbound(&self, tag: &str, protocol: &str) {
         if !self.inbounds.contains_key(tag) {
-            self.inbounds.insert(
-                tag.to_string(),
-                Arc::new(NodeStats {
-                    tag: tag.to_string(),
-                    protocol: protocol.to_string(),
-                    stats: Arc::new(Stats::default()),
-                }),
-            );
+            self.inbounds
+                .insert(tag.to_string(), NodeStats::new(tag, protocol));
         }
     }
 
     pub fn register_outbound(&self, tag: &str, protocol: &str) {
         if !self.outbounds.contains_key(tag) {
-            self.outbounds.insert(
-                tag.to_string(),
-                Arc::new(NodeStats {
-                    tag: tag.to_string(),
-                    protocol: protocol.to_string(),
-                    stats: Arc::new(Stats::default()),
-                }),
-            );
-        }
-    }
-
-    pub fn update_outbound_latency(&self, tag: &str, latency_ms: i64) {
-        if let Some(node) = self.outbounds.get(tag) {
-            if latency_ms > 0 {
-                node.stats.record_latency_ms(latency_ms as u64);
-            }
+            self.outbounds
+                .insert(tag.to_string(), NodeStats::new(tag, protocol));
         }
     }
 
     pub fn update_outbound_trace(
         &self,
-        tag: &str,
+        outbound: Arc<dyn AnyOutbound>,
         latency_ms: i64,
         ip: impl Into<String>,
         loc: impl Into<String>,
         uplink_path_stats: Option<outbound::PathState>,
         downlink_path_stats: Option<outbound::PathState>,
     ) {
-        if let Some(node) = self.outbounds.get(tag) {
+        if let Some(node) = self.outbounds.get(outbound.tag()) {
             if latency_ms > 0 {
                 node.stats.record_latency_ms(latency_ms as u64);
             }
+            if let Ok(mut trace) = node.trace.write() {
+                trace.ip = ip.into();
+                trace.loc = loc.into();
+                trace.uplink_path_stats = uplink_path_stats;
+                trace.downlink_path_stats = downlink_path_stats;
+            }
         }
-        self.outbound_traces.insert(
-            tag.to_string(),
-            OutboundTraceInfo {
-                ip: ip.into(),
-                loc: loc.into(),
-                latency_ms,
-                uplink_path_stats,
-                downlink_path_stats,
-            },
-        );
+    }
+
+    pub fn set_outbound_trace_testing(&self, tag: &str, testing: bool) {
+        if let Some(node) = self.outbounds.get(tag) {
+            node.is_testing_trace.store(testing, Ordering::Relaxed);
+        }
     }
 
     pub fn get_outbound_trace(&self, tag: &str) -> Option<OutboundTraceInfo> {
-        self.outbound_traces.get(tag).map(|v| v.value().clone())
+        let node = self.outbounds.get(tag)?;
+        let trace = node.trace.clone();
+        let guard = trace.read().ok()?;
+        Some(guard.clone())
     }
 
     pub fn get_inbound_stats(&self, tag: &str) -> Option<Arc<NodeStats>> {

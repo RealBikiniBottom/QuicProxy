@@ -34,7 +34,7 @@ http-body-util = "0"
 rand = "0.10"
 lru = "0"
 httparse = "1"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_json5 = "0"
 serde_path_to_error = "0"

@@ -12,7 +12,7 @@ use crate::api::get_outbound_info;
 use crate::cache::Cache;
 use crate::config::OutboundConfig;
 use crate::proxy::TargetAddr;
-use crate::proxy::observe::{OutboundTraceInfo, get_observer};
+use crate::proxy::observe::get_observer;
 use crate::proxy::outbound::{AnyOutbound, AnyStream};
 use crate::utils::time::parse_duration;
 
@@ -163,7 +163,7 @@ impl SelectorOutbound {
         }
     }
 
-    async fn check_all(&self) {
+    pub async fn check_all(&self) {
         let Some(observer) = get_observer() else {
             debug!(
                 "{} [{}] skipped outbound info check: observer not ready",
@@ -179,7 +179,7 @@ impl SelectorOutbound {
             self.tag
         );
 
-        let (tx, mut rx) = mpsc::channel::<(usize, OutboundTraceInfo)>(self.outbounds.len());
+        let (tx, mut rx) = mpsc::channel::<(usize, i64)>(self.outbounds.len());
         let mode = self.protocol().to_string();
         let selector_tag = self.tag.clone();
 
@@ -198,18 +198,11 @@ impl SelectorOutbound {
                 match get_outbound_info(&tag, observer, dns.as_deref()).await {
                     Ok(trace) => {
                         let latency_ms = trace.duration_ms as i64;
-                        let info = OutboundTraceInfo {
-                            ip: trace.ip,
-                            loc: trace.loc,
-                            latency_ms,
-                            uplink_path_stats: trace.uplink_path_stats,
-                            downlink_path_stats: trace.downlink_path_stats,
-                        };
                         debug!(
                             "{} [{}] outbound [{}] trace ip={} loc={} latency={} ms",
-                            mode, selector_tag, tag, info.ip, info.loc, trace.duration_ms
+                            mode, selector_tag, tag, trace.ip, trace.loc, trace.duration_ms
                         );
-                        let _ = tx.send((i, info)).await;
+                        let _ = tx.send((i, latency_ms)).await;
                     }
                     Err(err) => {
                         debug!(
@@ -262,8 +255,8 @@ impl SelectorOutbound {
         let mut results = Vec::with_capacity(self.outbounds.len());
         for (i, child) in self.outbounds.iter().enumerate() {
             let tag = child.tag();
-            if let Some(trace) = observer.get_outbound_trace(tag) {
-                results.push((i, trace));
+            if let Some(node) = observer.get_outbound_stats(tag) {
+                results.push((i, node.stats.get_latency_ms() as i64));
             }
         }
 
@@ -278,23 +271,23 @@ impl SelectorOutbound {
         self.reselect_node_by_info(&results);
     }
 
-    fn reselect_node_by_info(&self, results: &[(usize, OutboundTraceInfo)]) {
+    fn reselect_node_by_info(&self, results: &[(usize, i64)]) {
         if self.selector_type != SelectorType::UrlTest {
             return;
         }
 
         // 负数表示不通，只保留可达的节点
-        let reachable: Vec<_> = results.iter().filter(|(_, t)| t.latency_ms > 0).collect();
+        let reachable: Vec<_> = results.iter().filter(|(_, l)| *l > 0).collect();
         if reachable.is_empty() {
             warn!("UrlTest [{}] all outbounds failed latency test", self.tag);
             return;
         }
 
-        let min_latency = reachable.iter().map(|(_, t)| t.latency_ms).min().unwrap();
+        let min_latency = reachable.iter().map(|(_, l)| *l).min().unwrap();
 
         let mut best_idx = reachable[0].0;
-        for (idx, trace) in &reachable {
-            if trace.latency_ms <= min_latency + self.tolerance as i64 {
+        for (idx, latency) in &reachable {
+            if *latency <= min_latency + self.tolerance as i64 {
                 best_idx = *idx;
                 break;
             }
@@ -341,20 +334,33 @@ impl SelectorOutbound {
             return;
         }
 
+        let new_selected_node = self.outbounds[new_idx].clone();
         info!(
             "{} [{}] updated node from [{}] to [{}]",
             self.protocol(),
             self.tag,
             self.outbounds[old_idx].tag(),
-            self.outbounds[new_idx].tag()
+            new_selected_node.tag()
         );
 
         if let Some(observer) = get_observer() {
             observer.kill_connections_by_outbound(&self.tag);
+            if let Some(selected_tag) = self.get_selected_tag() {
+                if let Some(trace) = observer.get_outbound_trace(selected_tag) {
+                    observer.update_outbound_trace(
+                        get_outbound_by_tag(&self.tag),
+                        0,
+                        trace.ip,
+                        trace.loc,
+                        trace.uplink_path_stats,
+                        trace.downlink_path_stats,
+                    );
+                }
+            }
         }
 
         if let Some(ref cache) = self.cache {
-            if let Err(e) = cache.set("selected", &self.outbound_tags[new_idx]) {
+            if let Err(e) = cache.set("selected", &new_selected_node.tag().to_string()) {
                 warn!(
                     "{} [{}] failed to persist fallback selection: {}",
                     self.protocol(),
