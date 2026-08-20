@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
@@ -21,6 +23,10 @@ pub enum SelectorType {
     Manual,
     UrlTest,
 }
+
+/// 首个可达节点返回后，等待其余结果汇入的宽限窗口，
+/// 用于在响应速度与选优精度之间取平衡。
+const RESELECT_GRACE_PERIOD: Duration = Duration::from_millis(300);
 
 pub struct SelectorOutbound {
     tag: String,
@@ -173,7 +179,9 @@ impl SelectorOutbound {
             self.tag
         );
 
-        let mut handles = Vec::with_capacity(self.outbounds.len());
+        let (tx, mut rx) = mpsc::channel::<(usize, OutboundTraceInfo)>(self.outbounds.len());
+        let mode = self.protocol().to_string();
+        let selector_tag = self.tag.clone();
 
         for (i, handler) in self.outbounds.iter().enumerate() {
             let tag = handler.tag().to_string();
@@ -183,17 +191,11 @@ impl SelectorOutbound {
                 .or_else(|| handler.dns_server_name())
                 .map(str::to_string);
             let observer = observer.clone();
-            handles.push(tokio::spawn(async move {
-                let result = get_outbound_info(&tag, observer, dns.as_deref()).await;
-                (i, tag, result)
-            }));
-        }
-
-        let mut results = Vec::with_capacity(self.outbounds.len());
-
-        for handle in handles {
-            if let Ok((i, tag, result)) = handle.await {
-                match result {
+            let tx = tx.clone();
+            let mode = mode.clone();
+            let selector_tag = selector_tag.clone();
+            tokio::spawn(async move {
+                match get_outbound_info(&tag, observer, dns.as_deref()).await {
                     Ok(trace) => {
                         let latency_ms = trace.duration_ms as i64;
                         let info = OutboundTraceInfo {
@@ -205,25 +207,39 @@ impl SelectorOutbound {
                         };
                         debug!(
                             "{} [{}] outbound [{}] trace ip={} loc={} latency={} ms",
-                            self.protocol(),
-                            self.tag,
-                            tag,
-                            info.ip,
-                            info.loc,
-                            trace.duration_ms
+                            mode, selector_tag, tag, info.ip, info.loc, trace.duration_ms
                         );
-                        results.push((i, info));
+                        let _ = tx.send((i, info)).await;
                     }
                     Err(err) => {
                         debug!(
                             "{} [{}] outbound [{}] trace failed: {:#}",
-                            self.protocol(),
-                            self.tag,
-                            tag,
-                            err
+                            mode, selector_tag, tag, err
                         );
                     }
                 }
+            });
+        }
+
+        drop(tx);
+
+        let Some(first) = rx.recv().await else {
+            warn!(
+                "{} [{}] all outbounds failed latency test",
+                self.protocol(),
+                self.tag
+            );
+            return;
+        };
+
+        let mut results = vec![first];
+
+        let deadline = tokio::time::Instant::now() + RESELECT_GRACE_PERIOD;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(info)) => results.push(info),
+                Ok(None) => break,
+                Err(_) => break,
             }
         }
 
