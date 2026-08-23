@@ -1,8 +1,8 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -24,9 +24,8 @@ pub enum SelectorType {
     UrlTest,
 }
 
-/// 首个可达节点返回后，等待其余结果汇入的宽限窗口，
-/// 用于在响应速度与选优精度之间取平衡。
-const RESELECT_GRACE_PERIOD: Duration = Duration::from_millis(300);
+/// 单轮测速的总超时。超时后取消尚未完成的任务，保证展示结果和选举结果一致。
+const SELECTOR_TEST_ROUND_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct SelectorOutbound {
     tag: String,
@@ -37,6 +36,7 @@ pub struct SelectorOutbound {
     outbounds_count: usize,
     outbound_tags: Vec<String>,
     selected_index: AtomicUsize,
+    has_completed_test: AtomicBool,
     cache: Option<Cache<String>>,
     interval: Duration,
     tolerance: u64,
@@ -133,34 +133,18 @@ impl SelectorOutbound {
             outbounds: outbounds_vec,
             outbound_tags: outbound_tags.clone(),
             selected_index: AtomicUsize::new(selected_index),
+            has_completed_test: AtomicBool::new(false),
             dns: cfg.dns.clone(),
             interval,
             tolerance,
             cache,
         });
 
-        let clone = outbound.clone();
-        tokio::spawn(async move {
-            clone.run_test_loop().await;
-        });
-
         Ok(outbound)
     }
 
-    async fn run_test_loop(&self) {
-        let mode = match self.selector_type {
-            SelectorType::Manual => "selector",
-            SelectorType::UrlTest => "urltest",
-        };
-        info!(
-            "{} [{}] started latency test loop with interval {:?}",
-            mode, self.tag, self.interval
-        );
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        loop {
-            self.check_all().await;
-            tokio::time::sleep(self.interval).await;
-        }
+    pub fn test_interval(&self) -> Duration {
+        self.interval
     }
 
     pub async fn check_all(&self) {
@@ -179,7 +163,7 @@ impl SelectorOutbound {
             self.tag
         );
 
-        let (tx, mut rx) = mpsc::channel::<(usize, i64)>(self.outbounds.len());
+        let mut tasks = JoinSet::new();
         let mode = self.protocol().to_string();
         let selector_tag = self.tag.clone();
 
@@ -191,10 +175,9 @@ impl SelectorOutbound {
                 .or_else(|| handler.dns_server_name())
                 .map(str::to_string);
             let observer = observer.clone();
-            let tx = tx.clone();
             let mode = mode.clone();
             let selector_tag = selector_tag.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 match get_outbound_info(&tag, observer, dns.as_deref()).await {
                     Ok(trace) => {
                         let latency_ms = trace.duration_ms as i64;
@@ -202,67 +185,52 @@ impl SelectorOutbound {
                             "{} [{}] outbound [{}] trace ip={} loc={} latency={} ms",
                             mode, selector_tag, tag, trace.ip, trace.loc, trace.duration_ms
                         );
-                        let _ = tx.send((i, latency_ms)).await;
+                        Some((i, latency_ms))
                     }
                     Err(err) => {
                         debug!(
                             "{} [{}] outbound [{}] trace failed: {:#}",
                             mode, selector_tag, tag, err
                         );
+                        None
                     }
                 }
             });
         }
 
-        drop(tx);
-
-        let Some(first) = rx.recv().await else {
-            warn!(
-                "{} [{}] all outbounds failed latency test",
-                self.protocol(),
-                self.tag
-            );
-            return;
-        };
-
-        let mut results = vec![first];
-
-        let deadline = tokio::time::Instant::now() + RESELECT_GRACE_PERIOD;
-        loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(info)) => results.push(info),
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-
-        self.reselect_node_by_info(&results);
-    }
-
-    pub fn try_url_test_reselect(&self) {
-        if self.selector_type != SelectorType::UrlTest {
-            return;
-        }
-
-        let Some(observer) = get_observer() else {
-            debug!(
-                "UrlTest [{}] skipped reselect: observer not ready",
-                self.tag
-            );
-            return;
-        };
-
         let mut results = Vec::with_capacity(self.outbounds.len());
-        for (i, child) in self.outbounds.iter().enumerate() {
-            let tag = child.tag();
-            if let Some(node) = observer.get_outbound_stats(tag) {
-                results.push((i, node.stats.get_latency_ms() as i64));
+        let deadline = tokio::time::Instant::now() + SELECTOR_TEST_ROUND_TIMEOUT;
+        while !tasks.is_empty() {
+            match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+                Ok(Some(Ok(Some(info)))) => results.push(info),
+                Ok(Some(Ok(None))) => {}
+                Ok(Some(Err(err))) => {
+                    debug!(
+                        "{} [{}] latency test task failed: {}",
+                        self.protocol(),
+                        self.tag,
+                        err
+                    );
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    warn!(
+                        "{} [{}] latency test timed out after {:?}",
+                        self.protocol(),
+                        self.tag,
+                        SELECTOR_TEST_ROUND_TIMEOUT
+                    );
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    break;
+                }
             }
         }
 
         if results.is_empty() {
             warn!(
-                "UrlTest [{}] all outbounds have no latency data, skipping reselect",
+                "{} [{}] all outbounds failed latency test",
+                self.protocol(),
                 self.tag
             );
             return;
@@ -276,22 +244,34 @@ impl SelectorOutbound {
             return;
         }
 
-        // 负数表示不通，只保留可达的节点
-        let reachable: Vec<_> = results.iter().filter(|(_, l)| *l > 0).collect();
+        let mut sorted_results = results.to_vec();
+        sorted_results.sort_by_key(|(_, latency)| *latency);
+
+        let reachable: Vec<_> = sorted_results.iter().filter(|(_, l)| *l > 0).collect();
         if reachable.is_empty() {
             warn!("UrlTest [{}] all outbounds failed latency test", self.tag);
             return;
         }
 
-        let min_latency = reachable.iter().map(|(_, l)| *l).min().unwrap();
+        let (min_idx, min_latency) = *reachable[0];
+        let is_first_successful_test = !self.has_completed_test.swap(true, Ordering::Relaxed);
 
-        let mut best_idx = reachable[0].0;
-        for (idx, latency) in &reachable {
-            if *latency <= min_latency + self.tolerance as i64 {
-                best_idx = *idx;
-                break;
+        let best_idx = if is_first_successful_test {
+            min_idx
+        } else {
+            let current_idx = self.selected_index.load(Ordering::Relaxed);
+            let current_latency = reachable
+                .iter()
+                .find(|(idx, _)| *idx == current_idx)
+                .map(|(_, latency)| *latency);
+            let tolerance = i64::try_from(self.tolerance).unwrap_or(i64::MAX);
+            let tolerance_limit = min_latency.saturating_add(tolerance);
+
+            match current_latency {
+                Some(latency) if latency <= tolerance_limit => current_idx,
+                _ => min_idx,
             }
-        }
+        };
 
         self.update_selected_by_index(best_idx);
     }
@@ -499,5 +479,183 @@ impl AnyOutbound for SelectorOutbound {
                 bail!("urltest [{}] all outbounds failed UDP", self.tag);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use anyhow::bail;
+    use async_trait::async_trait;
+
+    use crate::proxy::TargetAddr;
+    use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream};
+
+    /// 仅用于测试的占位出站，不涉及真实网络行为。
+    struct MockOutbound {
+        tag: String,
+    }
+
+    #[async_trait]
+    impl AnyOutbound for MockOutbound {
+        fn tag(&self) -> &str {
+            &self.tag
+        }
+
+        fn protocol(&self) -> &str {
+            "mock"
+        }
+
+        fn dns_server_name(&self) -> Option<&str> {
+            None
+        }
+
+        fn connect_timeout(&self) -> Duration {
+            Duration::from_secs(5)
+        }
+
+        async fn connect_packet(&self, _target: &TargetAddr) -> anyhow::Result<Arc<dyn AnyPacket>> {
+            bail!("not implemented")
+        }
+
+        async fn connect_stream_base(&self) -> anyhow::Result<AnyStream> {
+            bail!("not implemented")
+        }
+
+        async fn connect_stream_with(
+            &self,
+            _target: &TargetAddr,
+            _stream: AnyStream,
+        ) -> anyhow::Result<AnyStream> {
+            bail!("not implemented")
+        }
+    }
+
+    fn mock_outbound(tag: &str) -> Arc<dyn AnyOutbound> {
+        Arc::new(MockOutbound {
+            tag: tag.to_string(),
+        })
+    }
+
+    fn build_selector(
+        selector_type: SelectorType,
+        tolerance: u64,
+        selected_index: usize,
+    ) -> SelectorOutbound {
+        let tags = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let outbounds: Vec<Arc<dyn AnyOutbound>> = tags.iter().map(|t| mock_outbound(t)).collect();
+
+        SelectorOutbound {
+            tag: "selector-test".to_string(),
+            selector_type,
+            default_outbound: "a".to_string(),
+            outbounds_count: outbounds.len(),
+            outbound_tags: tags,
+            outbounds,
+            selected_index: AtomicUsize::new(selected_index),
+            has_completed_test: AtomicBool::new(false),
+            cache: None,
+            interval: Duration::from_secs(3600),
+            tolerance,
+            dns: None,
+        }
+    }
+
+    fn selected_index(selector: &SelectorOutbound) -> usize {
+        selector.selected_index.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn manual_selector_does_not_reselect() {
+        let selector = build_selector(SelectorType::Manual, 0, 1);
+        let results = vec![(0, 10), (1, 20)];
+
+        selector.reselect_node_by_info(&results);
+
+        assert_eq!(selected_index(&selector), 1);
+    }
+
+    #[test]
+    fn empty_results_do_not_reselect() {
+        let selector = build_selector(SelectorType::UrlTest, 50, 0);
+
+        selector.reselect_node_by_info(&[]);
+
+        assert_eq!(selected_index(&selector), 0);
+    }
+
+    #[test]
+    fn all_unreachable_does_not_reselect() {
+        let selector = build_selector(SelectorType::UrlTest, 50, 2);
+        let results = vec![(0, -1), (1, -2)];
+
+        selector.reselect_node_by_info(&results);
+
+        assert_eq!(selected_index(&selector), 2);
+    }
+
+    #[test]
+    fn failed_round_does_not_consume_first_successful_selection() {
+        let selector = build_selector(SelectorType::UrlTest, 200, 0);
+        selector.reselect_node_by_info(&[(0, -1), (1, -2)]);
+
+        selector.reselect_node_by_info(&[(0, 300), (1, 150)]);
+
+        assert_eq!(selected_index(&selector), 1);
+    }
+
+    #[test]
+    fn filters_unreachable_nodes() {
+        let selector = build_selector(SelectorType::UrlTest, 0, 2);
+        let results = vec![(0, -1), (1, 20), (2, 30)];
+
+        selector.reselect_node_by_info(&results);
+
+        assert_eq!(selected_index(&selector), 1);
+    }
+
+    #[test]
+    fn picks_first_min_latency_node() {
+        let selector = build_selector(SelectorType::UrlTest, 0, 0);
+        let results = vec![(0, 30), (1, 20), (2, 20)];
+
+        selector.reselect_node_by_info(&results);
+
+        assert_eq!(selected_index(&selector), 1);
+    }
+
+    #[test]
+    fn first_successful_test_ignores_tolerance_and_picks_strict_min() {
+        let selector = build_selector(SelectorType::UrlTest, 200, 0);
+        let results = vec![(0, 300), (1, 150)];
+
+        selector.reselect_node_by_info(&results);
+
+        assert_eq!(selected_index(&selector), 1);
+    }
+
+    #[test]
+    fn later_test_keeps_current_node_within_tolerance() {
+        let selector = build_selector(SelectorType::UrlTest, 50, 0);
+        selector.reselect_node_by_info(&[(0, 20), (1, 60)]);
+
+        selector.reselect_node_by_info(&[(0, 60), (1, 20)]);
+
+        assert_eq!(selected_index(&selector), 0);
+    }
+
+    #[test]
+    fn later_test_switches_when_current_node_exceeds_tolerance() {
+        let selector = build_selector(SelectorType::UrlTest, 50, 0);
+        selector.reselect_node_by_info(&[(0, 20), (1, 60)]);
+
+        selector.reselect_node_by_info(&[(0, 80), (1, 20)]);
+
+        assert_eq!(selected_index(&selector), 1);
     }
 }

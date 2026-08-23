@@ -2,7 +2,7 @@
 //!
 //! 仅在 quicproxy 核心进程运行时可用。
 
-use crate::proxy::outbound::OUTBOUNDS_MAP;
+use crate::proxy::outbound::{AnyOutbound, OUTBOUNDS_MAP};
 use crate::proxy::{
     observe::{NodeStats, Observer, get_observer},
     router::get_router,
@@ -20,7 +20,7 @@ use hashbrown::HashMap;
 use hyper::http::Method;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use sysinfo::System;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info};
@@ -120,7 +120,12 @@ async fn delete_connections(
     if params.all {
         state.observer.kill_all_connections();
     } else if let Some(id) = &params.id {
-        state.observer.kill_connection(id);
+        if uuid::Uuid::parse_str(id).is_err() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if !state.observer.kill_connection(id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
     } else if let Some(outbound) = &params.outbound {
         state.observer.kill_connections_by_outbound(outbound);
     } else {
@@ -341,23 +346,31 @@ async fn get_trace(
     let dns = params.dns.as_deref().or_else(|| outbound.dns_server_name());
     match get_outbound_info(&params.tag, state.observer.clone(), dns).await {
         Ok(r) => Ok(Json(r)),
-        Err(_) => {
-            state
-                .observer
-                .update_outbound_trace(outbound, -1, "", "", None, None);
-            Err(StatusCode::BAD_GATEWAY)
-        }
+        Err(_) => Err(StatusCode::BAD_GATEWAY),
     }
 }
 
 struct TraceTestGuard {
     observer: Arc<Observer>,
+    outbound: Arc<dyn AnyOutbound>,
     tag: String,
+    succeeded: bool,
+}
+
+impl TraceTestGuard {
+    fn mark_succeeded(&mut self) {
+        self.succeeded = true;
+    }
 }
 
 impl Drop for TraceTestGuard {
     fn drop(&mut self) {
         self.observer.set_outbound_trace_testing(&self.tag, false);
+        // Drop also runs when a selector test is aborted by the round timeout.
+        if !self.succeeded {
+            self.observer
+                .update_outbound_trace(self.outbound.clone(), -1, "", "", None, None);
+        }
     }
 }
 
@@ -373,9 +386,11 @@ pub async fn get_outbound_info(
         .ok_or_else(|| anyhow::anyhow!("outbound not found: {outbound_tag}"))?;
 
     observer.set_outbound_trace_testing(outbound_tag, true);
-    let _guard = TraceTestGuard {
+    let mut guard = TraceTestGuard {
         observer: observer.clone(),
+        outbound: outbound.clone(),
         tag: outbound_tag.to_string(),
+        succeeded: false,
     };
 
     let response = request_via_outbound_with_dns(
@@ -423,6 +438,7 @@ pub async fn get_outbound_info(
         uplink_path_stats.clone(),
         downlink_path_stats.clone(),
     );
+    guard.mark_succeeded();
 
     Ok(TraceResponse {
         ip,
@@ -456,6 +472,8 @@ struct RequestResponse {
     duration_ms: u64,
 }
 
+const MAX_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 async fn get_request(Query(params): Query<RequestParams>) -> Result<impl IntoResponse, StatusCode> {
     let start = std::time::Instant::now();
     let outbound = OUTBOUNDS_MAP
@@ -483,6 +501,11 @@ async fn get_request(Query(params): Query<RequestParams>) -> Result<impl IntoRes
             StatusCode::BAD_GATEWAY
         }
     })?;
+
+    if response.body.len() > MAX_RESPONSE_BODY_BYTES {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let mut resp_headers = HashMap::new();
@@ -510,8 +533,13 @@ async fn get_traffic(State(state): State<CoreApiState>) -> Result<impl IntoRespo
 
 // ─── Handler: Version & System Info ───
 
+fn system_instance() -> &'static Mutex<System> {
+    static SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+    SYSTEM.get_or_init(|| Mutex::new(System::new_all()))
+}
+
 async fn get_runtime_core_version() -> Result<impl IntoResponse, StatusCode> {
-    let mut system = System::new_all();
+    let mut system = system_instance().lock().unwrap_or_else(|e| e.into_inner());
     system.refresh_memory();
 
     Ok(Json(build_core_version_response(&system)))

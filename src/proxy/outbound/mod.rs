@@ -33,6 +33,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::task::JoinSet;
+use tracing::{info, warn};
 use trojan::TrojanOutbound;
 use vmess::VmessOutbound;
 
@@ -42,6 +44,7 @@ use crate::proxy::observe::get_observer;
 use crate::proxy::{SessionCloser, TargetAddr};
 use crate::utils::interface::{InterfaceInfo, InterfaceManager, resolve_iface};
 use crate::utils::new_io_timeout_error;
+use crate::utils::shutdown;
 use crate::utils::socket::socket_helpers::{new_tcp_stream, new_udp_socket};
 
 use bytes::{Bytes, BytesMut};
@@ -119,6 +122,64 @@ pub fn init_outbounds(cfg: &Config) -> anyhow::Result<()> {
 /// Selectors may own persistent cache handles.
 pub fn shutdown_outbounds() {
     OUTBOUNDS_MAP.clear();
+}
+
+/// 在后台执行所有 selector 的首次测速，再进入周期测速，不阻塞应用启动。
+pub fn start_outbound_tests() {
+    let selectors: Vec<_> = OUTBOUNDS_MAP
+        .iter()
+        .filter(|entry| entry.key().as_str() == entry.value().tag())
+        .filter(|entry| entry.value().as_selector().is_some())
+        .map(|entry| entry.value().clone())
+        .collect();
+
+    shutdown::spawn(async move {
+        let mut initial_tests = JoinSet::new();
+        for outbound in &selectors {
+            let outbound = outbound.clone();
+            initial_tests.spawn(async move {
+                if let Some(selector) = outbound.as_selector() {
+                    selector.check_all().await;
+                }
+            });
+        }
+
+        while let Some(result) = initial_tests.join_next().await {
+            if let Err(err) = result {
+                warn!("selector initial latency test task failed: {}", err);
+            }
+        }
+
+        let mut periodic_tests = JoinSet::new();
+        for outbound in selectors {
+            let Some(selector) = outbound.as_selector() else {
+                continue;
+            };
+            let interval = selector.test_interval();
+            let protocol = outbound.protocol().to_string();
+            let tag = outbound.tag().to_string();
+
+            info!(
+                "{} [{}] started latency test loop with interval {:?}",
+                protocol, tag, interval
+            );
+            periodic_tests.spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let Some(selector) = outbound.as_selector() else {
+                        return;
+                    };
+                    selector.check_all().await;
+                }
+            });
+        }
+
+        while let Some(result) = periodic_tests.join_next().await {
+            if let Err(err) = result {
+                warn!("selector periodic latency test task failed: {}", err);
+            }
+        }
+    });
 }
 
 pub fn try_get_outbound_by_tag(tag: &str) -> Arc<dyn AnyOutbound> {

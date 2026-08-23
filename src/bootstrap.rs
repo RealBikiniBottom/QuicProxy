@@ -2,7 +2,7 @@ use crate::cache::{init_cache, shutdown_cache};
 use crate::config::Config;
 use crate::proxy::inbound::init_inbounds;
 use crate::proxy::observe::{init_observer, shutdown_observer};
-use crate::proxy::outbound::{init_outbounds, shutdown_outbounds};
+use crate::proxy::outbound::{init_outbounds, shutdown_outbounds, start_outbound_tests};
 use crate::proxy::router::geoip::{init_geoip, shutdown_geoip};
 use crate::proxy::router::geoip_db::{init_geoip_db, shutdown_geoip_db};
 use crate::proxy::router::{init_router, shutdown_router};
@@ -116,6 +116,9 @@ pub async fn init_app(mut config: Config) -> Result<Option<tokio::sync::mpsc::Re
 
     init_inbounds(&config).context("Failed to init inbounds")?;
     debug!("init_inbounds");
+
+    start_outbound_tests();
+    debug!("start_outbound_tests");
 
     init_core_api(&mut config)
         .await

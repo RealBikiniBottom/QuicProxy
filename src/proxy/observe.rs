@@ -394,14 +394,17 @@ impl Observer {
         }
     }
 
-    pub fn kill_connection(&self, id: &str) {
+    pub fn kill_connection(&self, id: &str) -> bool {
         let Ok(id) = Uuid::parse_str(id) else {
-            return;
+            return false;
         };
         if let Some(record) = self.connections.get(&id)
             && let Some(closer) = &record.closer
         {
             closer.close();
+            true
+        } else {
+            false
         }
     }
 
