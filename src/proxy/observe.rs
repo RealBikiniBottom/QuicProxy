@@ -268,7 +268,11 @@ impl Stats {
     }
 
     pub fn dec_active_tcp(&self) {
-        self.active_tcp_conns.fetch_sub(1, Ordering::Relaxed);
+        self.active_tcp_conns
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
     }
 
     pub fn inc_active_udp(&self) {
@@ -277,7 +281,11 @@ impl Stats {
     }
 
     pub fn dec_active_udp(&self) {
-        self.active_udp_conns.fetch_sub(1, Ordering::Relaxed);
+        self.active_udp_conns
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
     }
 
     pub fn inc_upload(&self, bytes: u64) {
@@ -351,13 +359,12 @@ impl Observer {
         let now = now_timestamp();
         let outbound_tag = conn.outbound_tag.to_string();
 
-        // 先计算 domain（用于查询/插入 key），ip 延迟到真正插入时才构造
         let domain = match &conn.final_target {
             TargetAddr::Ip(addr) => self
                 .realip2domain
                 .get(&addr.ip().to_string())
                 .map(|r| format!("{}:{}", r.value().as_str(), addr.port()))
-                .unwrap_or_default(),
+                .unwrap_or_else(|| addr.to_string()),
             TargetAddr::Domain(..) => conn.final_target.to_string(),
         };
 
@@ -459,7 +466,7 @@ impl Observer {
 
     pub fn on_inbound_close_tcp(&self, tag: &str) {
         if let Some(node) = self.inbounds.get(tag) {
-            node.stats.active_tcp_conns.fetch_sub(1, Ordering::Relaxed);
+            node.stats.dec_active_tcp();
         }
     }
 
@@ -472,7 +479,7 @@ impl Observer {
 
     pub fn on_inbound_close_udp(&self, tag: &str) {
         if let Some(node) = self.inbounds.get(tag) {
-            node.stats.active_udp_conns.fetch_sub(1, Ordering::Relaxed);
+            node.stats.dec_active_udp();
         }
     }
 
@@ -485,7 +492,7 @@ impl Observer {
 
     pub fn on_outbound_close_tcp(&self, tag: &str) {
         if let Some(node) = self.outbounds.get(tag) {
-            node.stats.active_tcp_conns.fetch_sub(1, Ordering::Relaxed);
+            node.stats.dec_active_tcp();
         }
     }
 
@@ -498,7 +505,7 @@ impl Observer {
 
     pub fn on_outbound_close_udp(&self, tag: &str) {
         if let Some(node) = self.outbounds.get(tag) {
-            node.stats.active_udp_conns.fetch_sub(1, Ordering::Relaxed);
+            node.stats.dec_active_udp();
         }
     }
 
