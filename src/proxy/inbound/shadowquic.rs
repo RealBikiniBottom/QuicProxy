@@ -370,7 +370,7 @@ impl AnyInbound for ShadowQuicInbound {
                         }
 
                         conn.close(VarInt::from_u64(263).unwrap(), &[]);
-                        debug!("QUIC conn closed",);
+                        info!("QUIC conn closed",);
                     });
                 }
                 Err(e) => {

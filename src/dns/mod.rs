@@ -190,9 +190,6 @@ pub async fn resolve_domain(domain: &str, dns_server: Arc<dyn AnyDNS>) -> Result
 
     if let Some(observer) = get_observer() {
         observer.record_dns_time(now.elapsed().as_micros() as u64);
-        observer
-            .realip2domain
-            .insert(ip.to_string(), domain.to_string());
     }
     info!(
         "resolved ip: {}, cost: {}",
@@ -201,6 +198,29 @@ pub async fn resolve_domain(domain: &str, dns_server: Arc<dyn AnyDNS>) -> Result
     );
 
     Ok(ip)
+}
+
+fn persist_realip_domains(packet: &Packet<'_>, domain: &str) {
+    if packet.rcode() != RCODE::NoError {
+        return;
+    }
+
+    let Some(observer) = get_observer() else {
+        return;
+    };
+
+    let domain = domain.to_string();
+    for answer in &packet.answers {
+        let ip = match &answer.rdata {
+            RData::A(a) => IpAddr::V4(a.address.into()),
+            RData::AAAA(aaaa) => IpAddr::V6(aaaa.address.into()),
+            _ => continue,
+        };
+
+        if let Err(e) = observer.realip2domain.set(&ip.to_string(), &domain) {
+            warn!("failed to persist real IP domain mapping for {ip}: {e}");
+        }
+    }
 }
 
 pub async fn resolve_target_base(
@@ -545,6 +565,7 @@ pub trait AnyDNS: Send + Sync + 'static {
         let max_ttl = self.max_ttl();
 
         let min_effective_ttl = apply_ttl_to_response(&mut resp_packet, min_ttl, max_ttl);
+        persist_realip_domains(&resp_packet, &domain);
 
         if let Some(cache_ttl) = min_effective_ttl.filter(|ttl| *ttl > 0) {
             if let Some(byte_cache) = self.byte_cache() {

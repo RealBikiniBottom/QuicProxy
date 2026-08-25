@@ -200,10 +200,14 @@ impl Router {
 
         let inbound_tag_str: Arc<str> = Arc::from(inbound_tag);
 
+        let outbound_tags = match outbound.as_selector() {
+            Some(selector) => selector.get_active_outbound_tags(),
+            None => vec![outbound.tag().to_string()],
+        };
         let outbound_tag: Arc<str> = Arc::from(outbound.tag());
-        let outbound_stats_tag: Arc<str> = outbound
-            .as_selector()
-            .map(|s| Arc::from(s.get_effective_tag()))
+        let outbound_stats_tag: Arc<str> = outbound_tags
+            .last()
+            .map(|tag| Arc::from(tag.as_str()))
             .unwrap_or_else(|| outbound_tag.clone());
 
         let inbound_stats = obs
@@ -224,7 +228,7 @@ impl Router {
 
         let tracker = ConnectionTracker::new(
             inbound_tag_str,
-            outbound_tag,
+            outbound_tags,
             matched_idx,
             final_target.clone(),
             target.clone(),
@@ -710,10 +714,6 @@ impl Router {
             .select_out(target_addr, inbound_tag, Some(NetworkType::Udp), payload)
             .await;
         let tracker_tag: Arc<str> = Arc::from(outbound.tag());
-        let stats_tag: Arc<str> = outbound
-            .as_selector()
-            .map(|s| Arc::from(s.get_effective_tag()))
-            .unwrap_or_else(|| tracker_tag.clone());
 
         info!("New UDP session: {} -> {}", source_addr, final_target);
 
@@ -724,6 +724,16 @@ impl Router {
                     "Connected UDP outbound [{}] for {}",
                     tracker_tag, final_target
                 );
+                // urltest may switch to a fallback while connecting, so capture
+                // the effective leaf only after the connection succeeds.
+                let outbound_tags = match outbound.as_selector() {
+                    Some(selector) => selector.get_active_outbound_tags(),
+                    None => vec![outbound.tag().to_string()],
+                };
+                let stats_tag: Arc<str> = outbound_tags
+                    .last()
+                    .map(|tag| Arc::from(tag.as_str()))
+                    .unwrap_or_else(|| tracker_tag.clone());
                 // s is already Arc<TrackedPacket>
                 if let Some(obs) = get_observer() {
                     let inbound_tag_str: Arc<str> = Arc::from(inbound_tag);
@@ -732,7 +742,7 @@ impl Router {
 
                     let tracker = ConnectionTracker::new(
                         inbound_tag_str,
-                        tracker_tag.clone(),
+                        outbound_tags,
                         matched_idx,
                         final_target.clone(),
                         target_addr.clone(),

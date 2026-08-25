@@ -135,27 +135,8 @@ async fn delete_connections(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_connections(
-    State(state): State<CoreApiState>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let connections = state.observer.get_all_connections();
-    let data: Vec<ConnectionData> = connections
-        .iter()
-        .map(|c| ConnectionData {
-            id: c.id.to_string(),
-            inbound_tag: c.inbound_tag.to_string(),
-            outbound_tag: c.outbound_tag.to_string(),
-            matched_rule_index: c.matched_rule_index,
-            dst: c.final_target.to_string(),
-            ip: c.origin_target.to_string(),
-            is_fakeip: c.is_fakeip,
-            is_udp: c.is_udp,
-            upload: c.upload.load(std::sync::atomic::Ordering::Relaxed),
-            download: c.download.load(std::sync::atomic::Ordering::Relaxed),
-            start_time: c.start_time,
-        })
-        .collect();
-    Ok(Json(data))
+async fn get_connections(State(state): State<CoreApiState>) -> impl IntoResponse {
+    Json(state.observer.get_all_connections())
 }
 
 // ─── Handler: Observe ───
@@ -619,21 +600,6 @@ struct MemoryResponse {
     swap_total: u64,
     swap_used: u64,
     swap_free: u64,
-}
-
-#[derive(Serialize)]
-struct ConnectionData {
-    id: String,
-    inbound_tag: String,
-    outbound_tag: String,
-    matched_rule_index: Option<usize>,
-    dst: String,
-    ip: String,
-    is_fakeip: bool,
-    is_udp: bool,
-    upload: u64,
-    download: u64,
-    start_time: u64,
 }
 
 #[derive(Serialize)]

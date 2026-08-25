@@ -205,6 +205,7 @@ impl Default for Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ObserveConfig {
     pub enabled: bool,
+    pub cache: Option<String>,
     #[serde(default = "default_log_interval")]
     pub log_interval: u64,
 }

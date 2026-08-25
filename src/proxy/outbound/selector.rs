@@ -294,6 +294,21 @@ impl SelectorOutbound {
             .unwrap_or_else(|| self.tag.clone())
     }
 
+    /// Returns the complete currently selected outbound path, from this
+    /// selector through any nested selectors to the effective leaf outbound.
+    pub fn get_active_outbound_tags(&self) -> Vec<String> {
+        let mut tags = vec![self.tag.clone()];
+        let idx = self.selected_index.load(Ordering::Relaxed);
+        if let Some(child) = self.outbounds.get(idx) {
+            if let Some(selector) = child.as_selector() {
+                tags.extend(selector.get_active_outbound_tags());
+            } else {
+                tags.push(child.tag().to_string());
+            }
+        }
+        tags
+    }
+
     pub fn get_outbound_tags(&self) -> Vec<String> {
         self.outbound_tags.clone()
     }
@@ -324,12 +339,14 @@ impl SelectorOutbound {
         );
 
         if let Some(observer) = get_observer() {
-            observer.kill_connections_by_outbound(&self.tag);
             if let Some(selected_tag) = self.get_selected_tag() {
-                if let Some(trace) = observer.get_outbound_trace(selected_tag) {
+                if let (Some(node), Some(trace)) = (
+                    observer.get_outbound_stats(selected_tag),
+                    observer.get_outbound_trace(selected_tag),
+                ) {
                     observer.update_outbound_trace(
                         get_outbound_by_tag(&self.tag),
-                        0,
+                        node.stats.get_latency_ms(),
                         trace.ip,
                         trace.loc,
                         trace.uplink_path_stats,
@@ -337,6 +354,7 @@ impl SelectorOutbound {
                     );
                 }
             }
+            observer.kill_connections_by_outbound(&self.tag);
         }
 
         if let Some(ref cache) = self.cache {
@@ -657,5 +675,22 @@ mod tests {
         selector.reselect_node_by_info(&[(0, 80), (1, 20)]);
 
         assert_eq!(selected_index(&selector), 1);
+    }
+
+    #[test]
+    fn active_outbound_tags_include_nested_selectors_and_leaf() {
+        let mut urltest = build_selector(SelectorType::UrlTest, 50, 0);
+        urltest.tag = "urltest".to_string();
+
+        let mut proxy = build_selector(SelectorType::Manual, 0, 0);
+        proxy.tag = "proxy".to_string();
+        proxy.outbound_tags[0] = "urltest".to_string();
+        proxy.outbounds[0] = Arc::new(urltest);
+
+        assert_eq!(
+            proxy.get_active_outbound_tags(),
+            vec!["proxy".to_string(), "urltest".to_string(), "a".to_string()]
+        );
+        assert_eq!(proxy.get_effective_tag(), "a");
     }
 }

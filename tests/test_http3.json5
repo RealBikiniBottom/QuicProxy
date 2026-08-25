@@ -5,7 +5,7 @@
       "address": "127.0.0.1",
       "idle_timeout": 500,
       "set_system_proxy": false,
-      "port": 1101
+      "port": 1102
     },
     "tun_inbound": {
       "type": "tun",
@@ -55,9 +55,9 @@
     "servers": {
       "autoSelect": {
         "type": "urltest",
-        "default_outbound": "real_out",
+        "default_outbound": "real_out2",
         "outbounds": [
-          "real_out",
+          "real_out2",
         ]
       },
       "real_out2": {
@@ -110,11 +110,11 @@
       },
       "proxy": {
         "type": "selector",
-        "default_outbound": "real_out",
+        "default_outbound": "real_out2",
         "cache": "all_cache",
         "outbounds": [
           "autoSelect",
-          "real_out",
+          "real_out2",
         ]
       },
       "direct": {
@@ -224,7 +224,7 @@
       {
         "mode": ["rule"],
         "geoip": ["cn"],
-        "outbound": "real_out"
+        "outbound": "real_out2"
       }
     ]
   },
@@ -270,6 +270,7 @@
   },
   "observe": {
     "enabled": false,
+    "cache": "all_cache",
     "log_interval": 15
   },
   "log": {

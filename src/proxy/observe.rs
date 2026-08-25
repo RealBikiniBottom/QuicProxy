@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
 
+use super::TargetAddr;
+use crate::cache::Cache;
 use crate::proxy::outbound::{self, AnyOutbound, get_outbound_by_tag};
 use crate::utils::now_timestamp;
 use crate::utils::shutdown;
@@ -33,11 +35,12 @@ pub struct ConnectionTracker {
     pub id: Uuid,
     #[serde(serialize_with = "serialize_shared_str")]
     pub inbound_tag: Arc<str>,
-    #[serde(serialize_with = "serialize_shared_str")]
-    pub outbound_tag: Arc<str>,
+    pub outbound_tag: Vec<String>,
     pub matched_rule_index: Option<usize>,
     pub final_target: TargetAddr,
     pub origin_target: TargetAddr,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     pub is_fakeip: bool,
     pub is_udp: bool,
     #[serde(serialize_with = "serialize_atomic_u64")]
@@ -64,7 +67,7 @@ where
 impl ConnectionTracker {
     pub fn new(
         inbound_tag: Arc<str>,
-        outbound_tag: Arc<str>,
+        outbound_tag: Vec<String>,
         matched_rule_index: Option<usize>,
         final_target: TargetAddr,
         origin_target: TargetAddr,
@@ -78,6 +81,7 @@ impl ConnectionTracker {
             matched_rule_index,
             origin_target,
             final_target,
+            domain: None,
             is_fakeip,
             is_udp,
             upload: AtomicU64::new(0),
@@ -90,6 +94,10 @@ impl ConnectionTracker {
     }
     pub fn inc_download(&self, bytes: u64) {
         self.download.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn uses_outbound(&self, tag: &str) -> bool {
+        self.outbound_tag.iter().any(|outbound| outbound == tag)
     }
 }
 
@@ -306,12 +314,10 @@ impl Stats {
 
 use crate::proxy::SessionCloser;
 
-use super::TargetAddr;
-
 pub struct Observer {
     inbounds: DashMap<String, Arc<NodeStats>>,
     outbounds: DashMap<String, Arc<NodeStats>>,
-    pub realip2domain: DashMap<String, String>,
+    pub realip2domain: Cache<String>,
     global_stats: Arc<Stats>,
     connections: DashMap<Uuid, ConnectionRecord>,
     dst_traffic: DashMap<String, DstTrafficEntry>,
@@ -324,23 +330,26 @@ struct ConnectionRecord {
 }
 
 impl Observer {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(cache_name: &str) -> anyhow::Result<Self> {
+        let realip2domain = Cache::new_with_tag(cache_name, "observe:realip2domain".to_string())?;
+
+        Ok(Self {
             inbounds: DashMap::new(),
             outbounds: DashMap::new(),
-            realip2domain: DashMap::new(),
+            realip2domain,
             global_stats: Arc::new(Stats::default()),
             connections: DashMap::new(),
             dst_traffic: DashMap::new(),
             mem_stats: Mutex::new((0, 0, 0)),
-        }
+        })
     }
 
     pub fn add_connection(
         &self,
-        conn: ConnectionTracker,
+        mut conn: ConnectionTracker,
         closer: Option<Arc<SessionCloser>>,
     ) -> Arc<ConnectionTracker> {
+        conn.domain = self.resolve_domain_for_target(&conn.final_target);
         let tracker = Arc::new(conn);
         self.connections.insert(
             tracker.id,
@@ -350,6 +359,21 @@ impl Observer {
             },
         );
         tracker
+    }
+
+    fn resolve_domain_for_target(&self, target: &TargetAddr) -> Option<String> {
+        let TargetAddr::Ip(addr) = target else {
+            return None;
+        };
+
+        self.realip2domain
+            .get(&addr.ip().to_string())
+            .ok()
+            .flatten()
+            .and_then(|(domain, _)| {
+                let domain = domain.trim();
+                (!domain.is_empty()).then(|| format!("{}:{}", domain, addr.port()))
+            })
     }
 
     pub fn remove_connection(&self, id: &Uuid) {
@@ -364,16 +388,13 @@ impl Observer {
         }
 
         let now = now_timestamp();
-        let outbound_tag = conn.outbound_tag.to_string();
+        let outbound_tag = conn.outbound_tag.first().cloned().unwrap_or_default();
 
-        let domain = match &conn.final_target {
-            TargetAddr::Ip(addr) => self
-                .realip2domain
-                .get(&addr.ip().to_string())
-                .map(|r| format!("{}:{}", r.value().as_str(), addr.port()))
-                .unwrap_or_else(|| addr.to_string()),
-            TargetAddr::Domain(..) => conn.final_target.to_string(),
-        };
+        let domain = conn
+            .domain
+            .clone()
+            .or_else(|| self.resolve_domain_for_target(&conn.final_target))
+            .unwrap_or_else(|| conn.final_target.to_string());
 
         if let Some(mut entry) = self.dst_traffic.get_mut(domain.as_str()) {
             entry.upload = entry.upload.wrapping_add(upload);
@@ -427,7 +448,7 @@ impl Observer {
         let to_close: Vec<Uuid> = self
             .connections
             .iter()
-            .filter(|entry| entry.value().tracker.outbound_tag.as_ref() == tag)
+            .filter(|entry| entry.value().tracker.uses_outbound(tag))
             .map(|entry| *entry.key())
             .collect();
 
@@ -673,7 +694,11 @@ static GLOBAL_OBSERVER: ArcSwapOption<Observer> = ArcSwapOption::const_empty();
 pub fn init_observer(cfg: &crate::config::Config) -> anyhow::Result<()> {
     if let Some(obs_cfg) = cfg.observe.as_ref() {
         if obs_cfg.enabled {
-            let observer = Arc::new(Observer::new());
+            let cache_name = obs_cfg
+                .cache
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("observe requires cache"))?;
+            let observer = Arc::new(Observer::new(cache_name)?);
             observer.spawn_periodic_log(obs_cfg.log_interval);
             GLOBAL_OBSERVER.store(Some(observer));
         }
@@ -687,4 +712,85 @@ pub fn get_observer() -> Option<Arc<Observer>> {
 
 pub fn shutdown_observer() {
     GLOBAL_OBSERVER.store(None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_tracker_serializes_core_api_shape() {
+        let mut tracker = ConnectionTracker::new(
+            Arc::from("mixed"),
+            vec![
+                "proxy".to_string(),
+                "urltest".to_string(),
+                "node-a".to_string(),
+            ],
+            Some(3),
+            TargetAddr::Ip("203.0.113.9:443".parse().unwrap()),
+            TargetAddr::Ip("198.51.100.7:54321".parse().unwrap()),
+            true,
+            false,
+        );
+        tracker.domain = Some("resolved.example:443".to_string());
+        tracker.inc_upload(128);
+        tracker.inc_download(256);
+
+        let value = serde_json::to_value(tracker).unwrap();
+
+        assert_eq!(
+            value["final_target"],
+            serde_json::json!({"Ip": "203.0.113.9:443"})
+        );
+        assert_eq!(
+            value["origin_target"],
+            serde_json::json!({"Ip": "198.51.100.7:54321"})
+        );
+        assert_eq!(value["upload"], 128);
+        assert_eq!(value["download"], 256);
+        assert_eq!(
+            value["outbound_tag"],
+            serde_json::json!(["proxy", "urltest", "node-a"])
+        );
+        assert_eq!(value["domain"], "resolved.example:443");
+        assert!(value.get("effective_outbound_tag").is_none());
+        assert!(value.get("dst").is_none());
+        assert!(value.get("ip").is_none());
+
+        let direct_tracker = ConnectionTracker::new(
+            Arc::from("mixed"),
+            vec!["direct".to_string()],
+            None,
+            TargetAddr::Domain("example.org".to_string(), 80),
+            TargetAddr::Domain("example.org".to_string(), 80),
+            false,
+            false,
+        );
+        let direct_value = serde_json::to_value(direct_tracker).unwrap();
+        assert_eq!(direct_value["outbound_tag"], serde_json::json!(["direct"]));
+        assert!(direct_value.get("domain").is_none());
+    }
+
+    #[test]
+    fn connection_tracker_matches_nested_selector() {
+        let tracker = ConnectionTracker::new(
+            Arc::from("mixed"),
+            vec![
+                "proxy".to_string(),
+                "urltest".to_string(),
+                "node-a".to_string(),
+            ],
+            None,
+            TargetAddr::Domain("example.org".to_string(), 443),
+            TargetAddr::Domain("example.org".to_string(), 443),
+            false,
+            false,
+        );
+
+        assert!(tracker.uses_outbound("proxy"));
+        assert!(tracker.uses_outbound("urltest"));
+        assert!(tracker.uses_outbound("node-a"));
+        assert!(!tracker.uses_outbound("other-urltest"));
+    }
 }
