@@ -2,7 +2,7 @@ use arc_swap::ArcSwapOption;
 use bytesize::ByteSize;
 use dashmap::DashMap;
 use serde::{Serialize, Serializer};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
@@ -18,6 +18,13 @@ where
     S: Serializer,
 {
     serializer.serialize_u64(val.load(Ordering::Relaxed))
+}
+
+fn serialize_atomic_i64<S>(val: &AtomicI64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_i64(val.load(Ordering::Relaxed))
 }
 
 #[derive(Debug, Serialize)]
@@ -163,8 +170,8 @@ pub struct Stats {
     #[serde(serialize_with = "serialize_atomic_u64")]
     route_match_count: AtomicU64,
     // Latency (for outbounds)
-    #[serde(serialize_with = "serialize_atomic_u64")]
-    latency_ms: AtomicU64,
+    #[serde(serialize_with = "serialize_atomic_i64")]
+    latency_ms: AtomicI64,
 }
 
 impl NodeStats {
@@ -196,17 +203,17 @@ impl Default for Stats {
             route_total_time_us: AtomicU64::new(0),
             route_match_count: AtomicU64::new(0),
 
-            latency_ms: AtomicU64::new(0),
+            latency_ms: AtomicI64::new(0),
         }
     }
 }
 
 impl Stats {
-    pub fn get_latency_ms(&self) -> u64 {
+    pub fn get_latency_ms(&self) -> i64 {
         self.latency_ms.load(Ordering::Relaxed)
     }
 
-    pub fn record_latency_ms(&self, ms: u64) {
+    pub fn record_latency_ms(&self, ms: i64) {
         self.latency_ms.store(ms, Ordering::Relaxed);
     }
 
@@ -549,9 +556,7 @@ impl Observer {
         downlink_path_stats: Option<outbound::PathState>,
     ) {
         if let Some(node) = self.outbounds.get(outbound.tag()) {
-            if latency_ms > 0 {
-                node.stats.record_latency_ms(latency_ms as u64);
-            }
+            node.stats.record_latency_ms(latency_ms);
             if let Ok(mut trace) = node.trace.write() {
                 trace.ip = ip.into();
                 trace.loc = loc.into();
@@ -603,6 +608,12 @@ impl Observer {
             if !nodes.is_empty() {
                 info!("{}:", label);
                 for (tag, node) in nodes {
+                    let latency_ms = node.stats.get_latency_ms();
+                    let latency = if latency_ms < 0 {
+                        format!("{latency_ms} ms")
+                    } else {
+                        format_ms(latency_ms as u64)
+                    };
                     info!(
                         "  [{}({})]: TCP: {}, UDP: {}, Up: {}, Down: {}, Latency: {}",
                         tag,
@@ -611,7 +622,7 @@ impl Observer {
                         node.stats.get_active_udp_sessions(),
                         ByteSize(node.stats.get_upload_bytes()),
                         ByteSize(node.stats.get_download_bytes()),
-                        format_ms(node.stats.get_latency_ms())
+                        latency
                     );
                 }
             }
