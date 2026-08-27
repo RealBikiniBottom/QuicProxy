@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::TargetAddr;
 use crate::cache::Cache;
-use crate::proxy::outbound::{self, AnyOutbound, get_outbound_by_tag};
+use crate::proxy::outbound::{self, AnyOutbound, OUTBOUNDS_MAP};
 use crate::utils::now_timestamp;
 use crate::utils::shutdown;
 use crate::utils::system::get_memory_usage;
@@ -126,20 +126,28 @@ impl Serialize for NodeStats {
         S: Serializer,
     {
         use serde::ser::SerializeStruct;
+        let selector_tag = if self.protocol == "selector" || self.protocol == "urltest" {
+            OUTBOUNDS_MAP
+                .get(&self.tag)
+                .map(|entry| entry.clone())
+                .and_then(|outbound| {
+                    outbound
+                        .as_selector()
+                        .and_then(|selector| selector.get_selected_tag().map(str::to_owned))
+                })
+        } else {
+            None
+        };
         let trace = self.trace.read().unwrap_or_else(|e| e.into_inner());
-        let mut state = serializer.serialize_struct("NodeStats", 4)?;
+        let field_count = 5 + usize::from(selector_tag.is_some());
+        let mut state = serializer.serialize_struct("NodeStats", field_count)?;
         state.serialize_field("tag", &self.tag)?;
         state.serialize_field("protocol", &self.protocol)?;
         state.serialize_field("is_testing_trace", &self.is_testing_trace)?;
         state.serialize_field("stats", &self.stats)?;
         state.serialize_field("trace", &*trace)?;
-        if self.protocol == "selector" || self.protocol == "urltest" {
-            let outbound = get_outbound_by_tag(&self.tag);
-            if let Some(selector) = outbound.as_selector() {
-                if let Some(selected_tag) = selector.get_selected_tag() {
-                    state.serialize_field("selector_tag", selected_tag)?;
-                }
-            }
+        if let Some(selector_tag) = selector_tag {
+            state.serialize_field("selector_tag", &selector_tag)?;
         }
         state.end()
     }
@@ -245,19 +253,17 @@ impl Stats {
     }
     pub fn get_dns_avg_time_us(&self) -> u64 {
         let count = self.dns_query_count.load(Ordering::Relaxed);
-        if count == 0 {
-            0
-        } else {
-            self.dns_total_time_us.load(Ordering::Relaxed) / count
-        }
+        self.dns_total_time_us
+            .load(Ordering::Relaxed)
+            .checked_div(count)
+            .unwrap_or(0)
     }
     pub fn get_route_avg_time_us(&self) -> u64 {
         let count = self.route_match_count.load(Ordering::Relaxed);
-        if count == 0 {
-            0
-        } else {
-            self.route_total_time_us.load(Ordering::Relaxed) / count
-        }
+        self.route_total_time_us
+            .load(Ordering::Relaxed)
+            .checked_div(count)
+            .unwrap_or(0)
     }
 
     pub fn add_traffic(&self, upload: u64, download: u64) {
@@ -329,6 +335,31 @@ struct ConnectionRecord {
     closer: Option<Arc<SessionCloser>>,
 }
 
+#[derive(Clone)]
+pub struct ConnectionHandle {
+    tracker: Arc<ConnectionTracker>,
+    _lifecycle: Arc<ConnectionLifecycle>,
+}
+
+struct ConnectionLifecycle {
+    observer: Arc<Observer>,
+    id: Uuid,
+}
+
+impl std::ops::Deref for ConnectionHandle {
+    type Target = ConnectionTracker;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tracker
+    }
+}
+
+impl Drop for ConnectionLifecycle {
+    fn drop(&mut self) {
+        self.observer.remove_connection(&self.id);
+    }
+}
+
 impl Observer {
     pub fn new(cache_name: &str) -> anyhow::Result<Self> {
         let realip2domain = Cache::new_with_tag(cache_name, "observe:realip2domain".to_string())?;
@@ -344,11 +375,25 @@ impl Observer {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Arc<Self> {
+        Arc::new(Self {
+            inbounds: DashMap::new(),
+            outbounds: DashMap::new(),
+            realip2domain: Cache::new(None, "observe:test:realip2domain".to_string(), 0)
+                .expect("create observer test cache"),
+            global_stats: Arc::new(Stats::default()),
+            connections: DashMap::new(),
+            dst_traffic: DashMap::new(),
+            mem_stats: Mutex::new((0, 0, 0)),
+        })
+    }
+
     pub fn add_connection(
-        &self,
+        self: &Arc<Self>,
         mut conn: ConnectionTracker,
         closer: Option<Arc<SessionCloser>>,
-    ) -> Arc<ConnectionTracker> {
+    ) -> ConnectionHandle {
         conn.domain = self.resolve_domain_for_target(&conn.final_target);
         let tracker = Arc::new(conn);
         self.connections.insert(
@@ -358,7 +403,13 @@ impl Observer {
                 closer,
             },
         );
-        tracker
+        ConnectionHandle {
+            _lifecycle: Arc::new(ConnectionLifecycle {
+                observer: self.clone(),
+                id: tracker.id,
+            }),
+            tracker,
+        }
     }
 
     fn resolve_domain_for_target(&self, target: &TargetAddr) -> Option<String> {
@@ -396,29 +447,33 @@ impl Observer {
             .or_else(|| self.resolve_domain_for_target(&conn.final_target))
             .unwrap_or_else(|| conn.final_target.to_string());
 
-        if let Some(mut entry) = self.dst_traffic.get_mut(domain.as_str()) {
-            entry.upload = entry.upload.wrapping_add(upload);
-            entry.download = entry.download.wrapping_add(download);
-            entry.last_active = now;
-            if !outbound_tag.is_empty() {
-                entry.outbound_tag = outbound_tag;
+        let ip = match &conn.final_target {
+            TargetAddr::Ip(addr) => addr.to_string(),
+            TargetAddr::Domain(..) => String::new(),
+        };
+        match self.dst_traffic.entry(domain.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                let entry = occupied.get_mut();
+                entry.upload = entry.upload.saturating_add(upload);
+                entry.download = entry.download.saturating_add(download);
+                entry.last_active = now;
+                if !ip.is_empty() {
+                    entry.ip = ip;
+                }
+                if !outbound_tag.is_empty() {
+                    entry.outbound_tag = outbound_tag;
+                }
             }
-        } else {
-            let ip = match &conn.final_target {
-                TargetAddr::Ip(addr) => addr.to_string(),
-                TargetAddr::Domain(..) => String::new(),
-            };
-            self.dst_traffic.insert(
-                domain.clone(),
-                DstTrafficEntry {
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(DstTrafficEntry {
                     domain,
                     ip,
                     outbound_tag,
                     upload,
                     download,
                     last_active: now,
-                },
-            );
+                });
+            }
         }
     }
 
@@ -471,8 +526,19 @@ impl Observer {
     }
 
     pub fn drain_dst_traffic(&self) -> Vec<DstTrafficEntry> {
-        let entries = self.dst_traffic.iter().map(|r| r.value().clone()).collect();
-        self.dst_traffic.clear();
+        // Remove the keys seen by this snapshot one by one. Updates that win the
+        // race are included in this batch; entries inserted afterwards remain for
+        // the next drain instead of being erased by a map-wide clear().
+        let keys: Vec<String> = self
+            .dst_traffic
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        let mut entries: Vec<DstTrafficEntry> = keys
+            .into_iter()
+            .filter_map(|key| self.dst_traffic.remove(&key).map(|(_, entry)| entry))
+            .collect();
+        entries.sort_unstable_by(|a, b| a.domain.cmp(&b.domain));
         entries
     }
 
@@ -541,9 +607,17 @@ impl Observer {
     }
 
     pub fn update_outbound_traffic(&self, tag: &str, upload: u64, download: u64) {
+        self.update_outbound_node_traffic(tag, upload, download);
+        self.update_global_traffic(upload, download);
+    }
+
+    pub(crate) fn update_outbound_node_traffic(&self, tag: &str, upload: u64, download: u64) {
         if let Some(node) = self.outbounds.get(tag) {
             node.stats.add_traffic(upload, download);
         }
+    }
+
+    pub fn update_global_traffic(&self, upload: u64, download: u64) {
         self.global_stats.add_traffic(upload, download);
     }
 
@@ -554,17 +628,15 @@ impl Observer {
     }
 
     pub fn register_inbound(&self, tag: &str, protocol: &str) {
-        if !self.inbounds.contains_key(tag) {
-            self.inbounds
-                .insert(tag.to_string(), NodeStats::new(tag, protocol));
-        }
+        self.inbounds
+            .entry(tag.to_string())
+            .or_insert_with(|| NodeStats::new(tag, protocol));
     }
 
     pub fn register_outbound(&self, tag: &str, protocol: &str) {
-        if !self.outbounds.contains_key(tag) {
-            self.outbounds
-                .insert(tag.to_string(), NodeStats::new(tag, protocol));
-        }
+        self.outbounds
+            .entry(tag.to_string())
+            .or_insert_with(|| NodeStats::new(tag, protocol));
     }
 
     pub fn update_outbound_trace(
@@ -578,12 +650,11 @@ impl Observer {
     ) {
         if let Some(node) = self.outbounds.get(outbound.tag()) {
             node.stats.record_latency_ms(latency_ms);
-            if let Ok(mut trace) = node.trace.write() {
-                trace.ip = ip.into();
-                trace.loc = loc.into();
-                trace.uplink_path_stats = uplink_path_stats;
-                trace.downlink_path_stats = downlink_path_stats;
-            }
+            let mut trace = node.trace.write().unwrap_or_else(|e| e.into_inner());
+            trace.ip = ip.into();
+            trace.loc = loc.into();
+            trace.uplink_path_stats = uplink_path_stats;
+            trace.downlink_path_stats = downlink_path_stats;
         }
     }
 
@@ -596,7 +667,7 @@ impl Observer {
     pub fn get_outbound_trace(&self, tag: &str) -> Option<OutboundTraceInfo> {
         let node = self.outbounds.get(tag)?;
         let trace = node.trace.clone();
-        let guard = trace.read().ok()?;
+        let guard = trace.read().unwrap_or_else(|e| e.into_inner());
         Some(guard.clone())
     }
 
@@ -660,48 +731,55 @@ impl Observer {
             format_us(gs.get_route_avg_time_us())
         );
 
-        if let Some(current_mem) = get_memory_usage() {
-            if current_mem > 0 {
-                let mut mem_stats = self.mem_stats.lock().unwrap_or_else(|e| e.into_inner());
-                mem_stats.1 += 1;
-                mem_stats.0 += current_mem;
-                mem_stats.2 = mem_stats.2.max(current_mem);
-                info!(
-                    "  [Memory]: Cur: {}, Avg: {}, Peak: {}",
-                    ByteSize(current_mem),
-                    ByteSize(mem_stats.0 / mem_stats.1),
-                    ByteSize(mem_stats.2)
-                );
-            }
+        if let Some(current_mem) = get_memory_usage()
+            && current_mem > 0
+        {
+            let mut mem_stats = self.mem_stats.lock().unwrap_or_else(|e| e.into_inner());
+            mem_stats.1 = mem_stats.1.saturating_add(1);
+            mem_stats.0 = mem_stats.0.saturating_add(current_mem);
+            mem_stats.2 = mem_stats.2.max(current_mem);
+            info!(
+                "  [Memory]: Cur: {}, Avg: {}, Peak: {}",
+                ByteSize(current_mem),
+                ByteSize(mem_stats.0 / mem_stats.1),
+                ByteSize(mem_stats.2)
+            );
         }
         info!("--------------------------");
     }
 
-    pub fn spawn_periodic_log(self: &Arc<Self>, interval_secs: u64) {
+    pub fn spawn_periodic_log(self: &Arc<Self>, interval_secs: u64) -> anyhow::Result<()> {
+        if interval_secs == 0 {
+            anyhow::bail!("observe log_interval must be greater than zero");
+        }
+
         let observer = self.clone();
         shutdown::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            let period = std::time::Duration::from_secs(interval_secs);
+            let start = tokio::time::Instant::now() + period;
+            let mut interval = tokio::time::interval_at(start, period);
             loop {
                 interval.tick().await;
                 observer.log_statistics();
             }
         });
+        Ok(())
     }
 }
 
 static GLOBAL_OBSERVER: ArcSwapOption<Observer> = ArcSwapOption::const_empty();
 
 pub fn init_observer(cfg: &crate::config::Config) -> anyhow::Result<()> {
-    if let Some(obs_cfg) = cfg.observe.as_ref() {
-        if obs_cfg.enabled {
-            let cache_name = obs_cfg
-                .cache
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("observe requires cache"))?;
-            let observer = Arc::new(Observer::new(cache_name)?);
-            observer.spawn_periodic_log(obs_cfg.log_interval);
-            GLOBAL_OBSERVER.store(Some(observer));
-        }
+    if let Some(obs_cfg) = cfg.observe.as_ref()
+        && obs_cfg.enabled
+    {
+        let cache_name = obs_cfg
+            .cache
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("observe requires cache"))?;
+        let observer = Arc::new(Observer::new(cache_name)?);
+        observer.spawn_periodic_log(obs_cfg.log_interval)?;
+        GLOBAL_OBSERVER.store(Some(observer));
     }
     Ok(())
 }
@@ -717,6 +795,8 @@ pub fn shutdown_observer() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+    use std::thread;
 
     #[test]
     fn connection_tracker_serializes_core_api_shape() {
@@ -792,5 +872,77 @@ mod tests {
         assert!(tracker.uses_outbound("urltest"));
         assert!(tracker.uses_outbound("node-a"));
         assert!(!tracker.uses_outbound("other-urltest"));
+    }
+
+    #[test]
+    fn node_stats_serialization_tolerates_missing_selector() {
+        let stats = NodeStats::new("missing-selector", "selector");
+        let value = serde_json::to_value(stats).unwrap();
+
+        assert_eq!(value["tag"], "missing-selector");
+        assert!(value.get("selector_tag").is_none());
+    }
+
+    #[test]
+    fn public_outbound_traffic_update_includes_global_totals_once() {
+        let observer = Observer::new_for_test();
+        observer.register_outbound("direct", "direct");
+
+        observer.update_outbound_traffic("direct", 10, 20);
+
+        let outbound = observer.get_outbound_stats("direct").unwrap();
+        assert_eq!(outbound.stats.get_upload_bytes(), 10);
+        assert_eq!(outbound.stats.get_download_bytes(), 20);
+        assert_eq!(observer.global_stats.get_upload_bytes(), 10);
+        assert_eq!(observer.global_stats.get_download_bytes(), 20);
+    }
+
+    #[test]
+    fn destination_traffic_aggregation_is_concurrent_and_lossless() {
+        const CONNECTIONS: usize = 16;
+
+        let observer = Observer::new_for_test();
+        let barrier = Arc::new(Barrier::new(CONNECTIONS));
+        let mut workers = Vec::with_capacity(CONNECTIONS);
+
+        for _ in 0..CONNECTIONS {
+            let observer = observer.clone();
+            let barrier = barrier.clone();
+            workers.push(thread::spawn(move || {
+                let tracker = ConnectionTracker::new(
+                    Arc::from("mixed"),
+                    vec!["direct".to_string()],
+                    None,
+                    TargetAddr::Domain("example.org".to_string(), 443),
+                    TargetAddr::Domain("example.org".to_string(), 443),
+                    false,
+                    false,
+                );
+                let tracker = observer.add_connection(tracker, None);
+                tracker.inc_upload(10);
+                tracker.inc_download(20);
+
+                barrier.wait();
+                observer.remove_connection(&tracker.id);
+            }));
+        }
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let entries = observer.drain_dst_traffic();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].upload, CONNECTIONS as u64 * 10);
+        assert_eq!(entries[0].download, CONNECTIONS as u64 * 20);
+        assert!(observer.drain_dst_traffic().is_empty());
+    }
+
+    #[test]
+    fn periodic_log_rejects_zero_interval() {
+        let observer = Observer::new_for_test();
+        let error = observer.spawn_periodic_log(0).unwrap_err();
+
+        assert!(error.to_string().contains("greater than zero"));
     }
 }

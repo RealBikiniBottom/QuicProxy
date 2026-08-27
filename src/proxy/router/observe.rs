@@ -1,4 +1,4 @@
-use crate::proxy::observe::{ConnectionTracker, Observer, Stats};
+use crate::proxy::observe::{ConnectionHandle, Observer, Stats};
 use crate::proxy::outbound::{AnyPacket, PacketInfo};
 use crate::proxy::{SessionCloser, SourceAddr, TargetAddr};
 use async_trait::async_trait;
@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub struct ObservedPacket {
     pub inner: Arc<dyn AnyPacket>,
     pub observer: Arc<Observer>,
-    pub tracker: Arc<ConnectionTracker>,
+    pub tracker: ConnectionHandle,
     pub outbound_tag: Arc<str>,
     pub extra_outbound_tag: Option<Arc<str>>,
 }
@@ -25,12 +25,13 @@ impl AnyPacket for ObservedPacket {
     ) -> anyhow::Result<usize> {
         let n = self.inner.send_to(buf, from, target).await?;
         self.observer
-            .update_outbound_traffic(&self.outbound_tag, n as u64, 0);
+            .update_outbound_node_traffic(&self.outbound_tag, n as u64, 0);
         self.observer
             .update_inbound_traffic(&self.tracker.inbound_tag, n as u64, 0);
         if let Some(ref tag) = self.extra_outbound_tag {
-            self.observer.update_outbound_traffic(tag, n as u64, 0);
+            self.observer.update_outbound_node_traffic(tag, n as u64, 0);
         }
+        self.observer.update_global_traffic(n as u64, 0);
         self.tracker.inc_upload(n as u64);
         Ok(n)
     }
@@ -39,12 +40,13 @@ impl AnyPacket for ObservedPacket {
         let (src, dst, data) = self.inner.recv_from().await?;
         let n = data.len();
         self.observer
-            .update_outbound_traffic(&self.outbound_tag, 0, n as u64);
+            .update_outbound_node_traffic(&self.outbound_tag, 0, n as u64);
         self.observer
             .update_inbound_traffic(&self.tracker.inbound_tag, 0, n as u64);
         if let Some(ref tag) = self.extra_outbound_tag {
-            self.observer.update_outbound_traffic(tag, 0, n as u64);
+            self.observer.update_outbound_node_traffic(tag, 0, n as u64);
         }
+        self.observer.update_global_traffic(0, n as u64);
         self.tracker.inc_download(n as u64);
         Ok((src, dst, data))
     }
@@ -53,12 +55,13 @@ impl AnyPacket for ObservedPacket {
         self.inner.recv_many(packets).await?;
         let n = packets.iter().map(|(_, _, data)| data.len() as u64).sum();
         self.observer
-            .update_outbound_traffic(&self.outbound_tag, 0, n);
+            .update_outbound_node_traffic(&self.outbound_tag, 0, n);
         self.observer
             .update_inbound_traffic(&self.tracker.inbound_tag, 0, n);
         if let Some(ref tag) = self.extra_outbound_tag {
-            self.observer.update_outbound_traffic(tag, 0, n);
+            self.observer.update_outbound_node_traffic(tag, 0, n);
         }
+        self.observer.update_global_traffic(0, n);
         self.tracker.inc_download(n);
         Ok(())
     }
@@ -88,7 +91,6 @@ impl Drop for ObservedPacket {
         if let Some(ref tag) = self.extra_outbound_tag {
             self.observer.on_outbound_close_udp(tag);
         }
-        self.observer.remove_connection(&self.tracker.id);
     }
 }
 
@@ -96,7 +98,7 @@ pub struct ObservedStream<S> {
     pub inner: S,
     pub stats: Arc<Stats>,
     pub extra_stats: Option<Arc<Stats>>,
-    pub tracker: Arc<ConnectionTracker>,
+    pub tracker: ConnectionHandle,
     pub observer: Arc<Observer>,
     pub is_inbound: bool,
 }
@@ -106,7 +108,7 @@ impl<S> ObservedStream<S> {
         inner: S,
         stats: Arc<Stats>,
         extra_stats: Option<Arc<Stats>>,
-        tracker: Arc<ConnectionTracker>,
+        tracker: ConnectionHandle,
         observer: Arc<Observer>,
         is_inbound: bool,
     ) -> Self {
@@ -131,7 +133,6 @@ impl<S> Drop for ObservedStream<S> {
         if let Some(ref s) = self.extra_stats {
             s.dec_active_tcp();
         }
-        self.observer.remove_connection(&self.tracker.id);
     }
 }
 
@@ -150,9 +151,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for ObservedStream<S> {
                     if self.is_inbound {
                         self.stats.inc_upload(n);
                         self.tracker.inc_upload(n);
+                        self.observer.update_global_traffic(n, 0);
                     } else {
                         self.stats.inc_download(n);
-                        self.tracker.inc_download(n);
                     }
                     if let Some(ref s) = self.extra_stats {
                         if self.is_inbound {
@@ -182,9 +183,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ObservedStream<S> {
                     if self.is_inbound {
                         self.stats.inc_download(n_u64);
                         self.tracker.inc_download(n_u64);
+                        self.observer.update_global_traffic(0, n_u64);
                     } else {
                         self.stats.inc_upload(n_u64);
-                        self.tracker.inc_upload(n_u64);
                     }
                     if let Some(ref s) = self.extra_stats {
                         if self.is_inbound {
@@ -206,5 +207,93 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ObservedStream<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::observe::ConnectionTracker;
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn tcp_tracker_counts_each_direction_once_across_both_wrappers() {
+        let observer = Observer::new_for_test();
+        let tracker = observer.add_connection(
+            ConnectionTracker::new(
+                Arc::from("mixed"),
+                vec!["direct".to_string()],
+                None,
+                TargetAddr::Domain("example.org".to_string(), 443),
+                TargetAddr::Domain("example.org".to_string(), 443),
+                false,
+                false,
+            ),
+            None,
+        );
+        let inbound_stats = Arc::new(Stats::default());
+        let outbound_stats = Arc::new(Stats::default());
+        let (inbound_inner, mut inbound_peer) = tokio::io::duplex(64);
+        let (outbound_inner, mut outbound_peer) = tokio::io::duplex(64);
+        let mut inbound = ObservedStream::new(
+            inbound_inner,
+            inbound_stats.clone(),
+            None,
+            tracker.clone(),
+            observer.clone(),
+            true,
+        );
+        let mut outbound = ObservedStream::new(
+            outbound_inner,
+            outbound_stats.clone(),
+            None,
+            tracker.clone(),
+            observer.clone(),
+            false,
+        );
+
+        inbound_peer.write_all(b"up").await.unwrap();
+        let mut upload = [0; 2];
+        inbound.read_exact(&mut upload).await.unwrap();
+        outbound.write_all(&upload).await.unwrap();
+        let mut forwarded_upload = [0; 2];
+        outbound_peer
+            .read_exact(&mut forwarded_upload)
+            .await
+            .unwrap();
+
+        outbound_peer.write_all(b"dn").await.unwrap();
+        let mut download = [0; 2];
+        outbound.read_exact(&mut download).await.unwrap();
+        inbound.write_all(&download).await.unwrap();
+        let mut forwarded_download = [0; 2];
+        inbound_peer
+            .read_exact(&mut forwarded_download)
+            .await
+            .unwrap();
+
+        assert_eq!(tracker.upload.load(Ordering::Relaxed), 2);
+        assert_eq!(tracker.download.load(Ordering::Relaxed), 2);
+        assert_eq!(inbound_stats.get_upload_bytes(), 2);
+        assert_eq!(inbound_stats.get_download_bytes(), 2);
+        assert_eq!(outbound_stats.get_upload_bytes(), 2);
+        assert_eq!(outbound_stats.get_download_bytes(), 2);
+
+        let global = observer.get_global_stats();
+        assert_eq!(global.get_upload_bytes(), 2);
+        assert_eq!(global.get_download_bytes(), 2);
+
+        assert_eq!(observer.get_all_connections().len(), 1);
+        drop(tracker);
+        drop(outbound);
+        assert_eq!(observer.get_all_connections().len(), 1);
+        drop(inbound);
+        assert!(observer.get_all_connections().is_empty());
+
+        let traffic = observer.drain_dst_traffic();
+        assert_eq!(traffic.len(), 1);
+        assert_eq!(traffic[0].upload, 2);
+        assert_eq!(traffic[0].download, 2);
     }
 }
