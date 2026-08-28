@@ -160,6 +160,26 @@ async fn forward_udp_outbound_once(
     Ok(packets)
 }
 
+/// Delivers a packet to an existing UDP session. If the session receiver has
+/// already gone away, the payload is returned so the caller can reopen the
+/// session without dropping its first packet.
+async fn send_to_existing_udp_session(
+    sessions: &SessionMap,
+    key: &super::outbound::SessionKey,
+    tx: mpsc::Sender<Bytes>,
+    payload: Bytes,
+) -> Option<Bytes> {
+    match tx.send(payload).await {
+        Ok(()) => None,
+        Err(error) => {
+            sessions.remove_if(key, |_, active_tx| {
+                active_tx.same_channel(&tx) && active_tx.is_closed()
+            });
+            Some(error.0)
+        }
+    }
+}
+
 impl Router {
     pub fn new(cfg: &Config) -> anyhow::Result<Self> {
         let mode = cfg.router.default_mode.clone();
@@ -790,15 +810,15 @@ pub async fn start_udp_loop(
     let sessions: SessionMap = Arc::new(DashMap::new());
     loop {
         match inbound_packet.recv_from().await {
-            Ok((src, dst, payload)) => {
+            Ok((src, dst, mut payload)) => {
                 let key = (src, dst);
 
                 let existing_tx = sessions.get(&key).map(|entry| entry.value().clone());
                 if let Some(tx) = existing_tx {
-                    if tx.send(payload).await.is_err() {
-                        sessions.remove_if(&key, |_, active_tx| active_tx.is_closed());
+                    match send_to_existing_udp_session(&sessions, &key, tx, payload).await {
+                        Some(recovered_payload) => payload = recovered_payload,
+                        None => continue,
                     }
-                    continue;
                 }
 
                 let session_key = Arc::new(key);
@@ -852,5 +872,29 @@ pub async fn start_udp_loop(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_udp_session_returns_first_payload_for_reopen() {
+        let sessions: SessionMap = Arc::new(DashMap::new());
+        let key = Arc::new((
+            TargetAddr::Domain("client.example".to_string(), 12345),
+            TargetAddr::Domain("target.example".to_string(), 443),
+        ));
+        let (tx, rx) = mpsc::channel(1);
+        sessions.insert(key.clone(), tx.clone());
+        drop(rx);
+        let payload = Bytes::from_static(b"first packet");
+
+        let recovered =
+            send_to_existing_udp_session(&sessions, key.as_ref(), tx, payload.clone()).await;
+
+        assert_eq!(recovered, Some(payload));
+        assert!(!sessions.contains_key(key.as_ref()));
     }
 }
