@@ -245,7 +245,7 @@ jobs:
         shell: pwsh
         run: |
           $versionDir = "${{ steps.extract_version.outputs.VERSION_STR }}"
-          $coreDir = "flutter_build_dir/core_workspace/$versionDir"
+          $coreDir = "flutter_build_dir/core_workspace"
           New-Item -ItemType Directory -Path $coreDir -Force | Out-Null
 
           # 复制 core.exe
