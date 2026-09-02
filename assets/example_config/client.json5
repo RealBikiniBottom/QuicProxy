@@ -207,12 +207,13 @@
   },
   "cache": {
     "all_cache": {
-      "memory_size": 100,
+      "memory_size": 0,
       "path": "cache.db"
     }
   },
   "observe": {
     "enabled": true,
+    "cache": "all_cache",
     "log_interval": 15
   },
   "api": {

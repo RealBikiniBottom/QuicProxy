@@ -24,7 +24,6 @@ pub enum SelectorType {
     UrlTest,
 }
 
-/// 单轮测速的总超时。超时后取消尚未完成的任务，保证展示结果和选举结果一致。
 const SELECTOR_TEST_ROUND_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct SelectorOutbound {
