@@ -1,6 +1,6 @@
 use anyhow::{Context as _, bail};
-use quinn::rustls::pki_types::PrivateKeyDer;
-use std::net::SocketAddr;
+use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::net::{IpAddr, SocketAddr};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -15,7 +15,7 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::utils::new_io_other_error;
 use crate::utils::socket::socket_helpers::try_create_dualstack_udpsocket;
@@ -62,7 +62,6 @@ fn make_transport_config(
     enable_mtudis: bool,
     initial_mtu: u16,
     min_mtu: u16,
-    default_max_concurrent_streams: Option<u32>,
 ) -> TransportConfig {
     let mut transport_config = TransportConfig::default();
 
@@ -86,10 +85,8 @@ fn make_transport_config(
         transport_config.send_window(SEND_WINDOW);
     }
 
-    if let Some(max_streams) = default_max_concurrent_streams {
-        transport_config.max_concurrent_bidi_streams(max_streams.into());
-        transport_config.max_concurrent_uni_streams(max_streams.into());
-    }
+    transport_config.max_concurrent_bidi_streams(DEFAULT_MAX_CONCURRENT_STREAMS.into());
+    transport_config.max_concurrent_uni_streams(DEFAULT_MAX_CONCURRENT_STREAMS.into());
 
     let mtudis = if enable_mtudis {
         let mut config = MtuDiscoveryConfig::default();
@@ -101,20 +98,18 @@ fn make_transport_config(
     };
     transport_config.mtu_discovery_config(mtudis);
 
-    match congestion_controller
-        .unwrap_or("bbr")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "bbr" => transport_config
-            .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
-        "cubic" => transport_config
-            .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
-        "newreno" => transport_config
-            .congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default())),
-        _ => transport_config
-            .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
-    };
+    let cc_name = congestion_controller.unwrap_or("bbr").to_ascii_lowercase();
+    let cc_factory: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
+        match cc_name.as_str() {
+            "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
+            "cubic" => Arc::new(quinn::congestion::CubicConfig::default()),
+            "newreno" => Arc::new(quinn::congestion::NewRenoConfig::default()),
+            other => {
+                warn!("unknown congestion controller '{}', falling back to bbr", other);
+                Arc::new(quinn::congestion::BbrConfig::default())
+            }
+        };
+    transport_config.congestion_controller_factory(cc_factory);
 
     transport_config
 }
@@ -124,8 +119,8 @@ pub struct QuinnUnistream {
 }
 
 impl QuinnUnistream {
-    pub fn new(send: SendStream) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(QuinnUnistream { send })
+    pub fn new(send: SendStream) -> Self {
+        QuinnUnistream { send }
     }
 }
 
@@ -182,7 +177,7 @@ impl AsyncWrite for QuinnBistream {
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
         Pin::new(&mut self.as_mut().send)
             .poll_write(cx, buf)
-            .map_err(|e| new_io_other_error(e))
+            .map_err(io::Error::from)
     }
 
     fn poll_flush(
@@ -209,8 +204,8 @@ pub struct QuinnConnection {
 }
 
 impl QuinnConnection {
-    pub fn new(connection: Box<quinn::Connection>) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(QuinnConnection { connection })
+    pub fn new(connection: Box<quinn::Connection>) -> Self {
+        QuinnConnection { connection }
     }
 }
 
@@ -218,25 +213,24 @@ impl QuinnConnection {
 impl QuicConnection for QuinnConnection {
     async fn packet_loss_rate(&self) -> f32 {
         let stats = self.connection.stats();
-        let rate: f32 = (stats.path.lost_packets as f32) / ((stats.path.sent_packets + 1) as f32);
-        return rate * 100.0;
+        stats.path.lost_packets as f32 / (stats.path.sent_packets + 1) as f32
     }
 
     async fn rtt(&self) -> Option<Duration> {
-        return Some(self.connection.rtt());
+        Some(self.connection.rtt())
     }
 
     async fn mtu(&self) -> u16 {
         let stats = self.connection.stats();
-        return stats.path.current_mtu;
+        stats.path.current_mtu
     }
 
     fn peer_addr(&self) -> SocketAddr {
         self.connection.remote_address()
     }
 
-    fn local_addr(&self) -> SocketAddr {
-        self.connection.remote_address()
+    fn local_ip(&self) -> Option<IpAddr> {
+        self.connection.local_ip()
     }
 
     async fn shutdown(&self) -> io::Result<()> {
@@ -250,14 +244,12 @@ impl QuicConnection for QuinnConnection {
 
     async fn accept_unistream(&self) -> io::Result<Box<dyn QuicUnistream>> {
         let (send, _recv) = self.connection.accept_bi().await?;
-        let unistream = QuinnUnistream::new(send).map_err(|e| new_io_other_error(e.to_string()))?;
-        Ok(Box::new(unistream))
+        Ok(Box::new(QuinnUnistream::new(send)))
     }
 
     async fn open_unistream(&self) -> io::Result<Box<dyn QuicUnistream>> {
         let send = self.connection.open_uni().await?;
-        let unistream = QuinnUnistream::new(send).map_err(|e| new_io_other_error(e.to_string()))?;
-        Ok(Box::new(unistream))
+        Ok(Box::new(QuinnUnistream::new(send)))
     }
 
     async fn accept_bistream(&self) -> io::Result<Box<dyn QuicBistream>> {
@@ -277,16 +269,22 @@ impl QuicConnection for QuinnConnection {
     }
 
     async fn send_datagram(&self, data: Bytes) -> io::Result<bool> {
-        Ok(self.connection.send_datagram(data).is_ok())
+        self.connection
+            .send_datagram(data)
+            .map_err(io::Error::other)?;
+        Ok(true)
     }
 }
 
 pub struct QuinnServer {
     accept_connection_rx: mpsc::Receiver<Arc<quinn::Connection>>,
+    // The accept task holds its own endpoint clone; keeping one here lets Drop
+    // close the endpoint, which stops the listener and ends the accept task.
+    endpoint: quinn::Endpoint,
 }
 
 impl QuinnServer {
-    pub async fn new(
+    pub fn new(
         addr: SocketAddr,
         idle_timeout: Duration,
         cert_path: Option<&str>,
@@ -296,7 +294,7 @@ impl QuinnServer {
         alpn: Option<Vec<String>>,
         zero_rtt: bool,
         jls_username: String,
-        jls_passwrod: String,
+        jls_password: String,
         is_jls: bool,
         enable_gso: bool,
         enable_mtudis: bool,
@@ -308,16 +306,12 @@ impl QuinnServer {
             let mut jls_config = quinn::rustls::jls::JlsServerConfig::default();
             jls_config = jls_config
                 .enable(true)
-                .add_user(jls_passwrod, jls_username)
+                .add_user(jls_password, jls_username)
                 .with_server_name(server_name.to_string());
 
-            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                .map_err(|e| new_io_other_error(format!("Failed to generate cert: {}", e)))?;
-            let cert_der = cert.cert.der().to_vec();
-            let key_der = cert.signing_key.serialize_der();
-            let cert_chain = vec![quinn::rustls::pki_types::CertificateDer::from(cert_der)];
-            let private_key = PrivateKeyDer::try_from(key_der)
-                .map_err(|e| new_io_other_error(format!("Invalid private key: {}", e)))?;
+            // JLS encrypts the handshake with a PSK, so the certificate only
+            // satisfies rustls' structure and a self-signed one is fine.
+            let (cert_chain, private_key) = generate_self_signed_cert()?;
 
             let mut config = quinn::rustls::ServerConfig::builder()
                 .with_no_client_auth()
@@ -340,15 +334,7 @@ impl QuinnServer {
                 tracing::info!(
                     "No TLS cert configured for QUIC, generating default self-signed certificate"
                 );
-                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                    .map_err(|e| new_io_other_error(format!("Failed to generate cert: {}", e)))?;
-                let cert_der = cert.cert.der().to_vec();
-                let key_der = cert.signing_key.serialize_der();
-
-                let cert_chain = vec![quinn::rustls::pki_types::CertificateDer::from(cert_der)];
-                let private_key = PrivateKeyDer::try_from(key_der)
-                    .map_err(|e| new_io_other_error(format!("Invalid private key: {}", e)))?;
-                (cert_chain, private_key)
+                generate_self_signed_cert()?
             };
 
             ServerConfig::with_single_cert(certs, key)?
@@ -360,7 +346,6 @@ impl QuinnServer {
             enable_mtudis,
             initial_mtu,
             min_mtu,
-            Some(DEFAULT_MAX_CONCURRENT_STREAMS),
         );
 
         server_config.transport_config(Arc::new(transport_config));
@@ -380,8 +365,9 @@ impl QuinnServer {
             mpsc::Receiver<Arc<quinn::Connection>>,
         ) = mpsc::channel(ACCEPT_CONNECTION_QUEUE_CAPACITY);
 
+        let accept_endpoint = endpoint.clone();
         tokio::spawn(async move {
-            while let Some(incoming) = endpoint.accept().await {
+            while let Some(incoming) = accept_endpoint.accept().await {
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     match incoming.await {
@@ -389,16 +375,17 @@ impl QuinnServer {
                             let _ = tx.send(Arc::new(connection)).await;
                         }
                         Err(e) => {
-                            error!("incoming quit: {}", e);
+                            debug!("incoming handshake failed: {}", e);
                         }
                     }
                 });
             }
-            error!("quic server endpoint quit");
+            info!("quic server endpoint quit");
         });
 
         Ok(Self {
             accept_connection_rx: rx,
+            endpoint,
         })
     }
 
@@ -409,6 +396,24 @@ impl QuinnServer {
             .await
             .ok_or(new_io_other_error("Listener closed"))
     }
+}
+
+impl Drop for QuinnServer {
+    fn drop(&mut self) {
+        self.endpoint.close(0u32.into(), b"");
+    }
+}
+
+fn generate_self_signed_cert(
+) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .map_err(|e| new_io_other_error(format!("Failed to generate cert: {}", e)))?;
+    let cert_der = cert.cert.der().to_vec();
+    let key_der = cert.signing_key.serialize_der();
+    let cert_chain = vec![CertificateDer::from(cert_der)];
+    let private_key = PrivateKeyDer::try_from(key_der)
+        .map_err(|e| new_io_other_error(format!("Invalid private key: {}", e)))?;
+    Ok((cert_chain, private_key))
 }
 
 // Helpers for certs
@@ -454,7 +459,7 @@ impl QuinnClient {
         alpn: Option<Vec<String>>,
         congestion_controller: Option<String>,
         username: String,
-        passwrod: String,
+        password: String,
         is_jls: bool,
         enable_gso: bool,
         enable_mtudis: bool,
@@ -468,7 +473,7 @@ impl QuinnClient {
                 .with_no_client_auth();
 
             config.jls_config.enable = true;
-            config.jls_config.user = quinn::rustls::jls::JlsUser::new(&passwrod, &username);
+            config.jls_config.user = quinn::rustls::jls::JlsUser::new(&password, &username);
             config
         } else {
             let mut root_store = quinn::rustls::RootCertStore::empty();
@@ -514,7 +519,6 @@ impl QuinnClient {
             enable_mtudis,
             initial_mtu,
             min_mtu,
-            Some(DEFAULT_MAX_CONCURRENT_STREAMS),
         );
 
         client_config.transport_config(Arc::new(transport_config));
@@ -556,7 +560,7 @@ impl QuinnClient {
         alpn: Option<Vec<String>>,
         congestion_controller: Option<String>,
         username: String,
-        passwrod: String,
+        password: String,
         is_jls: bool,
         enable_gso: bool,
         enable_mtudis: bool,
@@ -572,7 +576,7 @@ impl QuinnClient {
             alpn,
             congestion_controller,
             username,
-            passwrod,
+            password,
             is_jls,
             enable_gso,
             enable_mtudis,
@@ -583,12 +587,12 @@ impl QuinnClient {
     }
 
     pub async fn connect(&self, remote_addr: SocketAddr) -> anyhow::Result<Arc<quinn::Connection>> {
-        let conn = self.endpoint.connect(remote_addr, &*self.sni)?;
+        let conn = self.endpoint.connect(remote_addr, &self.sni)?;
         let raw_conn = if self.zero_rtt {
             match conn.into_0rtt() {
                 Ok((x, accepted)) => {
                     let conn_clone = x.clone();
-                    let is_jls_clone = self.is_jls.clone();
+                    let is_jls_clone = self.is_jls;
                     tokio::spawn(async move {
                         info!("zero rtt accepted: {}", accepted.await);
                         if is_jls_clone && conn_clone.is_jls() == Some(false) {

@@ -25,7 +25,6 @@ use crate::proxy::{TargetAddr, TlsConfig};
 use anyhow::Context;
 
 use crate::utils::keyed_notify::KeyedNotify;
-use crate::utils::new_io_other_error;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 use crate::utils::quic_wrap::quinn_wrap::QuinnServer;
 
