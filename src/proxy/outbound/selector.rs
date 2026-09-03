@@ -89,16 +89,17 @@ impl SelectorOutbound {
 
         let mut selected_index = 0;
 
-        let outbounds_vec: Vec<_> = outbound_tags
-            .iter()
-            .enumerate()
-            .map(|(i, tag_item)| {
-                if &selected_tag == tag_item {
-                    selected_index = i;
-                }
-                get_outbound_by_tag(tag_item.as_ref())
-            })
-            .collect();
+        let mut outbounds_vec: Vec<Arc<dyn AnyOutbound>> =
+            Vec::with_capacity(outbound_tags.len());
+        for (i, tag_item) in outbound_tags.iter().enumerate() {
+            if &selected_tag == tag_item {
+                selected_index = i;
+            }
+            let outbound = get_outbound_by_tag(tag_item.as_ref()).with_context(|| {
+                format!("selector '{}' references unknown outbound '{}'", tag, tag_item)
+            })?;
+            outbounds_vec.push(outbound);
+        }
 
         let outbounds_count = outbounds_vec.len();
         if outbounds_count == 0 {
@@ -343,14 +344,26 @@ impl SelectorOutbound {
                     observer.get_outbound_stats(selected_tag),
                     observer.get_outbound_trace(selected_tag),
                 ) {
-                    observer.update_outbound_trace(
-                        get_outbound_by_tag(&self.tag),
-                        node.stats.get_latency_ms(),
-                        trace.ip,
-                        trace.loc,
-                        trace.uplink_path_stats,
-                        trace.downlink_path_stats,
-                    );
+                    match get_outbound_by_tag(&self.tag) {
+                        Ok(outbound) => {
+                            observer.update_outbound_trace(
+                                outbound,
+                                node.stats.get_latency_ms(),
+                                trace.ip,
+                                trace.loc,
+                                trace.uplink_path_stats,
+                                trace.downlink_path_stats,
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "{} [{}] failed to resolve outbound for trace update: {:#}",
+                                self.protocol(),
+                                self.tag,
+                                e
+                            );
+                        }
+                    }
                 }
             }
             observer.kill_connections_by_outbound(&self.tag);

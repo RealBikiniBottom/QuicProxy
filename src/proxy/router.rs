@@ -190,7 +190,7 @@ impl Router {
 
         Ok(Self {
             mode: Arc::new(RwLock::new(mode)),
-            default_outbound: get_default_outbound(),
+            default_outbound: get_default_outbound()?,
             rules,
         })
     }

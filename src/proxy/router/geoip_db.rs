@@ -83,9 +83,14 @@ impl GeoipDB {
             ));
         }
 
-        let mut download_outbound = get_default_outbound();
+        let mut download_outbound = get_default_outbound()?;
         if let Some(out) = cfg.download_outbound.clone() {
-            download_outbound = get_outbound_by_tag(&out);
+            download_outbound = get_outbound_by_tag(&out).with_context(|| {
+                format!(
+                    "geoip_db '{}' references unknown download_outbound '{}'",
+                    tag, out
+                )
+            })?;
         }
 
         Ok(Self {

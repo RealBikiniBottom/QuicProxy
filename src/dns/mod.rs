@@ -674,7 +674,12 @@ impl UdpDns {
             .outbound
             .as_deref()
             .ok_or_else(|| anyhow!("dns '{}' requires outbound", tag))?;
-        let outbound = get_outbound_by_tag(outbound_tag);
+        let outbound = get_outbound_by_tag(outbound_tag).with_context(|| {
+            format!(
+                "dns '{}' references unknown outbound '{}'",
+                tag, outbound_tag
+            )
+        })?;
 
         let reject_ipv6 = cfg.reject_ipv6;
 
@@ -786,7 +791,12 @@ impl HttpsDns {
             .outbound
             .as_deref()
             .ok_or_else(|| anyhow!("dns '{}' requires outbound", tag))?;
-        let outbound = get_outbound_by_tag(outbound_tag);
+        let outbound = get_outbound_by_tag(outbound_tag).with_context(|| {
+            format!(
+                "dns '{}' references unknown outbound '{}'",
+                tag, outbound_tag
+            )
+        })?;
 
         let reject_ipv6 = cfg.reject_ipv6;
 
@@ -923,7 +933,7 @@ impl FakeIPDNS {
             ipv4_cidr,
             ipv6_cidr,
             cache,
-            default_outbound: get_default_outbound(),
+            default_outbound: get_default_outbound()?,
             ipv4_cursor: AtomicU64::new(ipv4_cursor),
             ipv6_cursor: AtomicU64::new(ipv6_cursor),
             reject_ipv6,

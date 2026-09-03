@@ -185,20 +185,21 @@ pub fn start_outbound_tests() {
 pub fn try_get_outbound_by_tag(tag: &str) -> Arc<dyn AnyOutbound> {
     match OUTBOUNDS_MAP.get(tag) {
         Some(r) => return r.clone(),
-        None => get_default_outbound(),
+        // Falling back to the default can only fail before init_outbounds has
+        // run, which is a startup-ordering invariant violation.
+        None => get_default_outbound()
+            .expect("default outbound must be registered before lookups"),
     }
 }
 
-pub fn get_outbound_by_tag(tag: &str) -> Arc<dyn AnyOutbound> {
-    match OUTBOUNDS_MAP.get(tag) {
-        Some(r) => return r.clone(),
-        None => {
-            panic!("can not find outbound: {}", tag);
-        }
-    };
+pub fn get_outbound_by_tag(tag: &str) -> anyhow::Result<Arc<dyn AnyOutbound>> {
+    OUTBOUNDS_MAP
+        .get(tag)
+        .map(|r| r.clone())
+        .with_context(|| format!("can not find outbound: {}", tag))
 }
 
-pub fn get_default_outbound() -> Arc<dyn AnyOutbound> {
+pub fn get_default_outbound() -> anyhow::Result<Arc<dyn AnyOutbound>> {
     get_outbound_by_tag("default_server".as_ref())
 }
 
@@ -541,5 +542,23 @@ impl AnyPacket for UdpHandler {
             packets.push((self.session_key.0.clone(), self.session_key.1.clone(), data));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_outbound_by_tag_returns_error_for_unknown_tag() {
+        let tag = "definitely-not-registered-outbound";
+        let err = match get_outbound_by_tag(tag) {
+            Ok(_) => panic!("unknown tag must be an error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains(tag),
+            "error should name the missing tag: {err}"
+        );
     }
 }

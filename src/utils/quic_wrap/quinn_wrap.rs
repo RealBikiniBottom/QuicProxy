@@ -436,8 +436,16 @@ pub struct QuinnClient {
 }
 
 impl QuinnClient {
-    pub fn new(
-        socket: std::net::UdpSocket,
+    /// Build the crypto + transport client configuration.
+    ///
+    /// This is the expensive part of client creation (cert loading, rustls
+    /// setup). It does not depend on the local UDP socket, so callers that
+    /// reconnect repeatedly should build it once and reuse it across
+    /// reconnects via [`QuinnClient::from_config`].
+    ///
+    /// Returns the config plus the resolved server name (SNI with the default
+    /// fallback applied).
+    pub fn build_client_config(
         idle_timeout: Duration,
         verify_peer: bool,
         zero_rtt: bool,
@@ -452,8 +460,8 @@ impl QuinnClient {
         enable_mtudis: bool,
         initial_mtu: u16,
         min_mtu: u16,
-    ) -> anyhow::Result<Self> {
-        let server_name = sni.as_deref().unwrap_or("apple.com");
+    ) -> anyhow::Result<(Arc<ClientConfig>, String)> {
+        let server_name = sni.unwrap_or_else(|| "apple.com".to_string());
         let mut client_crypto = if is_jls {
             let mut config = quinn::rustls::ClientConfig::builder()
                 .with_root_certificates(quinn::rustls::RootCertStore::empty())
@@ -511,19 +519,67 @@ impl QuinnClient {
 
         client_config.transport_config(Arc::new(transport_config));
 
+        Ok((Arc::new(client_config), server_name))
+    }
+
+    /// Create a client on a fresh UDP socket from a config previously built by
+    /// [`QuinnClient::build_client_config`].
+    pub fn from_config(
+        socket: std::net::UdpSocket,
+        client_config: Arc<ClientConfig>,
+        sni: String,
+        zero_rtt: bool,
+        is_jls: bool,
+    ) -> anyhow::Result<Self> {
         let runtime =
             quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
         let endpoint =
             quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
                 .context("Failed to create QUIC endpoint")?;
-        endpoint.set_default_client_config(client_config);
+        endpoint.set_default_client_config((*client_config).clone());
 
         Ok(Self {
             endpoint,
             is_jls,
-            sni: server_name.into(),
+            sni,
             zero_rtt,
         })
+    }
+
+    pub fn new(
+        socket: std::net::UdpSocket,
+        idle_timeout: Duration,
+        verify_peer: bool,
+        zero_rtt: bool,
+        ca_cert_path: Option<&str>,
+        sni: Option<String>,
+        alpn: Option<Vec<String>>,
+        congestion_controller: Option<String>,
+        username: String,
+        passwrod: String,
+        is_jls: bool,
+        enable_gso: bool,
+        enable_mtudis: bool,
+        initial_mtu: u16,
+        min_mtu: u16,
+    ) -> anyhow::Result<Self> {
+        let (client_config, server_name) = Self::build_client_config(
+            idle_timeout,
+            verify_peer,
+            zero_rtt,
+            ca_cert_path,
+            sni,
+            alpn,
+            congestion_controller,
+            username,
+            passwrod,
+            is_jls,
+            enable_gso,
+            enable_mtudis,
+            initial_mtu,
+            min_mtu,
+        )?;
+        Self::from_config(socket, client_config, server_name, zero_rtt, is_jls)
     }
 
     pub async fn connect(&self, remote_addr: SocketAddr) -> anyhow::Result<Arc<quinn::Connection>> {

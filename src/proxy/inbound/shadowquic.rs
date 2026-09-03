@@ -175,8 +175,7 @@ impl AnyInbound for ShadowQuicInbound {
             self.initial_mtu,
             self.min_mtu,
         )
-        .await
-        .map_err(|e| new_io_other_error(format!("QUIC server error: {}", e)))?;
+        .with_context(|| format!("QUIC server failed to listen on {}", listen_addr))?;
 
         let auth_hash = self.auth_hash;
         let session_timeout = self.idle_timeout();

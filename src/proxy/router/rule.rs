@@ -165,7 +165,9 @@ impl Rule {
             .outbound
             .as_ref()
             .context("require outbound in rule config")?;
-        let outbound = get_outbound_by_tag(outbound_tag);
+        let outbound = get_outbound_by_tag(outbound_tag).with_context(|| {
+            format!("rule references unknown outbound '{}'", outbound_tag)
+        })?;
 
         Ok(Self {
             mode,
