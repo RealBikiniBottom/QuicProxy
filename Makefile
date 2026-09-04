@@ -108,6 +108,7 @@ apk-verify:
 	keytool -printcert -jarfile $(APK_OUTPUT) 2>/dev/null || echo "keytool not available"
 
 build-xcframework:
+	cargo update
 	rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
 	@# iOS device
 	IPHONEOS_DEPLOYMENT_TARGET=14.0 \

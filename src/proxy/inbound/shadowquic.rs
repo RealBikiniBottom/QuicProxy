@@ -1,9 +1,8 @@
 use anyhow::bail;
 use async_trait::async_trait;
-use quinn::VarInt;
+use quinn::{ConnectionError, VarInt};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -16,19 +15,20 @@ use crate::proxy::router::Router;
 use crate::proxy::router::get_router;
 use crate::proxy::shadowquic_udp::{
     ExtensionRequest, PerConnectionState, ShadowQuicUdpPacket, ShadowUdpReceiver,
-    UDP_CONTEXT_ID_RECONNECT_MARGIN, UdpRecvMap, auth_sunnyquic, gen_sunny_auth_hash,
-    read_context_id, read_extension_request, read_request_head, run_bistream_recv_listener,
-    start_datagram_loop, start_unistream_listener, write_conn_stats_response,
-    write_ext_error_not_available,
+    UDP_CONTEXT_ID_RECONNECT_MARGIN, auth_sunnyquic, gen_sunny_auth_hash, read_context_id,
+    read_extension_request, read_request_head, run_bistream_recv_listener, start_datagram_loop,
+    start_unistream_listener, write_conn_stats_response, write_ext_error_not_available,
 };
 use crate::proxy::{TargetAddr, TlsConfig};
 use anyhow::Context;
 
-use crate::utils::keyed_notify::KeyedNotify;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 use crate::utils::quic_wrap::quinn_wrap::QuinnServer;
 
 use tracing::{Instrument, debug, error, field, info, info_span};
+
+/// Application close code sent to the peer when the connection handler exits.
+const SHADOWQUIC_CLOSE_CODE: u32 = 263;
 
 pub struct ShadowQuicInbound {
     tag: String,
@@ -82,11 +82,9 @@ impl ShadowQuicInbound {
         target: TargetAddr,
         router: Arc<Router>,
         inbound_tag: &str,
-        udp_recv_map: UdpRecvMap,
+        per_conn: Arc<PerConnectionState>,
         conn: Arc<quinn::Connection>,
-        send_context_id: Arc<AtomicU32>,
         idle_timeout: Duration,
-        udp_recv_map_notify: Arc<KeyedNotify>,
     ) -> anyhow::Result<()> {
         let recv_context_id = read_context_id(&mut bistream, idle_timeout).await?;
 
@@ -95,7 +93,7 @@ impl ShadowQuicInbound {
         // per-connection counter run out would trip get_send_context_id's
         // u16::try_from failure and close the whole QUIC connection, killing
         // every TCP and UDP session riding on it.
-        let used = send_context_id.load(Ordering::Relaxed);
+        let used = per_conn.next_context_id.load(Ordering::Relaxed);
         if used >= u16::MAX as u32 - UDP_CONTEXT_ID_RECONNECT_MARGIN {
             bail!(
                 "UDP context-id space nearly exhausted on this connection ({} used), refusing new UDP session",
@@ -104,38 +102,29 @@ impl ShadowQuicInbound {
         }
 
         let receiver = Arc::new(ShadowUdpReceiver::new(
-            udp_recv_map.clone(),
-            udp_recv_map_notify.clone(),
+            per_conn.udp_recv_map.clone(),
+            per_conn.udp_recv_map_notify.clone(),
         ));
         receiver.bind_context_id(target.clone(), recv_context_id)?;
         run_bistream_recv_listener(bistream.recv, receiver.clone());
 
-        let mut is_over_unistream = false;
-        match udp_mod {
-            UdpMode::OverStream => {
-                is_over_unistream = true;
-                debug!("UdpMode::OverStream");
-            }
-            UdpMode::OverDatagram => {
-                debug!("UdpMode::OverDatagram");
-            }
-        }
-
+        debug!(?udp_mod);
+        let source_addr = TargetAddr::Ip(conn.remote_address());
         let out_packet = Arc::new(ShadowQuicUdpPacket::new(
-            is_over_unistream,
+            matches!(udp_mod, UdpMode::OverStream),
             false,
             receiver,
-            send_context_id,
+            per_conn.next_context_id.clone(),
             Arc::new(Mutex::new(bistream.send)),
-            conn.clone(),
+            conn,
         ));
         out_packet.get_send_context_id(&target).await?; // init
 
         router
             .dispatch_packet(
                 out_packet,
-                &target.clone(),
-                &TargetAddr::Ip(conn.remote_address()),
+                &target,
+                &source_addr,
                 inbound_tag,
                 None,
                 idle_timeout,
@@ -186,52 +175,39 @@ impl AnyInbound for ShadowQuicInbound {
         loop {
             match listener.accept().await {
                 Ok(conn) => {
-                    let router_clone = router.clone();
                     info!("Accepted QUIC connection from {}", conn.remote_address());
 
                     let per_conn = Arc::new(PerConnectionState::new());
-
-                    let conn_clone = conn.clone();
-                    let session_timeout_val = session_timeout;
-                    let tag_clone = tag.clone();
+                    let router = router.clone();
+                    let tag = tag.clone();
 
                     tokio::spawn(async move {
                         let res: anyhow::Result<()> = async {
-                            let mut is_authed = !auth_hash.is_some();
+                            let mut is_authed = auth_hash.is_none();
                             let mut services_started = false;
 
-                            let start_services = || {
-                                start_unistream_listener(
-                                    conn_clone.clone(),
-                                    per_conn.udp_recv_map.clone(),
-                                    per_conn.udp_recv_map_notify.clone(),
-                                    session_timeout_val,
-                                );
-                                start_datagram_loop(
-                                    conn_clone.clone(),
-                                    per_conn.udp_recv_map.clone(),
-                                    per_conn.waiting_datagram_buffer.clone(),
-                                    per_conn.udp_recv_map_notify.clone(),
-                                );
-                            };
-
-                            while conn.close_reason().is_none() {
-                                let conn_clone2 = conn.clone();
-                                let (send, recv) = conn_clone2
-                                    .accept_bi()
-                                    .await
-                                    .context("QUIC accept_bi error")?;
+                            loop {
+                                let (send, recv) = match conn.accept_bi().await {
+                                    Ok(stream) => stream,
+                                    Err(
+                                        e @ (ConnectionError::ApplicationClosed(_)
+                                        | ConnectionError::ConnectionClosed(_)
+                                        | ConnectionError::TimedOut
+                                        | ConnectionError::LocallyClosed
+                                        | ConnectionError::Reset),
+                                    ) => {
+                                        debug!("QUIC connection ended: {}", e);
+                                        return Ok(());
+                                    }
+                                    Err(e) => return Err(e).context("QUIC accept_bi error"),
+                                };
 
                                 let mut bistream = Box::new(QuinnBistream::new(send, recv));
                                 if !is_authed {
                                     if let Some(auth_hash) = auth_hash {
-                                        auth_sunnyquic(
-                                            &mut bistream,
-                                            auth_hash,
-                                            session_timeout_val,
-                                        )
-                                        .await
-                                        .context("auth failed")?;
+                                        auth_sunnyquic(&mut bistream, auth_hash, session_timeout)
+                                            .await
+                                            .context("auth failed")?;
 
                                         is_authed = true;
                                         info!("Sunnyquic auth ok");
@@ -240,20 +216,32 @@ impl AnyInbound for ShadowQuicInbound {
                                 }
 
                                 if !services_started {
-                                    start_services();
+                                    start_unistream_listener(
+                                        conn.clone(),
+                                        per_conn.udp_recv_map.clone(),
+                                        per_conn.udp_recv_map_notify.clone(),
+                                        session_timeout,
+                                    );
+                                    start_datagram_loop(
+                                        conn.clone(),
+                                        per_conn.udp_recv_map.clone(),
+                                        per_conn.waiting_datagram_buffer.clone(),
+                                        per_conn.udp_recv_map_notify.clone(),
+                                    );
                                     services_started = true;
                                 }
 
-                                let tag = tag_clone.clone();
-                                let router = router_clone.clone();
+                                let tag = tag.clone();
+                                let router = router.clone();
                                 let per_conn = per_conn.clone();
-                                let remote_addr = conn_clone2.remote_address().to_string();
+                                let conn = conn.clone();
+                                let remote_addr = conn.remote_address().to_string();
 
                                 info!("Accepted proxy request from bistream");
                                 tokio::spawn(async move {
                                     let res: anyhow::Result<()> = async {
                                         let (cmd, target) =
-                                            read_request_head(&mut bistream, session_timeout_val)
+                                            read_request_head(&mut bistream, session_timeout)
                                                 .await?;
 
                                         match cmd {
@@ -290,11 +278,9 @@ impl AnyInbound for ShadowQuicInbound {
                                                     target,
                                                     router,
                                                     tag.as_str(),
-                                                    per_conn.udp_recv_map.clone(),
-                                                    conn_clone2.clone(),
-                                                    per_conn.next_context_id.clone(),
-                                                    session_timeout_val,
-                                                    per_conn.udp_recv_map_notify.clone(),
+                                                    per_conn,
+                                                    conn,
+                                                    session_timeout,
                                                 )
                                                 .instrument(span)
                                                 .await?;
@@ -303,7 +289,7 @@ impl AnyInbound for ShadowQuicInbound {
                                                 // Shadowquic extension protocol
                                                 let ext_req = read_extension_request(
                                                     &mut bistream,
-                                                    session_timeout_val,
+                                                    session_timeout,
                                                 )
                                                 .await
                                                 .context("read extension request")?;
@@ -311,10 +297,9 @@ impl AnyInbound for ShadowQuicInbound {
                                                 let mut send = bistream.send;
                                                 match ext_req {
                                                     ExtensionRequest::GetConnStats => {
-                                                        let stats = conn_clone2.stats();
+                                                        let stats = conn.stats();
                                                         let rtt_ms =
-                                                            conn_clone2.rtt().as_secs_f64()
-                                                                * 1000.0;
+                                                            conn.rtt().as_secs_f64() * 1000.0;
                                                         if let Err(e) = write_conn_stats_response(
                                                             &mut send,
                                                             stats.path.lost_packets,
@@ -359,7 +344,6 @@ impl AnyInbound for ShadowQuicInbound {
                                     }
                                 });
                             }
-                            Ok(())
                         }
                         .await;
 
@@ -367,8 +351,8 @@ impl AnyInbound for ShadowQuicInbound {
                             error!("QUIC conn error: {:#}", e);
                         }
 
-                        conn.close(VarInt::from_u64(263).unwrap(), &[]);
-                        info!("QUIC conn closed",);
+                        conn.close(VarInt::from_u32(SHADOWQUIC_CLOSE_CODE), b"");
+                        info!("QUIC conn {} closed", conn.remote_address());
                     });
                 }
                 Err(e) => {

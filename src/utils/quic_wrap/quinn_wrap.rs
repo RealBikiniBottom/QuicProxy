@@ -47,14 +47,6 @@ const ACCEPT_CONNECTION_QUEUE_CAPACITY: usize = 200;
 /// actually-opened stream -- so it can be generous.
 const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 1000;
 
-fn keep_alive_interval_for(idle_timeout: Duration) -> Option<Duration> {
-    if idle_timeout.is_zero() {
-        return None;
-    }
-
-    Some(std::cmp::max(idle_timeout / 2, Duration::from_secs(1)))
-}
-
 fn make_transport_config(
     idle_timeout: Duration,
     congestion_controller: Option<&str>,
@@ -67,11 +59,9 @@ fn make_transport_config(
 
     if idle_timeout.is_zero() {
         transport_config.max_idle_timeout(None);
-        transport_config.keep_alive_interval(None);
     } else {
         let timeout_ms = u32::try_from(idle_timeout.as_millis()).unwrap_or(u32::MAX);
         transport_config.max_idle_timeout(Some(VarInt::from_u32(timeout_ms).into()));
-        transport_config.keep_alive_interval(keep_alive_interval_for(idle_timeout));
     }
 
     transport_config.enable_segmentation_offload(enable_gso);
@@ -105,7 +95,10 @@ fn make_transport_config(
             "cubic" => Arc::new(quinn::congestion::CubicConfig::default()),
             "newreno" => Arc::new(quinn::congestion::NewRenoConfig::default()),
             other => {
-                warn!("unknown congestion controller '{}', falling back to bbr", other);
+                warn!(
+                    "unknown congestion controller '{}', falling back to bbr",
+                    other
+                );
                 Arc::new(quinn::congestion::BbrConfig::default())
             }
         };
@@ -404,8 +397,8 @@ impl Drop for QuinnServer {
     }
 }
 
-fn generate_self_signed_cert(
-) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+fn generate_self_signed_cert() -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>
+{
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .map_err(|e| new_io_other_error(format!("Failed to generate cert: {}", e)))?;
     let cert_der = cert.cert.der().to_vec();
