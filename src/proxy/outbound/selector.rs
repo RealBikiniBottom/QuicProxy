@@ -24,7 +24,7 @@ pub enum SelectorType {
     UrlTest,
 }
 
-const SELECTOR_TEST_ROUND_TIMEOUT: Duration = Duration::from_secs(10);
+const SELECTOR_TEST_ROUND_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct SelectorOutbound {
     tag: String,
