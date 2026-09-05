@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod shadowquic;
+
 use quicproxy::bootstrap;
 use quicproxy::config::Config;
 use std::fs::File;

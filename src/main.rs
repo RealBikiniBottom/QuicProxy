@@ -38,48 +38,36 @@ static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    // ─── 核心模式 ───
-    /// 配置文件路径（核心模式）
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// 提权运行
     #[arg(long)]
     elevate: bool,
 
     #[arg(long)]
     elevate_no_show_window: bool,
 
-    // ─── 管理模式 ───
-    /// 以管理服务器模式运行
     #[arg(long)]
     manage: bool,
 
-    /// 管理服务器监听地址
     #[arg(long, default_value = "::")]
     host: String,
 
-    /// 管理服务器监听端口
     #[arg(long, default_value = "8080")]
     port: u16,
 
-    /// quicproxy 核心可执行文件路径（默认自身）
     #[arg(long)]
     core_path: Option<String>,
 
-    /// 工作目录
     #[arg(long)]
     work_dir: Option<PathBuf>,
 
-    /// 持久化数据文件名
     #[arg(long, default_value = "persist.json")]
     persist_file: String,
 
-    /// API 密码
     #[arg(long, default_value = "")]
     password: String,
 
-    /// Flutter Web 构建产物目录
     #[arg(long)]
     web_dir: Option<PathBuf>,
 }
@@ -95,12 +83,9 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     let args = Args::parse();
 
-    // ─── 管理模式 ───
     if args.manage {
         return run_manage(args).await;
     }
-
-    // ─── 核心模式 ───
 
     if args.elevate {
         if !elevate::is_elevated() {
@@ -168,8 +153,6 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
-// ─── 管理模式 ───
-
 async fn run_manage(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "quicproxy=info".into()))
@@ -204,19 +187,16 @@ async fn run_manage(args: Args) -> Result<()> {
     let work_dir_display = core_manager.status().work_dir;
     let web_dir = args.web_dir.clone();
 
-    // 管理 API 路由
     let mgmt_router = management::router().with_state(ManagementState {
         core_manager: core_manager.clone(),
         password: args.password.clone(),
     });
 
-    // 持久化 API 路由
     let persist_router = persist_handler::router().with_state(PersistHandlerState {
         persist_store: persist_store.clone(),
         password: args.password.clone(),
     });
 
-    // 健康检查（lambda 捕获 clone）
     let cm = core_manager.clone();
     let ps = persist_store.clone();
     let health_route = Router::new().route(

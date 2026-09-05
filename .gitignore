@@ -9,3 +9,4 @@ remote.mmdb
 *~
 [._]*.un~
 .DS_Store
+.dsh-code

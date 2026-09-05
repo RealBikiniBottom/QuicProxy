@@ -15,7 +15,7 @@
       ],
       "idle_timeout": 100,
       "mtu": 1424,
-      "auto_route": false
+      "auto_route": true
     },
     "sq_inbound": {
       "type": "shadowquic",
@@ -62,14 +62,14 @@
       },
       "real_out2": {
         "type": "shadowquic",
-        "address": "127.0.0.1",
-        "port": 2344,
+        "address": "23.27.96.75",
+        "port": 443,
         "idle_timeout": 50,
         "udp_mod": "datagram",
         "tls": {
           "enable_jls": true,
-          "jls_username": "user",
-          "jls_password": "pwd",
+          "jls_username": "039d85c31c9f",
+          "jls_password": "5b0adc7f253e51df2996bbaab6bd5d67",
           "alpn": [],
           "zero_rtt": true,
           "sni": "www.apple.com"
