@@ -44,6 +44,17 @@
           "sni": "www.apple.com"
         }
       },
+      "hy2_example": {
+        "type": "hysteria2", // https://v2.hysteria.network
+        "address": "server.example.com",
+        "port": 443,
+        "password": "change-me",
+        "connect_timeout": 10,
+        "tls": {
+          // "insecure": true, // self-signed certificates
+          "sni": "server.example.com"
+        }
+      },
       "hijack_dns_outbound": {
         "type": "dns",
         "dns": "fakeip_dns"

@@ -2,6 +2,7 @@ pub mod anytls;
 pub mod direct;
 pub mod dns;
 pub mod http;
+pub mod hysteria2;
 pub mod pool;
 pub mod selector;
 pub mod shadowquic;
@@ -16,6 +17,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use direct::DirectOutbound;
 use dns::DnsOutbound;
+use hysteria2::Hysteria2Outbound;
 use selector::SelectorOutbound;
 use serde::Serialize;
 use shadowquic::ShadowQuicOutbound;
@@ -77,6 +79,7 @@ pub fn init_outbounds(cfg: &Config) -> anyhow::Result<()> {
             "shadowquic" => ShadowQuicOutbound::new(name_str, item)?,
             "trojan" => TrojanOutbound::new(name_str, item)?,
             "anytls" => AnytlsOutbound::new(name_str, item)?,
+            "hysteria2" | "hy2" => Hysteria2Outbound::new(name_str, item)?,
             "socks5" => Socks5Outbound::new(name_str, item)?,
             "shadowsocks" => ShadowsocksOutbound::new(name_str, item)?,
             "vmess" => VmessOutbound::new(name_str, item)?,
