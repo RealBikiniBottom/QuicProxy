@@ -8,6 +8,7 @@ pub mod selector;
 pub mod shadowquic;
 pub mod shadowsocks;
 pub mod socks5;
+pub mod transport;
 pub mod trojan;
 pub mod vmess;
 

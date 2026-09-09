@@ -80,6 +80,7 @@ cfb-mode = "0.8"
 aes = "0.8"
 shadowsocks = { version = "1", features = ["aead-cipher-2022", "stream-cipher"] }
 sysinfo = "0"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 
 [patch.crates-io]
 rustls = { git = "https://github.com/spongebob888/rustls-jls", branch = "jls-main" }

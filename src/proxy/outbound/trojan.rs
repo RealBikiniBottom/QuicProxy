@@ -12,8 +12,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 use tokio_rustls::{TlsConnector, rustls};
 
-use crate::config::OutboundConfig;
+use crate::config::{OutboundConfig, TransportConfig};
 use crate::proxy::outbound::pool::PoolOutbound;
+use crate::proxy::outbound::transport::wrap_transport_stream;
 use crate::proxy::{
     SourceAddr, TargetAddr, TlsConfig, configure_jls_client,
     outbound::{AnyOutbound, AnyPacket, AnyStream, LazyHandshakeStream, PacketInfo},
@@ -26,6 +27,7 @@ pub struct TrojanOutbound {
     pub address: TargetAddr,
     pub password: String,
     pub tls: TlsConfig,
+    pub transport: Option<TransportConfig>,
     pub connect_timeout: Duration,
     pub dns_server_name: Option<String>,
     pub bind_interface: Option<String>,
@@ -57,6 +59,7 @@ impl TrojanOutbound {
             address,
             password,
             tls,
+            transport: cfg.transport.clone(),
             connect_timeout,
             dns_server_name: cfg.dns.clone(),
             bind_interface: cfg.bind_interface.clone(),
@@ -246,11 +249,23 @@ impl AnyOutbound for TrojanOutbound {
         let socket_addr = self.resolve_addr(&self.address).await?;
         let stream = self.new_tcp_stream(socket_addr).await?;
 
-        if self.tls.enable {
-            Ok(Box::new(self.connect_tls(stream).await?))
+        let stream: AnyStream = if self.tls.enable {
+            Box::new(self.connect_tls(stream).await?)
         } else {
-            Ok(Box::new(stream))
-        }
+            Box::new(stream)
+        };
+
+        // A transport (e.g. ws) sits on top of the base connection: the TLS
+        // stream - when enabled - is the raw transport underneath it, which
+        // matches how sing-box layers trojan transports.
+        wrap_transport_stream(
+            self.transport.as_ref(),
+            &self.address,
+            stream,
+            self.connect_timeout(),
+        )
+        .await
+        .with_context(|| format!("trojan outbound '{}' transport failed", self.tag))
     }
 
     async fn connect_stream_with(
@@ -280,7 +295,7 @@ impl TrojanUdpSocket {
 
 #[async_trait]
 impl AnyPacket for TrojanUdpSocket {
-    async fn send_to(&self, buf: Bytes, target: &TargetAddr, _from: &SourceAddr) -> Result<usize> {
+    async fn send_to(&self, buf: Bytes, _from: &SourceAddr, target: &TargetAddr) -> Result<usize> {
         let mut packet = target.to_bytes();
 
         packet.extend_from_slice(&(buf.len() as u16).to_be_bytes());
@@ -297,7 +312,8 @@ impl AnyPacket for TrojanUdpSocket {
     async fn recv_from(&self) -> Result<PacketInfo> {
         let mut rx = self.rx.lock().await;
 
-        let target = TargetAddr::read_from(&mut *rx).await?;
+        // A reply datagram carries the source address of the responding peer.
+        let source = TargetAddr::read_from(&mut *rx).await?;
 
         let length = rx.read_u16().await?;
         let mut crlf = [0u8; 2];
@@ -312,6 +328,6 @@ impl AnyPacket for TrojanUdpSocket {
 
         let dummy_target = TargetAddr::dummy();
 
-        Ok((target, dummy_target, Bytes::from(payload)))
+        Ok((source, dummy_target, Bytes::from(payload)))
     }
 }
