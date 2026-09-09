@@ -537,11 +537,10 @@ pub trait AnyDNS: Send + Sync + 'static {
         let cache_key = format!("{}:{}:{:?}", outbound.tag(), domain, qtype);
 
         if let Some(byte_cache) = self.byte_cache() {
-            if let Ok(Some((cached_bytes, remaining_ttl, source))) = byte_cache.get(&cache_key) {
+            if let Ok(Some((cached_bytes, remaining_ttl))) = byte_cache.get(&cache_key) {
                 let remaining = Duration::from_secs(remaining_ttl.saturating_sub(now_timestamp()));
                 info!(
-                    "hit dns byte cache from {:?}({}) for {}({:?})",
-                    source,
+                    "hit dns byte cache({}) for {}({:?})",
                     format_duration(remaining),
                     domain,
                     qtype,
@@ -942,12 +941,8 @@ impl FakeIPDNS {
 
     fn load_cursor(cache: &FakeIPCache, key: &str) -> u64 {
         match cache.get(key) {
-            Ok(r) => {
-                if let Some(r) = r {
-                    return r.0.trim().parse().unwrap_or(0);
-                }
-                0
-            }
+            Ok(Some(r)) => r.trim().parse().unwrap_or(0),
+            Ok(None) => 0,
             Err(_) => 0,
         }
     }
@@ -1002,8 +997,8 @@ impl FakeIPDNS {
             _ => bail!("qtype unspported"),
         };
 
-        if let Ok(Some(r)) = self.cache.get(&cache_key) {
-            return Ok(r.0);
+        if let Ok(Some(ip_str)) = self.cache.get(&cache_key) {
+            return Ok(ip_str);
         }
 
         let ip_str = match qtype {
@@ -1041,8 +1036,8 @@ impl FakeIPDNS {
         let ptr_key = format!("ptr:{}", ip);
 
         match self.cache.get(&ptr_key) {
-            Ok(Some(r)) => {
-                let domain = r.0.trim().to_string();
+            Ok(Some(domain)) => {
+                let domain = domain.trim().to_string();
                 if domain.is_empty() {
                     None
                 } else {

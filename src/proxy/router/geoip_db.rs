@@ -11,6 +11,7 @@ use crate::utils::time::parse_duration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use hyper::http::Method;
 use memmap2::Mmap;
@@ -18,11 +19,10 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 pub type GeoIpReader = maxminddb::Reader<Mmap>;
-pub type SharedGeoIpReader = Mutex<Arc<Option<GeoIpReader>>>;
+pub type SharedGeoIpReader = ArcSwapOption<GeoIpReader>;
 
 pub static GEOIP_DB_MAP: LazyLock<DashMap<String, Arc<GeoipDB>>> = LazyLock::new(DashMap::new);
 
@@ -48,13 +48,13 @@ pub fn get_geoip_db_by_tag(tag: &str) -> Result<Arc<GeoipDB>> {
     }
 }
 
-pub fn load_db_file(path: &str) -> Result<Arc<Option<GeoIpReader>>> {
+pub fn load_db_file(path: &str) -> Result<Arc<GeoIpReader>> {
     if !Path::new(path).exists() {
         bail!("path does not exists.")
     }
     let reader = unsafe { maxminddb::Reader::open_mmap(&path) }
         .context(format!("failed to load db:{}", path))?;
-    return Ok(Arc::new(Some(reader)));
+    return Ok(Arc::new(reader));
 }
 
 pub struct GeoipDB {
@@ -100,7 +100,7 @@ impl GeoipDB {
             download_outbound,
             cache,
             url: cfg.url.clone(),
-            reader: Mutex::new(Arc::new(None)),
+            reader: ArcSwapOption::empty(),
         })
     }
 
@@ -108,7 +108,7 @@ impl GeoipDB {
         let start = now();
         match load_db_file(&self.path) {
             Ok(reader) => {
-                *self.reader.lock().await = reader;
+                self.reader.store(Some(reader));
             }
             Err(e) => {
                 if self.url.is_some() {
@@ -133,10 +133,9 @@ impl GeoipDB {
     pub async fn lookup(&self, ip: std::net::IpAddr) -> Result<String> {
         let start = now();
 
-        let shared_reader = self.reader.lock().await.clone();
-        let reader = shared_reader
-            .as_ref()
-            .as_ref()
+        let reader = self
+            .reader
+            .load_full()
             .ok_or_else(|| anyhow::anyhow!("GeoIP db '{}' is not loaded", self.tag))?;
 
         let result = match reader
@@ -169,10 +168,8 @@ impl GeoipDB {
         Ok(result)
     }
 
-    pub async fn close_reader(&self) -> Result<()> {
-        let mut lock = self.reader.lock().await;
-        *lock = Arc::new(None); // 用一个新的 Arc(None) 替换旧的
-        Ok(())
+    pub fn close_reader(&self) {
+        self.reader.store(None);
     }
 
     fn record_update_success(&self) {
@@ -197,7 +194,7 @@ impl GeoipDB {
         let key = self.get_key();
 
         match cache.get(&key) {
-            Ok(Some((last_update, _))) => {
+            Ok(Some(last_update)) => {
                 let elapsed = Duration::from_secs(now_timestamp().saturating_sub(last_update));
                 self.update_interval.saturating_sub(elapsed)
             }
@@ -229,7 +226,6 @@ impl GeoipDB {
         if self.url.is_none() {
             bail!("missing url for remote db")
         }
-        self.record_update_success();
         let tmp_path = format!("{}.tmp", self.path);
 
         if let Err(e) = self.download_db(&tmp_path).await {
@@ -256,7 +252,8 @@ impl GeoipDB {
         }
 
         let reader = load_db_file(&self.path)?;
-        *self.reader.lock().await = reader;
+        self.reader.store(Some(reader));
+        self.record_update_success();
         Ok(())
     }
 

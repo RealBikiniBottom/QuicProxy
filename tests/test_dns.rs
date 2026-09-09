@@ -429,13 +429,12 @@ async fn test_fakeip_reverse_unknown_ip_returns_none() {
 // FakeIPDNS direct tests
 // ========================
 
-fn setup_cache_for_tag(temp_dir: &TempDir, tag: &str, memory_size: u64) {
+fn setup_cache_for_tag(temp_dir: &TempDir, tag: &str) {
     let db_path = temp_dir.path().join("cache.db");
     let mut config = Config::default();
     config.cache.insert(
         tag.to_string(),
         CacheConfig {
-            memory_size,
             path: Some(db_path.to_string_lossy().to_string()),
         },
     );
@@ -470,11 +469,11 @@ fn make_fakeipdns(tag: &str, cache_tag: &str, range_v4: &str, range_v6: Option<&
             .expect("failed to init cache");
 
     let ipv4_cursor = match cache.get("fakeip_ipv4_cursor_index") {
-        Ok(Some(r)) => r.0.trim().parse().unwrap_or(0),
+        Ok(Some(r)) => r.trim().parse().unwrap_or(0),
         _ => 0,
     };
     let ipv6_cursor = match cache.get("fakeip_ipv6_cursor_index") {
-        Ok(Some(r)) => r.0.trim().parse().unwrap_or(0),
+        Ok(Some(r)) => r.trim().parse().unwrap_or(0),
         _ => 0,
     };
 
@@ -502,7 +501,7 @@ async fn test_fakeipdns_cache_same_domain_returns_same_ip() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let cache_tag = "fk_cache_basic";
-        setup_cache_for_tag(&temp_dir, cache_tag, 100);
+        setup_cache_for_tag(&temp_dir, cache_tag);
 
         let dns = make_fakeipdns("test", cache_tag, "198.18.0.0/15", None);
 
@@ -531,7 +530,7 @@ async fn test_fakeipdns_cache_multiple_domains() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let cache_tag = "fk_cache_multi";
-        setup_cache_for_tag(&temp_dir, cache_tag, 100);
+        setup_cache_for_tag(&temp_dir, cache_tag);
 
         let dns = make_fakeipdns("test", cache_tag, "198.18.0.0/15", None);
 
@@ -571,7 +570,7 @@ async fn test_fakeipdns_cursor_persistence() {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let cache_tag = "fk_cursor_persist";
         let dns_tag = "fakeip_persist";
-        setup_cache_for_tag(&temp_dir, cache_tag, 100);
+        setup_cache_for_tag(&temp_dir, cache_tag);
 
         let dns1 = make_fakeipdns(dns_tag, cache_tag, "198.18.0.0/15", None);
 
@@ -628,7 +627,7 @@ async fn test_fakeipdns_reverse_lookup() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let cache_tag = "fk_reverse";
-        setup_cache_for_tag(&temp_dir, cache_tag, 100);
+        setup_cache_for_tag(&temp_dir, cache_tag);
 
         let dns = make_fakeipdns("test", cache_tag, "198.18.0.0/15", Some("fc00::/18"));
 
@@ -664,7 +663,7 @@ async fn test_fakeipdns_reverse_after_reopen() {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let cache_tag = "fk_reverse_reopen";
         let dns_tag = "fakeip_rev_reopen";
-        setup_cache_for_tag(&temp_dir, cache_tag, 100);
+        setup_cache_for_tag(&temp_dir, cache_tag);
 
         let dns1 = make_fakeipdns(dns_tag, cache_tag, "198.18.0.0/15", None);
 
@@ -720,7 +719,7 @@ async fn test_fakeipdns_full_roundtrip_v4_and_v6() {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let cache_tag = "fk_full_roundtrip";
         let dns_tag = "fakeip_full";
-        setup_cache_for_tag(&temp_dir, cache_tag, 100);
+        setup_cache_for_tag(&temp_dir, cache_tag);
 
         let dns1 = make_fakeipdns(dns_tag, cache_tag, "198.18.0.0/15", Some("fc00::/18"));
 
@@ -805,7 +804,7 @@ async fn test_fakeipdns_anydns_reverse_trait() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let cache_tag = "fk_anydns_rev";
-        setup_cache_for_tag(&temp_dir, cache_tag, 100);
+        setup_cache_for_tag(&temp_dir, cache_tag);
 
         let dns = make_fakeipdns("test", cache_tag, "198.18.0.0/15", None);
         let outbound = dns.default_outbound();

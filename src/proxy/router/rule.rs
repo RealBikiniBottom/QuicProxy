@@ -9,6 +9,7 @@ use crate::proxy::TargetAddr;
 use crate::proxy::outbound::{AnyOutbound, get_outbound_by_tag};
 use anyhow::{Context, Result, ensure};
 
+use super::geoip::Geoip;
 use super::geoip::get_geoip_by_tag;
 
 #[derive(Clone)]
@@ -29,7 +30,7 @@ pub struct Rule {
     pub query_type: Option<Vec<QTYPE>>,
 
     pub dns: Option<Arc<dyn AnyDNS>>,
-    pub geoip: Option<Vec<String>>,
+    pub geoip: Vec<Arc<Geoip>>,
     pub reverse: Option<Arc<dyn AnyDNS>>,
     pub outbound: Arc<dyn AnyOutbound>,
 }
@@ -165,9 +166,25 @@ impl Rule {
             .outbound
             .as_ref()
             .context("require outbound in rule config")?;
-        let outbound = get_outbound_by_tag(outbound_tag).with_context(|| {
-            format!("rule references unknown outbound '{}'", outbound_tag)
-        })?;
+        let outbound = get_outbound_by_tag(outbound_tag)
+            .with_context(|| format!("rule references unknown outbound '{}'", outbound_tag))?;
+
+        // 9. GeoIP: resolve tags once at startup so unknown tags fail early
+        // and per-match map lookups are avoided at runtime.
+        let geoip = cfg
+            .geoip
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .map(|tags| {
+                tags.iter()
+                    .map(|t| {
+                        get_geoip_by_tag(t)
+                            .with_context(|| format!("rule references unknown geoip '{}'", t))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
 
         Ok(Self {
             mode,
@@ -175,7 +192,7 @@ impl Rule {
             domain,
             domain_suffix,
             inbounds_tag,
-            geoip: cfg.geoip.clone(),
+            geoip,
             ip_cidr,
             port,
             port_range,
@@ -264,25 +281,17 @@ impl Rule {
                 let mut matched = false;
 
                 if let Some(domains) = &self.domain {
-                    for d in domains.iter() {
-                        if d == domain {
-                            matched = true;
-                            break;
-                        }
-                    }
+                    matched = domains.iter().any(|d| domain.eq_ignore_ascii_case(d));
                 }
 
                 if !matched {
                     if let Some(domain_suffixes) = &self.domain_suffix {
-                        for d in domain_suffixes {
-                            // 确保 domain 是 &str，d 也是 &str
-                            if domain.ends_with(d.as_str()) {
-                                matched = true;
-                                break;
-                            }
-                        }
+                        matched = domain_suffixes
+                            .iter()
+                            .any(|suffix| domain_matches_suffix(domain, suffix));
                     }
                 }
+
                 if !matched {
                     return (false, None);
                 }
@@ -328,33 +337,58 @@ impl Rule {
             }
         }
 
-        if let Some(geoip) = &self.geoip {
-            if !geoip.is_empty() {
-                let mut is_matched = false;
-                for item in geoip.iter() {
-                    let geoip = match get_geoip_by_tag(item) {
-                        Ok(g) => g,
-                        Err(e) => {
-                            error!("can not find geoip tag [{}]: {}", item, e);
-                            continue;
-                        }
-                    };
-                    match geoip.lookup(target).await {
-                        Ok(r) => {
-                            if r {
-                                is_matched = true;
-                                break;
-                            }
-                        }
-                        Err(e) => error!("can not find geoip [{}]: {:?}", item, e),
+        if !self.geoip.is_empty() {
+            let mut is_matched = false;
+            for geoip in self.geoip.iter() {
+                match geoip.lookup(target).await {
+                    Ok(true) => {
+                        is_matched = true;
+                        break;
                     }
+                    Ok(false) => {}
+                    Err(e) => error!("geoip lookup failed for {:?}: {:?}", geoip.tag, e),
                 }
-                if !is_matched {
-                    return (false, None);
-                }
+            }
+            if !is_matched {
+                return (false, None);
             }
         }
 
         (true, None)
+    }
+}
+
+/// Case-insensitive suffix match with a `.` boundary so that
+/// suffix `example.com` does not match `badexample.com`, but matches
+/// `example.com` itself and any `*.example.com`.
+fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
+    let domain = domain.as_bytes();
+    let suffix = suffix.as_bytes();
+    if suffix.is_empty() || domain.len() < suffix.len() {
+        return false;
+    }
+    let start = domain.len() - suffix.len();
+    domain[start..].eq_ignore_ascii_case(suffix) && (start == 0 || domain[start - 1] == b'.')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::domain_matches_suffix;
+
+    #[test]
+    fn suffix_match_respects_dot_boundary() {
+        let s = "example.com";
+        assert!(domain_matches_suffix("example.com", s));
+        assert!(domain_matches_suffix("www.example.com", s));
+        assert!(domain_matches_suffix("a.b.example.com", s));
+        assert!(!domain_matches_suffix("badexample.com", s));
+        assert!(!domain_matches_suffix("example.com.evil", s));
+    }
+
+    #[test]
+    fn suffix_match_is_case_insensitive() {
+        assert!(domain_matches_suffix("WWW.EXAMPLE.COM", "example.com"));
+        assert!(domain_matches_suffix("www.example.com", "EXAMPLE.COM"));
+        assert!(domain_matches_suffix("Example.com", "example.com"));
     }
 }

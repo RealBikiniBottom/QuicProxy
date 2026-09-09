@@ -6,6 +6,13 @@ use std::sync::{Arc, LazyLock};
 
 pub static REDB_CACHE: LazyLock<DashMap<PathBuf, Arc<Database>>> = LazyLock::new(DashMap::new);
 
+/// redb 页缓存大小的默认值，单位 MiB。
+///
+/// redb 的内部页缓存按字节预算配置（`Builder::set_cache_size`，默认 1 GiB）。
+/// 这里把默认预算收敛为 1 MiB，热数据页驻留内存以加速读取；
+/// 需要更大/更小预算时用 [`RedbStore::with_cache_size`] 指定。
+pub const DEFAULT_CACHE_SIZE_MIB: usize = 1;
+
 pub struct RedbStore {
     db: Arc<Database>,
 }
@@ -18,7 +25,16 @@ pub fn shutdown_redb() {
 
 #[allow(dead_code)]
 impl RedbStore {
+    /// 使用默认页缓存大小（[`DEFAULT_CACHE_SIZE_MIB`] MiB）打开数据库。
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+        Self::with_cache_size(path, DEFAULT_CACHE_SIZE_MIB)
+    }
+
+    /// 以指定的页缓存大小（单位 MiB）打开数据库。
+    ///
+    /// 注意：同一路径的数据库会按路径复用（`REDB_CACHE`），
+    /// 页缓存大小只在首次打开时生效，后续打开同路径会忽略该参数。
+    pub fn with_cache_size<P: AsRef<Path>>(path: P, cache_size_mib: usize) -> Result<Self, Error> {
         let path = path.as_ref();
 
         // Resolve absolute path consistently, regardless of whether file exists
@@ -49,9 +65,13 @@ impl RedbStore {
         // 释放所有 Database 引用，lock 会被释放。以下超时机制仅作为保险：
         // 应对 SIGKILL / panic 在 shutdown 之前 / OOM killer 等极端情况下残留的文件锁。
         let path_owned = key.clone();
+        let cache_size = cache_size_mib.saturating_mul(1024 * 1024);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = redb::Builder::new().set_cache_size(0).create(&path_owned);
+            // redb 页缓存预算按 set_cache_size 设置（字节），热数据页驻留内存以加速读取。
+            let result = redb::Builder::new()
+                .set_cache_size(cache_size)
+                .create(&path_owned);
             let _ = tx.send(result);
         });
 

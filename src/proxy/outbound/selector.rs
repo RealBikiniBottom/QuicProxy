@@ -66,7 +66,7 @@ impl SelectorOutbound {
         let mut selected_tag = default_outbound.clone();
         if let Some(ref cache) = cache {
             match cache.get("selected") {
-                Ok(Some((cached_tag, _))) => {
+                Ok(Some(cached_tag)) => {
                     if outbound_tags.iter().any(|tag_item| tag_item == &cached_tag) {
                         info!(
                             "selector [{}] restored cached selection: {}",
@@ -89,14 +89,16 @@ impl SelectorOutbound {
 
         let mut selected_index = 0;
 
-        let mut outbounds_vec: Vec<Arc<dyn AnyOutbound>> =
-            Vec::with_capacity(outbound_tags.len());
+        let mut outbounds_vec: Vec<Arc<dyn AnyOutbound>> = Vec::with_capacity(outbound_tags.len());
         for (i, tag_item) in outbound_tags.iter().enumerate() {
             if &selected_tag == tag_item {
                 selected_index = i;
             }
             let outbound = get_outbound_by_tag(tag_item.as_ref()).with_context(|| {
-                format!("selector '{}' references unknown outbound '{}'", tag, tag_item)
+                format!(
+                    "selector '{}' references unknown outbound '{}'",
+                    tag, tag_item
+                )
             })?;
             outbounds_vec.push(outbound);
         }

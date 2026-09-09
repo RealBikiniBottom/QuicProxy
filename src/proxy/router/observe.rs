@@ -13,6 +13,80 @@ pub struct ObservedPacket {
     pub tracker: ConnectionHandle,
     pub outbound_tag: Arc<str>,
     pub extra_outbound_tag: Option<Arc<str>>,
+    // Resolved once per session so the per-packet path avoids DashMap lookups.
+    pub outbound_stats: Option<Arc<Stats>>,
+    pub extra_stats: Option<Arc<Stats>>,
+    pub inbound_stats: Option<Arc<Stats>>,
+    pub global_stats: Arc<Stats>,
+}
+
+impl ObservedPacket {
+    pub(crate) fn new(
+        inner: Arc<dyn AnyPacket>,
+        observer: Arc<Observer>,
+        tracker: ConnectionHandle,
+        outbound_tag: Arc<str>,
+        extra_outbound_tag: Option<Arc<str>>,
+    ) -> Self {
+        let inbound_tag = tracker.inbound_tag.clone();
+        let outbound_stats = observer
+            .get_outbound_stats(&outbound_tag)
+            .map(|node| node.stats.clone());
+        let extra_stats = extra_outbound_tag
+            .as_ref()
+            .and_then(|tag| observer.get_outbound_stats(tag))
+            .map(|node| node.stats.clone());
+        let inbound_stats = observer
+            .get_inbound_stats(&inbound_tag)
+            .map(|node| node.stats.clone());
+        let global_stats = observer.global_stats_arc();
+        Self {
+            inner,
+            observer,
+            tracker,
+            outbound_tag,
+            extra_outbound_tag,
+            outbound_stats,
+            extra_stats,
+            inbound_stats,
+            global_stats,
+        }
+    }
+
+    fn add_outbound(&self, upload: u64, download: u64) {
+        match &self.outbound_stats {
+            Some(stats) => stats.add_traffic(upload, download),
+            None => {
+                self.observer
+                    .update_outbound_node_traffic(&self.outbound_tag, upload, download)
+            }
+        }
+    }
+
+    fn add_extra(&self, upload: u64, download: u64) {
+        if self.extra_outbound_tag.is_none() {
+            return;
+        }
+        match &self.extra_stats {
+            Some(stats) => stats.add_traffic(upload, download),
+            None => {
+                if let Some(ref tag) = self.extra_outbound_tag {
+                    self.observer
+                        .update_outbound_node_traffic(tag, upload, download);
+                }
+            }
+        }
+    }
+
+    fn add_inbound(&self, upload: u64, download: u64) {
+        match &self.inbound_stats {
+            Some(stats) => stats.add_traffic(upload, download),
+            None => {
+                self.observer
+                    .update_inbound_traffic(&self.tracker.inbound_tag, upload, download)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -24,44 +98,33 @@ impl AnyPacket for ObservedPacket {
         target: &TargetAddr,
     ) -> anyhow::Result<usize> {
         let n = self.inner.send_to(buf, from, target).await?;
-        self.observer
-            .update_outbound_node_traffic(&self.outbound_tag, n as u64, 0);
-        self.observer
-            .update_inbound_traffic(&self.tracker.inbound_tag, n as u64, 0);
-        if let Some(ref tag) = self.extra_outbound_tag {
-            self.observer.update_outbound_node_traffic(tag, n as u64, 0);
-        }
-        self.observer.update_global_traffic(n as u64, 0);
-        self.tracker.inc_upload(n as u64);
-        Ok(n)
+        let n = n as u64;
+        self.add_outbound(n, 0);
+        self.add_inbound(n, 0);
+        self.add_extra(n, 0);
+        self.global_stats.add_traffic(n, 0);
+        self.tracker.inc_upload(n);
+        Ok(n as usize)
     }
 
     async fn recv_from(&self) -> anyhow::Result<PacketInfo> {
         let (src, dst, data) = self.inner.recv_from().await?;
-        let n = data.len();
-        self.observer
-            .update_outbound_node_traffic(&self.outbound_tag, 0, n as u64);
-        self.observer
-            .update_inbound_traffic(&self.tracker.inbound_tag, 0, n as u64);
-        if let Some(ref tag) = self.extra_outbound_tag {
-            self.observer.update_outbound_node_traffic(tag, 0, n as u64);
-        }
-        self.observer.update_global_traffic(0, n as u64);
-        self.tracker.inc_download(n as u64);
+        let n = data.len() as u64;
+        self.add_outbound(0, n);
+        self.add_inbound(0, n);
+        self.add_extra(0, n);
+        self.global_stats.add_traffic(0, n);
+        self.tracker.inc_download(n);
         Ok((src, dst, data))
     }
 
     async fn recv_many(&self, packets: &mut Vec<PacketInfo>) -> anyhow::Result<()> {
         self.inner.recv_many(packets).await?;
         let n = packets.iter().map(|(_, _, data)| data.len() as u64).sum();
-        self.observer
-            .update_outbound_node_traffic(&self.outbound_tag, 0, n);
-        self.observer
-            .update_inbound_traffic(&self.tracker.inbound_tag, 0, n);
-        if let Some(ref tag) = self.extra_outbound_tag {
-            self.observer.update_outbound_node_traffic(tag, 0, n);
-        }
-        self.observer.update_global_traffic(0, n);
+        self.add_outbound(0, n);
+        self.add_inbound(0, n);
+        self.add_extra(0, n);
+        self.global_stats.add_traffic(0, n);
         self.tracker.inc_download(n);
         Ok(())
     }

@@ -24,7 +24,7 @@ use crate::config::OutboundConfig;
 use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, PathState};
 use crate::proxy::{SessionCloser, TargetAddr, TlsConfig};
 use crate::utils::interface::InterfaceManager;
-use crate::utils::new_io_other_error;
+use crate::utils::{new_io_other_error, now};
 use crate::utils::quic_wrap::quinn_wrap::QuinnClient;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -207,7 +207,7 @@ fn process_udp_datagram(
     if message.frag_count == 1 {
         return Ok(Some((message.destination, message.payload)));
     }
-    let now = std::time::Instant::now();
+    let now = now();
     if defrag.len() >= UDP_MAX_DEFRAG_ENTRIES {
         defrag.retain(|_, v| now.duration_since(v.created) < UDP_FRAGMENT_TIMEOUT);
     }

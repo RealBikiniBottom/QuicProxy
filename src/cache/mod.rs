@@ -1,10 +1,9 @@
 use anyhow::Result;
 use dashmap::DashMap;
-use lru::LruCache;
 use redb_store::RedbStore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::num::NonZeroUsize;
-use std::sync::{LazyLock, Mutex};
+use std::marker::PhantomData;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
@@ -12,12 +11,8 @@ use crate::utils::now_timestamp;
 
 mod redb_store;
 
-static CACHE_MAP: LazyLock<DashMap<String, AnyCache>> = LazyLock::new(DashMap::new);
-
-struct AnyCache {
-    memory_size: u64,
-    path: Option<String>,
-}
+/// cache tag -> redb 数据库文件路径
+static CACHE_MAP: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
 
 /// 关闭所有缓存数据库，释放文件锁，避免进程重启时卡死。
 pub fn shutdown_cache() {
@@ -26,20 +21,15 @@ pub fn shutdown_cache() {
 
 pub fn init_cache(cfg: &Config) -> Result<()> {
     for (name, item) in cfg.cache.iter() {
-        let cache_entry = AnyCache {
-            memory_size: item.memory_size,
-            path: item.path.clone(),
-        };
-
-        CACHE_MAP.insert(name.clone(), cache_entry);
+        let path = item.path.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cache '{name}' must configure `path`: memory-only cache is not supported, \
+                 redb's built-in page cache keeps hot data in memory"
+            )
+        })?;
+        CACHE_MAP.insert(name.clone(), path.to_string());
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CacheSource {
-    Memory,
-    Disk,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,9 +46,9 @@ impl<T> CacheWithExpire<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
 {
-    pub fn new(path: Option<String>, table_name: String, memory_cache_size: usize) -> Result<Self> {
+    pub fn new(path: String, table_name: String) -> Result<Self> {
         Ok(Self {
-            inner: Cache::new(path, table_name, memory_cache_size)?,
+            inner: Cache::new(path, table_name)?,
         })
     }
 
@@ -68,13 +58,13 @@ where
         })
     }
 
-    pub fn get(&self, key: &str) -> Result<Option<(T, u64, CacheSource)>> {
+    pub fn get(&self, key: &str) -> Result<Option<(T, u64)>> {
         let now = now_timestamp();
 
         match self.inner.get(key)? {
-            Some((expiring_val, source)) => {
+            Some(expiring_val) => {
                 if expiring_val.expiry > now {
-                    Ok(Some((expiring_val.value, expiring_val.expiry, source)))
+                    Ok(Some((expiring_val.value, expiring_val.expiry)))
                 } else {
                     let _ = self.inner.delete(key)?;
                     Ok(None)
@@ -127,121 +117,48 @@ where
 }
 
 pub struct Cache<T> {
-    disk_db: Option<RedbStore>,
-    memory_db: Option<Mutex<LruCache<String, T>>>,
+    db: RedbStore,
     table_name_for_disk_db: Box<str>,
+    _marker: PhantomData<T>,
 }
 
 impl<T> Cache<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
 {
-    pub fn new(path: Option<String>, table_name: String, memory_cache_size: usize) -> Result<Self> {
-        // 修复点：只有在 path 为 Some 时才初始化 RedbStore
-        let disk_db = if let Some(p) = path {
-            // 此时 p 是 String，String 实现了 AsRef<Path>，符合 RedbStore::new 的要求
-            Some(RedbStore::new(p)?)
-        } else {
-            None
-        };
-
-        let memory_db = if memory_cache_size > 0 {
-            let cap = NonZeroUsize::new(memory_cache_size).unwrap_or_else(|| {
-                tracing::error!("Invalid memory_cache_size: {}", memory_cache_size);
-                NonZeroUsize::new(1).unwrap()
-            });
-            Some(Mutex::new(LruCache::new(cap)))
-        } else {
-            None
-        };
-
+    pub fn new(path: String, table_name: String) -> Result<Self> {
         Ok(Self {
-            disk_db,
-            memory_db,
+            db: RedbStore::new(path)?,
             table_name_for_disk_db: table_name.into_boxed_str(),
+            _marker: PhantomData,
         })
     }
 
     pub fn new_with_tag(tag: &str, table_name: String) -> Result<Self> {
-        let (path, memory_size) = {
-            let guard = CACHE_MAP
-                .get(tag)
-                .ok_or_else(|| anyhow::anyhow!("can not find cache config for tag: {tag}"))?;
+        let path = CACHE_MAP
+            .get(tag)
+            .ok_or_else(|| anyhow::anyhow!("can not find cache config for tag: {tag}"))?;
 
-            (guard.path.clone(), guard.memory_size)
-        };
-
-        Self::new(path, table_name, memory_size as usize)
+        Self::new(path.value().clone(), table_name)
     }
 
-    pub fn get(&self, key: &str) -> Result<Option<(T, CacheSource)>> {
-        if let Some(mem_db) = &self.memory_db {
-            let mut map = mem_db.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(val) = map.get(key) {
-                return Ok(Some((val.clone(), CacheSource::Memory)));
-            }
-        }
-
-        if let Some(db) = &self.disk_db {
-            if let Some(val) = db.get_entry::<T>(&self.table_name_for_disk_db, key)? {
-                if let Some(mem_db) = &self.memory_db {
-                    let mut map = mem_db.lock().unwrap_or_else(|e| e.into_inner());
-                    map.put(key.to_string(), val.clone());
-                }
-                return Ok(Some((val, CacheSource::Disk)));
-            }
-        }
-
-        Ok(None)
+    pub fn get(&self, key: &str) -> Result<Option<T>> {
+        Ok(self.db.get_entry::<T>(&self.table_name_for_disk_db, key)?)
     }
 
     pub fn delete(&self, key: &str) -> Result<Option<T>> {
-        let mem_res = if let Some(mem_db) = &self.memory_db {
-            let mut map = mem_db.lock().unwrap_or_else(|e| e.into_inner());
-            map.pop(key)
-        } else {
-            None
-        };
-
-        let db_res = if let Some(db) = &self.disk_db {
-            db.delete_entry(&self.table_name_for_disk_db, key)?
-        } else {
-            None
-        };
-
-        if let Some(val) = mem_res {
-            Ok(Some(val))
-        } else {
-            Ok(db_res)
-        }
+        Ok(self
+            .db
+            .delete_entry::<T>(&self.table_name_for_disk_db, key)?)
     }
 
     pub fn set(&self, key: &str, value: &T) -> Result<()> {
-        if let Some(mem_db) = &self.memory_db {
-            let mut map = mem_db.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(existing) = map.get_mut(key) {
-                *existing = value.clone();
-            } else {
-                map.put(key.to_string(), value.clone());
-            }
-        }
-
-        if let Some(db) = &self.disk_db {
-            db.set_entry(&self.table_name_for_disk_db, key, value)?;
-        }
+        self.db
+            .set_entry(&self.table_name_for_disk_db, key, value)?;
         Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<(String, T)>> {
-        if let Some(db) = &self.disk_db {
-            Ok(db.get_all_entries(&self.table_name_for_disk_db)?)
-        } else if let Some(mem_db) = &self.memory_db {
-            let map = mem_db.lock().unwrap_or_else(|e| e.into_inner());
-            let mut result = Vec::with_capacity(map.len());
-            result.extend(map.iter().map(|(k, v)| (k.clone(), v.clone())));
-            Ok(result)
-        } else {
-            Ok(Vec::new())
-        }
+        Ok(self.db.get_all_entries::<T>(&self.table_name_for_disk_db)?)
     }
 }

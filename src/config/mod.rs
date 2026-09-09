@@ -47,12 +47,7 @@ fn required_credentials<'a>(
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CacheConfig {
-    #[serde(
-        default = "default_cache_size",
-        alias = "memory_size",
-        alias = "menmory_size"
-    )]
-    pub memory_size: u64,
+    /// redb 数据库文件路径。必填：热数据由 redb 内置页缓存驻留内存。
     pub path: Option<String>,
 }
 

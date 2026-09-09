@@ -92,11 +92,10 @@ impl Geoip {
         let key = addr.host();
 
         if let Some(cache) = &self.cache {
-            if let Ok(Some((res, remaining_ttl, source))) = cache.get(&key) {
+            if let Ok(Some((res, remaining_ttl))) = cache.get(&key) {
                 let remaining = Duration::from_secs(remaining_ttl.saturating_sub(now_timestamp()));
                 info!(
-                    "Cache HIT from {:?} for {}({})[{}], cost: {}",
-                    source,
+                    "Cache HIT for {}({})[{}], cost: {}",
                     key,
                     res,
                     format_duration(remaining),

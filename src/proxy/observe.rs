@@ -376,12 +376,29 @@ impl Observer {
     }
 
     #[cfg(test)]
+    fn test_cache_db_path() -> String {
+        use std::sync::atomic::AtomicUsize;
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir()
+            .join(format!(
+                "quicproxy-observe-test-{}-{}.db",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_for_test() -> Arc<Self> {
         Arc::new(Self {
             inbounds: DashMap::new(),
             outbounds: DashMap::new(),
-            realip2domain: Cache::new(None, "observe:test:realip2domain".to_string(), 0)
-                .expect("create observer test cache"),
+            realip2domain: Cache::new(
+                Self::test_cache_db_path(),
+                "observe:test:realip2domain".to_string(),
+            )
+            .expect("create observer test cache"),
             global_stats: Arc::new(Stats::default()),
             connections: DashMap::new(),
             dst_traffic: DashMap::new(),
@@ -421,7 +438,7 @@ impl Observer {
             .get(&addr.ip().to_string())
             .ok()
             .flatten()
-            .and_then(|(domain, _)| {
+            .and_then(|domain| {
                 let domain = domain.trim();
                 (!domain.is_empty()).then(|| format!("{}:{}", domain, addr.port()))
             })
@@ -615,6 +632,10 @@ impl Observer {
         if let Some(node) = self.outbounds.get(tag) {
             node.stats.add_traffic(upload, download);
         }
+    }
+
+    pub(crate) fn global_stats_arc(&self) -> Arc<Stats> {
+        self.global_stats.clone()
     }
 
     pub fn update_global_traffic(&self, upload: u64, download: u64) {

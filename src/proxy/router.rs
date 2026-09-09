@@ -779,13 +779,13 @@ impl Router {
                         None
                     };
 
-                    let wrapped = ObservedPacket {
-                        inner: out_packet,
-                        observer: obs.clone(),
-                        tracker: tracker_arc,
-                        outbound_tag: stats_tag,
+                    let wrapped = ObservedPacket::new(
+                        out_packet,
+                        obs.clone(),
+                        tracker_arc,
+                        stats_tag,
                         extra_outbound_tag,
-                    };
+                    );
                     Ok((Arc::new(wrapped), final_target))
                 } else {
                     Ok((out_packet, final_target))
