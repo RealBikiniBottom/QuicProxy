@@ -436,6 +436,7 @@ fn setup_cache_for_tag(temp_dir: &TempDir, tag: &str) {
         tag.to_string(),
         CacheConfig {
             path: Some(db_path.to_string_lossy().to_string()),
+            ..Default::default()
         },
     );
     cache::init_cache(&config).expect("failed to initialize test cache");

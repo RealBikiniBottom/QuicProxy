@@ -51,7 +51,7 @@
   },
   "cache": {
     "all_cache": {
-      "memory_size": 1000,
+      "memory_size_mb": 10,
       "path": "server_cache.db"
     }
   },

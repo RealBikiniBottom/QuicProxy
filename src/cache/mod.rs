@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use dashmap::DashMap;
 use redb_store::RedbStore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -6,13 +6,15 @@ use std::marker::PhantomData;
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::Config;
+use crate::config::{CacheConfig, Config};
 use crate::utils::now_timestamp;
 
 mod redb_store;
 
-/// cache tag -> redb 数据库文件路径
-static CACHE_MAP: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
+pub use redb_store::DEFAULT_MEMORY_SIZE_MB;
+
+/// cache tag -> cache config
+static CACHE_MAP: LazyLock<DashMap<String, CacheConfig>> = LazyLock::new(DashMap::new);
 
 /// 关闭所有缓存数据库，释放文件锁，避免进程重启时卡死。
 pub fn shutdown_cache() {
@@ -21,13 +23,12 @@ pub fn shutdown_cache() {
 
 pub fn init_cache(cfg: &Config) -> Result<()> {
     for (name, item) in cfg.cache.iter() {
-        let path = item.path.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "cache '{name}' must configure `path`: memory-only cache is not supported, \
-                 redb's built-in page cache keeps hot data in memory"
-            )
-        })?;
-        CACHE_MAP.insert(name.clone(), path.to_string());
+        ensure!(
+            item.path.is_some(),
+            "cache '{name}' must configure `path`: memory-only cache is not supported, \
+             redb's built-in page cache keeps hot data in memory"
+        );
+        CACHE_MAP.insert(name.clone(), item.clone());
     }
     Ok(())
 }
@@ -46,9 +47,9 @@ impl<T> CacheWithExpire<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
 {
-    pub fn new(path: String, table_name: String) -> Result<Self> {
+    pub fn new(path: String, table_name: String, memory_size_mb: usize) -> Result<Self> {
         Ok(Self {
-            inner: Cache::new(path, table_name)?,
+            inner: Cache::new(path, table_name, memory_size_mb)?,
         })
     }
 
@@ -126,39 +127,39 @@ impl<T> Cache<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
 {
-    pub fn new(path: String, table_name: String) -> Result<Self> {
+    pub fn new(path: String, table_name: String, memory_size_mb: usize) -> Result<Self> {
         Ok(Self {
-            db: RedbStore::new(path)?,
+            db: RedbStore::with_cache_size(path, memory_size_mb)?,
             table_name_for_disk_db: table_name.into_boxed_str(),
             _marker: PhantomData,
         })
     }
 
     pub fn new_with_tag(tag: &str, table_name: String) -> Result<Self> {
-        let path = CACHE_MAP
+        let config = CACHE_MAP
             .get(tag)
+            .map(|item| item.value().clone())
             .ok_or_else(|| anyhow::anyhow!("can not find cache config for tag: {tag}"))?;
+        let path = config
+            .path
+            .ok_or_else(|| anyhow::anyhow!("cache '{tag}' must configure `path`"))?;
 
-        Self::new(path.value().clone(), table_name)
+        Self::new(path, table_name, config.memory_size_mb)
     }
 
     pub fn get(&self, key: &str) -> Result<Option<T>> {
-        Ok(self.db.get_entry::<T>(&self.table_name_for_disk_db, key)?)
+        self.db.get_entry::<T>(&self.table_name_for_disk_db, key)
     }
 
     pub fn delete(&self, key: &str) -> Result<Option<T>> {
-        Ok(self
-            .db
-            .delete_entry::<T>(&self.table_name_for_disk_db, key)?)
+        self.db.delete_entry::<T>(&self.table_name_for_disk_db, key)
     }
 
     pub fn set(&self, key: &str, value: &T) -> Result<()> {
-        self.db
-            .set_entry(&self.table_name_for_disk_db, key, value)?;
-        Ok(())
+        self.db.set_entry(&self.table_name_for_disk_db, key, value)
     }
 
     pub fn list(&self) -> Result<Vec<(String, T)>> {
-        Ok(self.db.get_all_entries::<T>(&self.table_name_for_disk_db)?)
+        self.db.get_all_entries::<T>(&self.table_name_for_disk_db)
     }
 }

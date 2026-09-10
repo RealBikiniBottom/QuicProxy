@@ -596,7 +596,7 @@ JSON5EOF
   },
   "cache": {
     "all_cache": {
-      "memory_size": 1000,
+      "memory_size_mb": 10,
       "path": "${INSTALL_DIR}/server_cache.db"
     }
   },

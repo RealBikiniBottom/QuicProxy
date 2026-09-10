@@ -47,8 +47,24 @@ fn required_credentials<'a>(
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CacheConfig {
-    /// redb 数据库文件路径。必填：热数据由 redb 内置页缓存驻留内存。
+    /// redb database file path. Required: hot data lives in redb's built-in page cache.
     pub path: Option<String>,
+    /// redb page cache budget in MB.
+    #[serde(default = "default_memory_size_mb")]
+    pub memory_size_mb: usize,
+}
+
+fn default_memory_size_mb() -> usize {
+    crate::cache::DEFAULT_MEMORY_SIZE_MB
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            memory_size_mb: default_memory_size_mb(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -607,7 +623,8 @@ impl Default for RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{DnsConfig, InboundConfig, OutboundConfig, duration_from_secs_or};
+    use super::{CacheConfig, DnsConfig, InboundConfig, OutboundConfig, duration_from_secs_or};
+    use crate::cache::DEFAULT_MEMORY_SIZE_MB;
     use serde_json::json;
     use std::time::Duration;
 
@@ -620,6 +637,16 @@ mod tests {
             Duration::from_secs(12)
         );
         assert_eq!(duration_from_secs_or(None, default), default);
+    }
+
+    #[test]
+    fn cache_config_memory_size_defaults_and_can_be_overridden() {
+        let default: CacheConfig = serde_json::from_value(json!({ "path": "cache.db" })).unwrap();
+        assert_eq!(default.memory_size_mb, DEFAULT_MEMORY_SIZE_MB);
+
+        let configured: CacheConfig =
+            serde_json::from_value(json!({ "path": "cache.db", "memory_size_mb": 64 })).unwrap();
+        assert_eq!(configured.memory_size_mb, 64);
     }
 
     #[test]

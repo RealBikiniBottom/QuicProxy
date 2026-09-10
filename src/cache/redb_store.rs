@@ -1,104 +1,58 @@
+use anyhow::{Context, Result, bail};
 use dashmap::DashMap;
-use redb::{Database, Error, ReadableDatabase, ReadableTable, TableDefinition, TableError};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableError};
 use serde::{Serialize, de::DeserializeOwned};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
-pub static REDB_CACHE: LazyLock<DashMap<PathBuf, Arc<Database>>> = LazyLock::new(DashMap::new);
+static REDB_CACHE: LazyLock<DashMap<PathBuf, Arc<Database>>> = LazyLock::new(DashMap::new);
 
-/// redb 页缓存大小的默认值，单位 MiB。
-///
-/// redb 的内部页缓存按字节预算配置（`Builder::set_cache_size`，默认 1 GiB）。
-/// 这里把默认预算收敛为 1 MiB，热数据页驻留内存以加速读取；
-/// 需要更大/更小预算时用 [`RedbStore::with_cache_size`] 指定。
-pub const DEFAULT_CACHE_SIZE_MIB: usize = 1;
+pub const DEFAULT_MEMORY_SIZE_MB: usize = 1;
+
+const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct RedbStore {
     db: Arc<Database>,
 }
 
-/// 显式关闭并释放所有 redb 数据库连接。
-/// 调用前应确保所有持有 RedbStore 的静态变量（如 DNS_MAP）已被清空。
 pub fn shutdown_redb() {
     REDB_CACHE.clear();
 }
 
-#[allow(dead_code)]
 impl RedbStore {
-    /// 使用默认页缓存大小（[`DEFAULT_CACHE_SIZE_MIB`] MiB）打开数据库。
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        Self::with_cache_size(path, DEFAULT_CACHE_SIZE_MIB)
-    }
-
-    /// 以指定的页缓存大小（单位 MiB）打开数据库。
-    ///
-    /// 注意：同一路径的数据库会按路径复用（`REDB_CACHE`），
-    /// 页缓存大小只在首次打开时生效，后续打开同路径会忽略该参数。
-    pub fn with_cache_size<P: AsRef<Path>>(path: P, cache_size_mib: usize) -> Result<Self, Error> {
-        let path = path.as_ref();
-
-        // Resolve absolute path consistently, regardless of whether file exists
-        // Canonicalize parent dir if possible, then join filename
-        let key = if let Some(parent) = path.parent() {
-            match parent.canonicalize() {
-                Ok(p) => p.join(path.file_name().unwrap_or_default()),
-                Err(_) => {
-                    if let Ok(cwd) = std::env::current_dir() {
-                        cwd.join(path)
-                    } else {
-                        path.to_path_buf()
-                    }
-                }
-            }
-        } else {
-            if let Ok(cwd) = std::env::current_dir() {
-                cwd.join(path)
-            } else {
-                path.to_path_buf()
-            }
-        };
+    pub fn with_cache_size(path: String, memory_size_mb: usize) -> Result<Self> {
+        let key = resolve_db_path(&path);
         if let Some(db) = REDB_CACHE.get(&key) {
             return Ok(Self { db: db.clone() });
         }
 
-        // redb 在 Linux 上使用 flock，正常退出时通过 shutdown_cache() → REDB_CACHE.clear()
-        // 释放所有 Database 引用，lock 会被释放。以下超时机制仅作为保险：
-        // 应对 SIGKILL / panic 在 shutdown 之前 / OOM killer 等极端情况下残留的文件锁。
-        let path_owned = key.clone();
-        let cache_size = cache_size_mib.saturating_mul(1024 * 1024);
+        // redb holds an exclusive file lock (flock on Linux). shutdown_cache() clears
+        // REDB_CACHE so the lock is released on a clean exit; the timeout below only guards
+        // against a lock left behind by SIGKILL, a panic before shutdown or the OOM killer.
+        let cache_size_bytes = memory_size_mb.saturating_mul(1024 * 1024);
         let (tx, rx) = std::sync::mpsc::channel();
+        let db_path = key.clone();
         std::thread::spawn(move || {
-            // redb 页缓存预算按 set_cache_size 设置（字节），热数据页驻留内存以加速读取。
-            let result = redb::Builder::new()
-                .set_cache_size(cache_size)
-                .create(&path_owned);
-            let _ = tx.send(result);
+            // Page cache budget in bytes; hot pages stay resident in memory.
+            let db = redb::Builder::new()
+                .set_cache_size(cache_size_bytes)
+                .create(&db_path);
+            let _ = tx.send(db);
         });
 
-        let db = match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        let db = match rx.recv_timeout(OPEN_TIMEOUT) {
             Ok(Ok(db)) => db,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                tracing::warn!(
-                    "redb database {:?} is locked by another process. \
-                     If no other instance is running, delete this file manually.",
-                    path
-                );
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "redb database {:?} is locked by another process. \
-                             If no other instance is running, delete this file manually.",
-                        path
-                    ),
-                )));
+            Ok(Err(e)) => {
+                return Err(e).context(format!("failed to open redb database {path:?}"));
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "redb worker thread panicked",
-                )));
-            }
+            Err(RecvTimeoutError::Timeout) => bail!(
+                "opening redb database {path:?} timed out after {OPEN_TIMEOUT:?}: the file is \
+                 locked by another process. If no other instance is running, delete this file \
+                 manually."
+            ),
+            Err(RecvTimeoutError::Disconnected) => bail!("redb worker thread panicked"),
         };
 
         let arc_db = Arc::new(db);
@@ -107,28 +61,19 @@ impl RedbStore {
         Ok(Self { db: arc_db })
     }
 
-    pub fn set_entry<T: Serialize>(
-        &self,
-        table_name: &str,
-        key: &str,
-        value: &T,
-    ) -> Result<(), Error> {
+    pub fn set_entry<T: Serialize>(&self, table_name: &str, key: &str, value: &T) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let def = TableDefinition::<&str, &[u8]>::new(table_name);
             let mut table = write_txn.open_table(def)?;
-            let bytes = serde_json::to_vec(value).map_err(|e| Error::Corrupted(e.to_string()))?;
+            let bytes = serde_json::to_vec(value)?;
             table.insert(key, bytes.as_slice())?;
         }
         write_txn.commit()?;
         Ok(())
     }
 
-    pub fn get_entry<T: DeserializeOwned>(
-        &self,
-        table_name: &str,
-        key: &str,
-    ) -> Result<Option<T>, Error> {
+    pub fn get_entry<T: DeserializeOwned>(&self, table_name: &str, key: &str) -> Result<Option<T>> {
         let read_txn = self.db.begin_read()?;
         let def = TableDefinition::<&str, &[u8]>::new(table_name);
         let table = match read_txn.open_table(def) {
@@ -136,13 +81,8 @@ impl RedbStore {
             Err(TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let result = table.get(key)?;
-        match result {
-            Some(access_guard) => {
-                let val = serde_json::from_slice(access_guard.value())
-                    .map_err(|e| Error::Corrupted(e.to_string()))?;
-                Ok(Some(val))
-            }
+        match table.get(key)? {
+            Some(guard) => Ok(Some(serde_json::from_slice(guard.value())?)),
             None => Ok(None),
         }
     }
@@ -151,29 +91,24 @@ impl RedbStore {
         &self,
         table_name: &str,
         key: &str,
-    ) -> Result<Option<T>, Error> {
+    ) -> Result<Option<T>> {
         let write_txn = self.db.begin_write()?;
-        let res = {
+        let value = {
             let def = TableDefinition::<&str, &[u8]>::new(table_name);
             let mut table = write_txn.open_table(def)?;
-            let v = table.remove(key)?;
-            match v {
-                Some(guard) => {
-                    let val = serde_json::from_slice(guard.value())
-                        .map_err(|e| Error::Corrupted(e.to_string()))?;
-                    Some(val)
-                }
+            match table.remove(key)? {
+                Some(guard) => Some(serde_json::from_slice(guard.value())?),
                 None => None,
             }
         };
         write_txn.commit()?;
-        Ok(res)
+        Ok(value)
     }
 
     pub fn get_all_entries<T: DeserializeOwned>(
         &self,
         table_name: &str,
-    ) -> Result<Vec<(String, T)>, Error> {
+    ) -> Result<Vec<(String, T)>> {
         let read_txn = self.db.begin_read()?;
         let def = TableDefinition::<&str, &[u8]>::new(table_name);
         let table = match read_txn.open_table(def) {
@@ -182,87 +117,26 @@ impl RedbStore {
             Err(e) => return Err(e.into()),
         };
 
-        // Pre-allocate with estimated capacity to reduce reallocations
-        let mut result = Vec::with_capacity(64);
+        let mut entries = Vec::new();
         for item in table.iter()? {
             let (key, value) = item?;
-            // Avoid to_string() - use to_owned() which is clearer for str -> String
-            let key_str = key.value().to_owned();
-            let val: T = serde_json::from_slice(value.value())
-                .map_err(|e| Error::Corrupted(e.to_string()))?;
-            result.push((key_str, val));
+            entries.push((
+                key.value().to_owned(),
+                serde_json::from_slice(value.value())?,
+            ));
         }
-        // Shrink to fit actual size to free unused memory
-        result.shrink_to_fit();
-        Ok(result)
+        Ok(entries)
     }
+}
 
-    pub fn set_string(&self, table_name: &str, key: &str, value: &str) -> Result<(), Error> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let def = TableDefinition::<&str, &str>::new(table_name);
-            let mut table = write_txn.open_table(def)?;
-            table.insert(key, value)?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    pub fn get_string(&self, table_name: &str, key: &str) -> Result<Option<String>, Error> {
-        let read_txn = self.db.begin_read()?;
-        let def = TableDefinition::<&str, &str>::new(table_name);
-        let table = read_txn.open_table(def)?;
-        let result = table.get(key)?;
-        match result {
-            Some(access_guard) => Ok(Some(access_guard.value().to_string())),
-            None => Ok(None),
-        }
-    }
-
-    pub fn set_bytes(&self, table_name: &str, key: &str, value: &[u8]) -> Result<(), Error> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let def = TableDefinition::<&str, &[u8]>::new(table_name);
-            let mut table = write_txn.open_table(def)?;
-            table.insert(key, value)?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    pub fn get_bytes(&self, table_name: &str, key: &str) -> Result<Option<Vec<u8>>, Error> {
-        let read_txn = self.db.begin_read()?;
-        let def = TableDefinition::<&str, &[u8]>::new(table_name);
-        let table = read_txn.open_table(def)?;
-        let result = table.get(key)?;
-        match result {
-            // Use to_owned() instead of to_vec() for clarity (same performance)
-            Some(access_guard) => Ok(Some(access_guard.value().to_owned())),
-            None => Ok(None),
-        }
-    }
-
-    pub fn delete_string(&self, table_name: &str, key: &str) -> Result<Option<String>, Error> {
-        let write_txn = self.db.begin_write()?;
-        let res = {
-            let def = TableDefinition::<&str, &str>::new(table_name);
-            let mut table = write_txn.open_table(def)?;
-            let v = table.remove(key)?;
-            v.map(|guard| guard.value().to_string())
-        };
-        write_txn.commit()?;
-        Ok(res)
-    }
-
-    pub fn delete_bytes(&self, table_name: &str, key: &str) -> Result<Option<Vec<u8>>, Error> {
-        let write_txn = self.db.begin_write()?;
-        let res = {
-            let def = TableDefinition::<&str, &[u8]>::new(table_name);
-            let mut table = write_txn.open_table(def)?;
-            let v = table.remove(key)?;
-            v.map(|guard| guard.value().to_owned())
-        };
-        write_txn.commit()?;
-        Ok(res)
+/// Resolve `path` against the current directory so that the same database file always maps to
+/// the same cache key, no matter how the configured path was spelled.
+fn resolve_db_path(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    match path.parent().and_then(|parent| parent.canonicalize().ok()) {
+        Some(parent) => parent.join(path.file_name().unwrap_or_default()),
+        None => std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf()),
     }
 }

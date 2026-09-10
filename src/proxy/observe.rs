@@ -397,6 +397,7 @@ impl Observer {
             realip2domain: Cache::new(
                 Self::test_cache_db_path(),
                 "observe:test:realip2domain".to_string(),
+                1,
             )
             .expect("create observer test cache"),
             global_stats: Arc::new(Stats::default()),

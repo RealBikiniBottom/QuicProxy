@@ -264,7 +264,7 @@
   },
   "cache": {
     "all_cache": {
-      "memory_size": 0,
+      "memory_size_mb": 0,
       "path": "test_cache.db"
     }
   },
