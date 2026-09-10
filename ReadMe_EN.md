@@ -65,6 +65,7 @@ Outbound:
 - Trojan
 - Shadowsocks
 - Vmess
+- Hysteria2
 
 ## Zero Latency Throughout
 

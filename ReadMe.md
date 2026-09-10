@@ -67,6 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/s
 - Trojan
 - Shadowsocks
 - Vmess
+- Hysteria2
 
 ## 全程零延迟
 
