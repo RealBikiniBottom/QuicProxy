@@ -38,7 +38,7 @@ pub fn get_memory_usage() -> Option<u64> {
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn get_memory_usage() -> Option<u64> {
     use std::fs;
 
@@ -55,76 +55,6 @@ pub fn get_memory_usage() -> Option<u64> {
         return Some(rss_pages * page_size as u64);
     }
     None
-}
-
-#[cfg(target_os = "android")]
-pub mod android_alloc {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    pub struct TrackingAllocator {
-        pub allocated: AtomicUsize,
-        pub freed: AtomicUsize,
-    }
-
-    impl TrackingAllocator {
-        pub const fn new() -> Self {
-            TrackingAllocator {
-                allocated: AtomicUsize::new(0),
-                freed: AtomicUsize::new(0),
-            }
-        }
-
-        pub fn current_usage(&self) -> usize {
-            let allocated = self.allocated.load(Ordering::Relaxed);
-            let freed = self.freed.load(Ordering::Relaxed);
-            if allocated > freed {
-                allocated - freed
-            } else {
-                0
-            }
-        }
-    }
-
-    unsafe impl GlobalAlloc for TrackingAllocator {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let ptr = unsafe { System.alloc(layout) };
-            if !ptr.is_null() {
-                self.allocated.fetch_add(layout.size(), Ordering::Relaxed);
-            }
-            ptr
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe { System.dealloc(ptr, layout) };
-            self.freed.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            let ptr = unsafe { System.alloc_zeroed(layout) };
-            if !ptr.is_null() {
-                self.allocated.fetch_add(layout.size(), Ordering::Relaxed);
-            }
-            ptr
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-            if !new_ptr.is_null() {
-                self.freed.fetch_add(layout.size(), Ordering::Relaxed);
-                self.allocated.fetch_add(new_size, Ordering::Relaxed);
-            }
-            new_ptr
-        }
-    }
-
-    #[global_allocator]
-    pub static ALLOCATOR: TrackingAllocator = TrackingAllocator::new();
-}
-
-#[cfg(target_os = "android")]
-pub fn get_memory_usage() -> Option<u64> {
-    Some(android_alloc::ALLOCATOR.current_usage() as u64)
 }
 
 #[cfg(target_os = "windows")]
