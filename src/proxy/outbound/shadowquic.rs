@@ -6,7 +6,7 @@ use crate::proxy::shadowquic_udp::{
 use crate::utils::interface::InterfaceManager;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 use crate::utils::quic_wrap::quinn_wrap::QuinnClient;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use std::sync::Arc;
@@ -21,7 +21,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::config::OutboundConfig;
-use crate::proxy::outbound::{AnyOutbound, AnyStream, LazyHandshakeStream, UdpMode};
+use crate::proxy::outbound::{
+    AnyOutbound, AnyStream, LazyHandshakeStream, UdpMode, get_outbound_by_tag,
+    report_outbound_unhealthy,
+};
 use crate::proxy::{TargetAddr, TlsConfig};
 
 use crate::utils::{format_duration, new_io_other_error};
@@ -29,6 +32,21 @@ use crate::utils::{format_duration, new_io_other_error};
 use super::AnyPacket;
 
 const DOWNLINK_STATS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bounded wait for the liveness probe. A black-holed path never answers, so
+/// this is what a dead connection costs before the caller can fail over. It
+/// scales with the last known RTT so a slow (but healthy) path is not killed by
+/// a too aggressive deadline.
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+const LIVENESS_PROBE_MAX_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `Conn(GetConnStats)` extension request used both for downlink stats and as a
+/// liveness probe: any answer proves the peer received our packet.
+// 0xFF (SQReq::SQExtension) | u64 BE 1 (SQExtOpcode::Conn) | 0x00 (GetConnStats)
+const SQ_CONN_STATS_REQUEST: [u8; 10] = [0xFF, 0, 0, 0, 0, 0, 0, 0, 1, 0x00];
+
+const CONN_UNHEALTHY_CLOSE_CODE: u32 = 1;
+const CONN_UNHEALTHY_REASON: &[u8] = b"connection unhealthy";
 
 /// Serialized `TargetAddr::dummy()`, sent as the placeholder target in the UDP
 /// session handshake (cmd 0x03/0x04).
@@ -166,35 +184,111 @@ impl ShadowQuicOutbound {
     /// Clear the cached connection, but only if it is still the one that
     /// failed: a concurrent caller may have already replaced it with a fresh
     /// connection, which must not be evicted.
-    async fn clear_cached_conn(&self, failed: &quinn::Connection) {
+    ///
+    /// `close` additionally closes the connection instead of only dropping the
+    /// cache entry. Sessions spawned earlier hold their own `Arc` clone, so an
+    /// unhealthy connection would otherwise stay usable (and keep black-holing
+    /// traffic) until every one of them gives up.
+    async fn clear_cached_conn(&self, failed: &quinn::Connection, close: bool) {
         let mut lock = self.cached_client.lock().await;
         let is_failed = matches!(
             &*lock,
             Some((conn, _, _)) if conn.stable_id() == failed.stable_id()
         );
         if is_failed {
+            if close {
+                failed.close(CONN_UNHEALTHY_CLOSE_CODE.into(), CONN_UNHEALTHY_REASON);
+            }
             *lock = None;
         }
+    }
+
+    /// Report this outbound as unreachable so the UI marks it down and any
+    /// selector owning it re-tests (and switches) promptly.
+    fn report_unhealthy(&self) {
+        match get_outbound_by_tag(self.tag()) {
+            Ok(outbound) => report_outbound_unhealthy(&outbound),
+            Err(e) => warn!(
+                "[{}] failed to report unhealthy outbound: {}",
+                self.tag(),
+                e
+            ),
+        }
+    }
+
+    /// True when the connection can still carry traffic. Reused connections are
+    /// only probed when their receive counters went quiet, so the common case
+    /// pays nothing.
+    async fn is_healthy(&self, conn: &quinn::Connection, state: &PerConnectionState) -> bool {
+        if !state.liveness.needs_probe(conn) {
+            return true;
+        }
+
+        if self.probe_connection(conn).await {
+            state.liveness.mark_alive();
+            return true;
+        }
+
+        false
+    }
+
+    /// One round trip over the connection. Silence means the path is dead; any
+    /// answer (including a stream reset from a server that does not implement
+    /// the extension) proves the peer is reachable.
+    async fn probe_connection(&self, conn: &quinn::Connection) -> bool {
+        let timeout = (conn.rtt() * 4)
+            .clamp(LIVENESS_PROBE_TIMEOUT, LIVENESS_PROBE_MAX_TIMEOUT)
+            .min(self.connect_timeout);
+        let probe = async {
+            let Ok((mut send, mut recv)) = conn.open_bi().await else {
+                return false;
+            };
+            if send.write_all(&SQ_CONN_STATS_REQUEST).await.is_err() {
+                return false;
+            }
+            if send.flush().await.is_err() {
+                return false;
+            }
+
+            let mut answer = [0u8; 1];
+            match recv.read(&mut answer).await {
+                Ok(_) => true,
+                Err(quinn::ReadError::Reset(_)) => true,
+                Err(e) => {
+                    debug!("[{}] liveness probe failed: {}", self.tag(), e);
+                    false
+                }
+            }
+        };
+
+        tokio::time::timeout(timeout, probe).await.unwrap_or(false)
     }
 
     async fn ensure_connection(
         &self,
     ) -> anyhow::Result<(Arc<quinn::Connection>, Arc<PerConnectionState>)> {
-        // The lock is held across the whole establishment: concurrent callers
-        // wait for one shared handshake instead of racing. If they raced, the
-        // last writer would overwrite the cache and drop the loser's
-        // QuinnClient — dropping it closes the endpoint and tears down
-        // connections that were already handed out to other callers.
         let mut lock = self.cached_client.lock().await;
 
         if let Some((ref conn, _, ref state)) = *lock {
             if conn.close_reason().is_none() {
-                debug!(
-                    "[{}] reuse quic connection {}",
+                if self.is_healthy(conn, state).await {
+                    debug!(
+                        "[{}] reuse quic connection {}",
+                        self.tag(),
+                        conn.stable_id()
+                    );
+                    return Ok((conn.clone(), state.clone()));
+                }
+
+                warn!(
+                    "[{}] quic connection {} stopped receiving traffic, closing it",
                     self.tag(),
                     conn.stable_id()
                 );
-                return Ok((conn.clone(), state.clone()));
+                conn.close(CONN_UNHEALTHY_CLOSE_CODE.into(), CONN_UNHEALTHY_REASON);
+                *lock = None;
+                self.report_unhealthy();
+                bail!("[{}] ShadowQuic connection is not responding", self.tag());
             }
             info!(
                 "[{}] exists connection closed: {:?}",
@@ -217,6 +311,7 @@ impl ShadowQuicOutbound {
             }
             Err(e) => {
                 *lock = None;
+                self.report_unhealthy();
                 Err(e)
             }
         }
@@ -347,13 +442,24 @@ impl ShadowQuicOutbound {
                     e
                 );
 
-                self.clear_cached_conn(&conn).await;
+                self.clear_cached_conn(&conn, true).await;
 
                 let (retry_conn, retry_state) = self.ensure_connection().await?;
 
-                let stream = open(retry_conn.clone()).await.with_context(|| {
-                    format!("failed to open {} stream after reconnection", kind)
-                })?;
+                let stream = match open(retry_conn.clone()).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        // A freshly established connection failing right away is a
+                        // node level failure, not a stale cache entry.
+                        self.clear_cached_conn(&retry_conn, true).await;
+                        self.report_unhealthy();
+                        return Err(anyhow::Error::new(e).context(format!(
+                            "[{}] failed to open {} stream after reconnection",
+                            self.tag(),
+                            kind
+                        )));
+                    }
+                };
 
                 Ok((retry_conn, stream, retry_state))
             }
@@ -405,7 +511,9 @@ impl ShadowQuicOutbound {
                 self.tag(),
                 used
             );
-            self.clear_cached_conn(&conn).await;
+            // The connection itself is healthy, sessions already running on it
+            // must keep working, so it is only evicted from the cache.
+            self.clear_cached_conn(&conn, false).await;
         }
 
         anyhow::bail!(
@@ -453,14 +561,7 @@ impl ShadowQuicOutbound {
         let result = tokio::time::timeout(DOWNLINK_STATS_TIMEOUT, async {
             let (mut send, mut recv) = conn.open_bi().await?;
 
-            // SQReq::SQExtension tag (u8)
-            // SQExtOpcode::Conn tag (u64 BE, value = 1)
-            // ExtOpcodeConn::GetConnStats tag (u8)
-            let mut req = [0u8; 10];
-            req[0] = 0xFF;
-            req[1..9].copy_from_slice(&1u64.to_be_bytes());
-            req[9] = 0x00;
-            send.write_all(&req).await?;
+            send.write_all(&SQ_CONN_STATS_REQUEST).await?;
             send.flush().await?;
             let _ = send.finish();
 

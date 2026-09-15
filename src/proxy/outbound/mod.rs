@@ -37,6 +37,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinSet;
+use tracing::debug;
 use tracing::{info, warn};
 use trojan::TrojanOutbound;
 use vmess::VmessOutbound;
@@ -126,6 +127,70 @@ pub fn init_outbounds(cfg: &Config) -> anyhow::Result<()> {
 /// Selectors may own persistent cache handles.
 pub fn shutdown_outbounds() {
     OUTBOUNDS_MAP.clear();
+}
+
+/// Minimum gap between selector re-tests forced by outbound failures: a burst of
+/// failing requests must not each start a full latency test round.
+const FORCED_TEST_DEBOUNCE: Duration = Duration::from_secs(5);
+
+static LAST_FORCED_TEST: LazyLock<DashMap<String, tokio::time::Instant>> =
+    LazyLock::new(DashMap::new);
+
+/// Called when an outbound turned out to be unusable (dead QUIC path, failed
+/// handshake, ...). Marks it as unreachable for the UI and asks every selector
+/// owning it to re-test, so a urltest switches to a working node right away
+/// instead of at the next periodic test.
+pub fn report_outbound_unhealthy(outbound: &Arc<dyn AnyOutbound>) {
+    let tag = outbound.tag().to_string();
+
+    if let Some(observer) = get_observer() {
+        observer.update_outbound_trace(outbound.clone(), -1, "", "", None, None);
+    }
+
+    let now = tokio::time::Instant::now();
+    let tested_recently = LAST_FORCED_TEST
+        .get(&tag)
+        .map(|last| now.duration_since(*last) < FORCED_TEST_DEBOUNCE)
+        .unwrap_or(false);
+    if tested_recently {
+        return;
+    }
+    LAST_FORCED_TEST.insert(tag.clone(), now);
+
+    let selectors: Vec<Arc<dyn AnyOutbound>> = OUTBOUNDS_MAP
+        .iter()
+        .filter(|entry| {
+            entry
+                .value()
+                .as_selector()
+                .map(|selector| {
+                    selector
+                        .get_outbound_tags()
+                        .iter()
+                        .any(|child| child == &tag)
+                })
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.value().clone())
+        .collect();
+
+    if selectors.is_empty() {
+        return;
+    }
+
+    debug!(
+        "outbound [{}] reported unhealthy, re-testing {} selector(s)",
+        tag,
+        selectors.len()
+    );
+
+    shutdown::spawn(async move {
+        for outbound in selectors {
+            if let Some(selector) = outbound.as_selector() {
+                selector.check_all().await;
+            }
+        }
+    });
 }
 
 /// 在后台执行所有 selector 的首次测速，再进入周期测速，不阻塞应用启动。

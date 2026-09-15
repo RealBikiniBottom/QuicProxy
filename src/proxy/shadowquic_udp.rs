@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,6 +26,7 @@ use crate::utils::format_duration;
 use crate::utils::keyed_notify::KeyedNotify;
 use crate::utils::new_io_other_error;
 use crate::utils::now;
+use crate::utils::now_millis;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 
 use super::SourceAddr;
@@ -47,7 +49,74 @@ const MAX_WAITING_DATAGRAM_CONTEXTS: usize = 1024;
 /// mid-flight, which would otherwise close the whole QUIC connection.
 pub const UDP_CONTEXT_ID_RECONNECT_MARGIN: u32 = 256;
 
+/// No packet received from the peer for this long means the path is suspect,
+/// even if the connection is idle: keep-alive is enabled on the client (at most
+/// every 5s), so a healthy path keeps producing ACKs and a single lost
+/// keep-alive cannot trigger a probe.
+const LIVENESS_IDLE: Duration = Duration::from_secs(10);
+
+/// When traffic is flowing (we keep sending) but nothing comes back, the path is
+/// suspect much sooner than [LIVENESS_IDLE].
+const LIVENESS_SILENCE: Duration = Duration::from_secs(1);
+
+/// Tracks whether a cached QUIC connection still receives anything from the
+/// peer. `Connection::open_bi` succeeds on a black-holed path, so stream
+/// opening alone says nothing about liveness; the UDP counters do.
+pub struct PathLiveness {
+    last_rx: AtomicU64,
+    last_tx: AtomicU64,
+    last_alive_at: AtomicU64,
+}
+
+impl PathLiveness {
+    pub fn new() -> Self {
+        Self {
+            last_rx: AtomicU64::new(0),
+            last_tx: AtomicU64::new(0),
+            last_alive_at: AtomicU64::new(now_millis()),
+        }
+    }
+
+    pub fn mark_alive(&self) {
+        self.last_alive_at.store(now_millis(), Ordering::Relaxed);
+    }
+
+    /// Feed the current UDP counters in and tell whether the connection looks
+    /// suspicious enough to require an explicit round-trip probe.
+    pub fn observe(&self, rx_datagrams: u64, tx_datagrams: u64) -> bool {
+        self.observe_at(rx_datagrams, tx_datagrams, now_millis())
+    }
+
+    fn observe_at(&self, rx_datagrams: u64, tx_datagrams: u64, now: u64) -> bool {
+        let prev_rx = self.last_rx.swap(rx_datagrams, Ordering::Relaxed);
+        let prev_tx = self.last_tx.swap(tx_datagrams, Ordering::Relaxed);
+
+        if rx_datagrams > prev_rx {
+            self.last_alive_at.store(now, Ordering::Relaxed);
+            return false;
+        }
+
+        let silent_for =
+            Duration::from_millis(now.saturating_sub(self.last_alive_at.load(Ordering::Relaxed)));
+
+        silent_for >= LIVENESS_IDLE || (silent_for >= LIVENESS_SILENCE && tx_datagrams > prev_tx)
+    }
+
+    /// Sample a live connection and tell whether it needs to be probed.
+    pub fn needs_probe(&self, conn: &quinn::Connection) -> bool {
+        let stats = conn.stats();
+        self.observe(stats.udp_rx.datagrams, stats.udp_tx.datagrams)
+    }
+}
+
+impl Default for PathLiveness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct PerConnectionState {
+    pub liveness: PathLiveness,
     pub next_context_id: Arc<AtomicU32>,
     pub udp_recv_map: UdpRecvMap,
     pub udp_recv_map_notify: Arc<KeyedNotify>,
@@ -58,6 +127,7 @@ impl PerConnectionState {
     pub fn new() -> Self {
         let udp_recv_map: UdpRecvMap = Arc::new(DashMap::new());
         Self {
+            liveness: PathLiveness::new(),
             next_context_id: Arc::new(AtomicU32::new(1)),
             udp_recv_map,
             udp_recv_map_notify: Arc::new(KeyedNotify::new()),
@@ -914,5 +984,38 @@ mod tests {
 
         first.clean();
         assert!(udp_recv_map.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    #[test]
+    fn receiving_packets_never_requires_a_probe() {
+        let liveness = PathLiveness::new();
+
+        assert!(!liveness.observe_at(10, 3, 1_000));
+        assert!(!liveness.observe_at(11, 4, 60_000));
+    }
+
+    #[test]
+    fn silent_path_requires_a_probe_once_idle() {
+        let liveness = PathLiveness::new();
+        assert!(!liveness.observe_at(10, 3, 1_000));
+
+        let idle_deadline = 1_000 + LIVENESS_IDLE.as_millis() as u64;
+        assert!(!liveness.observe_at(10, 3, idle_deadline - 1));
+        assert!(liveness.observe_at(10, 3, idle_deadline));
+    }
+
+    #[test]
+    fn silence_with_outgoing_traffic_is_detected_early() {
+        let liveness = PathLiveness::new();
+        assert!(!liveness.observe_at(10, 3, 1_000));
+
+        let silence = 1_000 + LIVENESS_SILENCE.as_millis() as u64;
+        assert!(!liveness.observe_at(10, 3, silence));
+        assert!(liveness.observe_at(10, 9, silence));
     }
 }

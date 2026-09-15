@@ -41,6 +41,14 @@ pub fn now() -> Instant {
     return std::time::Instant::now();
 }
 
+static PROCESS_START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+/// Monotonic milliseconds since process start, cheap enough to record
+/// per-packet/per-connection timestamps.
+pub fn now_millis() -> u64 {
+    PROCESS_START.elapsed().as_millis() as u64
+}
+
 pub fn now_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
