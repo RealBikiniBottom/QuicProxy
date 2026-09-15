@@ -662,6 +662,56 @@ UNITEOF
   fi
 }
 
+ensure_qrencode() {
+  command -v qrencode &>/dev/null && return 0
+
+  log_info "未检测到 qrencode, 尝试自动安装..."
+  local installer=""
+  for cmd in apt-get dnf yum; do
+    if command -v "$cmd" &>/dev/null; then
+      installer="$cmd"
+      break
+    fi
+  done
+
+  [[ -z "$installer" ]] && return 1
+
+  if [[ "$installer" == "apt-get" ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode &>/dev/null || return 1
+  else
+    "$installer" install -y -q qrencode &>/dev/null || return 1
+  fi
+
+  command -v qrencode &>/dev/null
+}
+
+print_qr_code() {
+  local url="$1"
+  local BOLD_WHITE='\033[1;37m'
+
+  echo ""
+  echo -e "  ${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "  ${YELLOW}║${NC}  ${BOLD_WHITE}📱 shadowquic (IPv4) 二维码${NC}                              ${YELLOW}║${NC}"
+  echo -e "  ${YELLOW}║${NC}  ${CYAN}用客户端扫码即可导入该节点${NC}                                ${YELLOW}║${NC}"
+  echo -e "  ${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+
+  if ! ensure_qrencode; then
+    log_warn "无法安装 qrencode, 跳过二维码显示"
+    log_info "可手动安装后查看: qrencode -t ANSIUTF8 '${url}'"
+    return
+  fi
+
+  if ! qrencode -t ANSIUTF8 -m 2 "$url" 2>/dev/null; then
+    qrencode -t ANSI -m 2 "$url" || {
+      log_warn "二维码生成失败"
+      return
+    }
+  fi
+
+  echo ""
+}
+
 generate_subscription_url() {
   log_step "生成订阅链接..."
 
@@ -678,6 +728,7 @@ generate_subscription_url() {
   local urls=()
   local addresses=()
   local families=()
+  local sq_ipv4_url=""
   [[ -n "${SERVER_IPV4:-}" ]] && addresses+=("${SERVER_IPV4}") && families+=("IPv4")
   [[ -n "${SERVER_IPV6:-}" ]] && addresses+=("${SERVER_IPV6}") && families+=("IPv6")
 
@@ -691,7 +742,9 @@ generate_subscription_url() {
     if $sq_enabled; then
       tag=$(printf "%s-%02d-%s" "${SERVER_COUNTRY}" "${node_num}" "$family")
       node_num=$((node_num + 1))
-      urls+=("sq://${USERNAME}:${PASSWORD}@${uri_host}:${SQ_PORT}?sni=${sni}&zero_rtt=true#${tag}")
+      local sq_url="sq://${USERNAME}:${PASSWORD}@${uri_host}:${SQ_PORT}?sni=${sni}&zero_rtt=true#${tag}"
+      urls+=("$sq_url")
+      [[ "$family" == "IPv4" ]] && sq_ipv4_url="$sq_url"
     fi
 
     if $anytls_enabled; then
@@ -726,6 +779,8 @@ generate_subscription_url() {
   done
 
   echo ""
+
+  [[ -n "$sq_ipv4_url" ]] && print_qr_code "$sq_ipv4_url"
 
   log_info "以上订阅链接已备份到 ${INSTALL_DIR}/subscription.txt"
   log_info "可以随时用 cat ${INSTALL_DIR}/subscription.txt 查看"
