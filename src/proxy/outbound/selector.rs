@@ -229,6 +229,47 @@ impl SelectorOutbound {
             }
         }
 
+        self.reselect_node_by_info(&results);
+        self.sync_selected_trace();
+    }
+
+    fn sync_selected_trace(&self) {
+        let Some(observer) = get_observer() else {
+            return;
+        };
+
+        let idx = self.selected_index.load(Ordering::Relaxed) % self.outbounds.len();
+        let selected_tag = self.outbounds[idx].tag();
+        let (Some(node), Some(trace)) = (
+            observer.get_outbound_stats(selected_tag),
+            observer.get_outbound_trace(selected_tag),
+        ) else {
+            return;
+        };
+
+        match get_outbound_by_tag(&self.tag) {
+            Ok(outbound) => {
+                observer.update_outbound_trace(
+                    outbound,
+                    node.stats.get_latency_ms(),
+                    trace.ip,
+                    trace.loc,
+                    trace.uplink_path_stats,
+                    trace.downlink_path_stats,
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "{} [{}] failed to resolve outbound for trace update: {:#}",
+                    self.protocol(),
+                    self.tag,
+                    e
+                );
+            }
+        }
+    }
+
+    fn reselect_node_by_info(&self, results: &[(usize, i64)]) {
         if results.is_empty() {
             warn!(
                 "{} [{}] all outbounds failed latency test",
@@ -238,10 +279,6 @@ impl SelectorOutbound {
             return;
         }
 
-        self.reselect_node_by_info(&results);
-    }
-
-    fn reselect_node_by_info(&self, results: &[(usize, i64)]) {
         if self.selector_type != SelectorType::UrlTest {
             return;
         }
@@ -340,39 +377,15 @@ impl SelectorOutbound {
             new_selected_node.tag()
         );
 
+        let selected_tag = new_selected_node.tag();
+        self.sync_selected_trace();
+
         if let Some(observer) = get_observer() {
-            if let Some(selected_tag) = self.get_selected_tag() {
-                if let (Some(node), Some(trace)) = (
-                    observer.get_outbound_stats(selected_tag),
-                    observer.get_outbound_trace(selected_tag),
-                ) {
-                    match get_outbound_by_tag(&self.tag) {
-                        Ok(outbound) => {
-                            observer.update_outbound_trace(
-                                outbound,
-                                node.stats.get_latency_ms(),
-                                trace.ip,
-                                trace.loc,
-                                trace.uplink_path_stats,
-                                trace.downlink_path_stats,
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "{} [{}] failed to resolve outbound for trace update: {:#}",
-                                self.protocol(),
-                                self.tag,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
             observer.kill_connections_by_outbound(&self.tag);
         }
 
         if let Some(ref cache) = self.cache {
-            if let Err(e) = cache.set("selected", &new_selected_node.tag().to_string()) {
+            if let Err(e) = cache.set("selected", &selected_tag.to_string()) {
                 warn!(
                     "{} [{}] failed to persist fallback selection: {}",
                     self.protocol(),

@@ -62,7 +62,6 @@ pub async fn init_core_api(
 
     let app = Router::new()
         .route("/observe", get(get_observe))
-        .route("/outbounds", get(get_outbounds))
         .route("/selector", put(put_selector))
         .route("/mode", get(get_mode).put(put_mode))
         .route(
@@ -158,8 +157,6 @@ async fn get_observe(State(state): State<CoreApiState>) -> Result<impl IntoRespo
     Ok(Json(response))
 }
 
-// ─── Handler: Mode ───
-
 async fn get_mode(State(state): State<CoreApiState>) -> Result<impl IntoResponse, StatusCode> {
     let mode = state.router.get_mode().await;
     Ok(Json(serde_json::json!({ "mode": mode })))
@@ -177,61 +174,6 @@ async fn put_mode(
     state.router.set_mode(payload.mode).await;
     Ok(StatusCode::OK)
 }
-
-// ─── Handler: Outbounds ───
-
-async fn get_outbounds(State(state): State<CoreApiState>) -> Result<impl IntoResponse, StatusCode> {
-    // Collect all entries first to avoid lifetime issues with DashMap iterator
-    let entries: Vec<_> = OUTBOUNDS_MAP
-        .iter()
-        .map(|entry| {
-            let tag = entry.key().clone();
-            let outbound = entry.value().clone();
-            (tag, outbound)
-        })
-        .collect();
-
-    let mut list = Vec::new();
-    for (tag, outbound) in entries {
-        let latency = state
-            .observer
-            .get_outbound_stats(&tag)
-            .map(|n| n.stats.get_latency_ms() as i64)
-            .unwrap_or(0);
-
-        let trace = state.observer.get_outbound_trace(&tag);
-        let ip = trace.as_ref().map(|t| t.ip.clone()).unwrap_or_default();
-        let loc = trace.as_ref().map(|t| t.loc.clone()).unwrap_or_default();
-        let (selector_outbounds, selected_node) = outbound
-            .as_selector()
-            .map(|selector| {
-                (
-                    Some(selector.get_outbound_tags()),
-                    selector.get_selected_tag().map(|s| s.to_string()),
-                )
-            })
-            .unwrap_or((None, None));
-
-        let uplink_path_stats = trace.as_ref().and_then(|t| t.uplink_path_stats.clone());
-        let downlink_path_stats = trace.as_ref().and_then(|t| t.downlink_path_stats.clone());
-
-        list.push(OutboundInfo {
-            tag,
-            protocol: outbound.protocol().to_string(),
-            latency,
-            ip,
-            loc,
-            outbounds: selector_outbounds,
-            selected_node,
-            uplink_path_stats,
-            downlink_path_stats,
-        });
-    }
-
-    Ok(Json(list))
-}
-
-// ─── Handler: Selector ───
 
 #[derive(Deserialize)]
 struct SelectorUpdate {
@@ -253,14 +195,10 @@ async fn put_selector(
     Err(StatusCode::NOT_FOUND)
 }
 
-// ─── Handler: Quit ───
-
 async fn get_quit(State(state): State<CoreApiState>) -> Result<impl IntoResponse, StatusCode> {
     let _ = state.shutdown_tx.send(()).await;
     Ok(StatusCode::OK)
 }
-
-// ─── Handler: Trace ───
 
 #[derive(Deserialize)]
 struct TraceParams {
@@ -305,14 +243,6 @@ async fn get_trace(
             .observer
             .get_outbound_trace(&selected_tag)
             .ok_or(StatusCode::BAD_GATEWAY)?;
-        state.observer.update_outbound_trace(
-            outbound,
-            latency,
-            trace.ip.clone(),
-            trace.loc.clone(),
-            trace.uplink_path_stats.clone(),
-            trace.downlink_path_stats.clone(),
-        );
 
         return Ok(Json(TraceResponse {
             ip: trace.ip.clone(),
@@ -347,8 +277,9 @@ impl TraceTestGuard {
 impl Drop for TraceTestGuard {
     fn drop(&mut self) {
         self.observer.set_outbound_trace_testing(&self.tag, false);
-        // Drop also runs when a selector test is aborted by the round timeout.
-        if !self.succeeded {
+        // Selector traces are aggregations managed by their own `check_all`;
+        // a failed or aborted nested test must not overwrite them with -1.
+        if !self.succeeded && self.outbound.as_selector().is_none() {
             self.observer
                 .update_outbound_trace(self.outbound.clone(), -1, "", "", None, None);
         }
@@ -430,8 +361,6 @@ pub async fn get_outbound_info(
         downlink_path_stats,
     })
 }
-
-// ─── Handler: Request ───
 
 #[derive(Deserialize)]
 struct RequestParams {
@@ -609,19 +538,6 @@ struct ObserveResponse {
     dns_avg_time_us: u64,
     route_avg_time_us: u64,
     memory_usage: u64,
-}
-
-#[derive(Serialize)]
-struct OutboundInfo {
-    tag: String,
-    protocol: String,
-    latency: i64,
-    ip: String,
-    loc: String,
-    outbounds: Option<Vec<String>>,
-    selected_node: Option<String>,
-    uplink_path_stats: Option<crate::proxy::outbound::PathState>,
-    downlink_path_stats: Option<crate::proxy::outbound::PathState>,
 }
 
 #[cfg(test)]
