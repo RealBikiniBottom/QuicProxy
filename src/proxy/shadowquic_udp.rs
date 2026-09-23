@@ -837,6 +837,18 @@ pub async fn auth_sunnyquic(
     expected_hash: [u8; 64],
     duration: Duration,
 ) -> anyhow::Result<()> {
+    let received_hash = read_sunny_auth(bistream, duration).await?;
+    if received_hash != expected_hash {
+        bail!("Invalid auth hash")
+    }
+    Ok(())
+}
+
+/// Read the SunnyQuic auth request and return the raw 64-byte credential hash.
+pub async fn read_sunny_auth(
+    bistream: &mut QuinnBistream,
+    duration: Duration,
+) -> anyhow::Result<[u8; 64]> {
     let handshake = async {
         let mut cmd_buf = [0u8; 1];
         bistream.read_exact(&mut cmd_buf).await?;
@@ -846,11 +858,7 @@ pub async fn auth_sunnyquic(
         }
         let mut received_hash = [0u8; 64];
         bistream.read_exact(&mut received_hash).await?;
-        if received_hash != expected_hash {
-            bail!("Invalid auth hash")
-        }
-
-        Ok(())
+        Ok(received_hash)
     };
 
     match timeout(duration, handshake).await {

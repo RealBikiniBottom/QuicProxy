@@ -72,6 +72,8 @@ pub async fn init_core_api(
         .route("/request", get(get_request))
         .route("/quit", get(get_quit))
         .route("/traffic", get(get_traffic))
+        .route("/users", get(get_users).post(post_user).delete(delete_user))
+        .route("/users/stats", get(get_user_stats))
         .route("/version", get(get_runtime_core_version))
         .route_layer(axum::middleware::from_fn_with_state(
             password,
@@ -441,7 +443,74 @@ async fn get_traffic(State(state): State<CoreApiState>) -> Result<impl IntoRespo
     Ok(Json(state.observer.drain_dst_traffic()))
 }
 
-// ─── Handler: Version & System Info ───
+// ─── Handler: Users ───
+
+#[derive(Deserialize)]
+struct AddUserRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct UserQuery {
+    username: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UserStatsQuery {
+    username: Option<String>,
+    #[serde(default)]
+    clear: bool,
+}
+
+async fn get_users(State(state): State<CoreApiState>) -> impl IntoResponse {
+    Json(state.observer.collect_user_stats(None, false))
+}
+
+async fn post_user(
+    State(state): State<CoreApiState>,
+    Json(payload): Json<AddUserRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if payload.username.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    state
+        .observer
+        .add_user(&payload.username, &payload.password)
+        .await
+        .map_err(|e| {
+            error!("add user failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::OK)
+}
+
+async fn delete_user(
+    State(state): State<CoreApiState>,
+    Query(params): Query<UserQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let Some(username) = params.username else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    match state.observer.remove_user(&username).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn get_user_stats(
+    State(state): State<CoreApiState>,
+    Query(params): Query<UserStatsQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let stats = state
+        .observer
+        .collect_user_stats(params.username.as_deref(), params.clear);
+    if params.username.is_some() && stats.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(stats))
+}
 
 fn system_instance() -> &'static Mutex<System> {
     static SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();

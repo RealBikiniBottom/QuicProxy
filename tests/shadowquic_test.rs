@@ -89,8 +89,158 @@ async fn test_shadowquic_jls_full_chain() {
         .expect("ShadowQuic JLS test timed out after 15s");
 }
 
-// ─── Connection Reuse Tests ───────────────────────────────────────────────
+// ─── User Management Tests ────────────────────────────────────────────────
 
+mod user_management_test {
+    use super::*;
+    use quicproxy::proxy::observe::get_observer;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Open one proxied TCP echo stream through the SOCKS5 inbound and return
+    /// the established stream (SOCKS5 reply consumed, echo verified).
+    async fn open_proxied_stream(ctx: &TestContext) -> tokio::net::TcpStream {
+        let stream = tokio::net::TcpStream::connect(ctx.last_proxy().addr)
+            .await
+            .unwrap();
+        open_proxied_stream_on(stream, ctx, Duration::from_secs(10))
+            .await
+            .expect("proxied stream should establish")
+    }
+
+    /// Drive the SOCKS5 CONNECT handshake and one echo round-trip on an existing
+    /// stream, bounded by `timeout`.
+    async fn open_proxied_stream_on(
+        mut stream: tokio::net::TcpStream,
+        ctx: &TestContext,
+        timeout: Duration,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        let ip_octets = match ctx.mock_server_tcp_addr.ip() {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            _ => panic!("IPv6 not supported in this test"),
+        };
+        let fut = async {
+            stream.write_all(&[5, 1, 0]).await?;
+            let mut method = [0u8; 2];
+            stream.read_exact(&mut method).await?;
+            if method != [5, 0] {
+                return Err(std::io::Error::other("no acceptable method"));
+            }
+
+            let mut req = vec![5, 1, 0, 1];
+            req.extend_from_slice(&ip_octets);
+            req.extend_from_slice(&ctx.mock_server_tcp_addr.port().to_be_bytes());
+            stream.write_all(&req).await?;
+
+            let mut resp_head = [0u8; 4];
+            stream.read_exact(&mut resp_head).await?;
+            if resp_head[1] != 0 {
+                return Err(std::io::Error::other("socks connect rejected"));
+            }
+            match resp_head[3] {
+                1 => {
+                    let mut buf = [0u8; 6];
+                    stream.read_exact(&mut buf).await?;
+                }
+                3 => {
+                    let mut len = [0u8; 1];
+                    stream.read_exact(&mut len).await?;
+                    let mut buf = vec![0u8; len[0] as usize + 2];
+                    stream.read_exact(&mut buf).await?;
+                }
+                4 => {
+                    let mut buf = [0u8; 18];
+                    stream.read_exact(&mut buf).await?;
+                }
+                other => return Err(std::io::Error::other(format!("atyp {other}"))),
+            }
+
+            stream.write_all(b"ping").await?;
+            let mut buf = [0u8; 16];
+            let n = stream.read(&mut buf).await?;
+            if &buf[..n] != b"ping" {
+                return Err(std::io::Error::other("echo mismatch"));
+            }
+            Ok(stream)
+        };
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| std::io::Error::other("timeout"))?
+    }
+
+    /// Removing a user must tear down that user's live QUIC connection:
+    /// `set_server_config` only affects new handshakes, so a connection that is
+    /// left running would keep proxying with a revoked credential. Uses the
+    /// non-JLS (sunnyquic) path for a deterministic handshake.
+    #[tokio::test]
+    async fn test_shadowquic_remove_user_kills_live_connection() {
+        let mut ctx = TestContext::new().await;
+        let user = "user";
+        let pwd = "testpassword";
+
+        let db_path = std::env::temp_dir().join(format!(
+            "quicproxy-shadowquic-users-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+
+        let mut server_cfg = server_config(user, pwd);
+        server_cfg["cache"] = serde_json::json!({
+            "users_cache": { "path": db_path.to_string_lossy() }
+        });
+        server_cfg["observe"] = serde_json::json!({
+            "enabled": true,
+            "cache": "users_cache",
+            "log_interval": 30
+        });
+
+        let proxy_b_idx = ctx.start_proxy(server_cfg, "sq_in").await;
+        let proxy_b_port = ctx.proxies[proxy_b_idx].port;
+
+        // Force the default outbound so the loopback mock target is proxied
+        // through `sq_out` instead of falling back to a leftover outbound.
+        let mut client_cfg = client_config(user, pwd, proxy_b_port, None);
+        client_cfg["outbounds"]["final_outbound"] = serde_json::json!("sq_out");
+        ctx.start_proxy(client_cfg, "socks_in").await;
+
+        let test_fut = async {
+            // First stream establishes an authenticated QUIC connection that is
+            // tracked for `user`, and confirms the tunnel works.
+            let _stream = open_proxied_stream(&ctx).await;
+
+            let observer = get_observer().expect("observer should be initialized");
+            assert!(
+                !observer.all_user_stats().is_empty(),
+                "the config-seeded user should be registered in the observer"
+            );
+
+            assert!(
+                observer.remove_user(user).await.unwrap(),
+                "remove_user should report the user existed"
+            );
+
+            // The revoked QUIC connection must not keep serving new streams.
+            // With the connection left alive, a second request would reuse it
+            // and succeed despite the removed credential.
+            let second = tokio::net::TcpStream::connect(ctx.last_proxy().addr).await.unwrap();
+            let reused = open_proxied_stream_on(second, &ctx, Duration::from_secs(2))
+                .await
+                .is_ok();
+            assert!(
+                !reused,
+                "a revoked user must not be able to open another stream on the old connection"
+            );
+
+            let _ = std::fs::remove_file(&db_path);
+        };
+
+        tokio::time::timeout(Duration::from_secs(25), test_fut)
+            .await
+            .expect("remove-user kill test timed out after 25s");
+    }
+}
+
+
+// ─── Connection Reuse Tests ───────────────────────────────────────────────
 mod connection_reuse_test {
     use super::*;
 

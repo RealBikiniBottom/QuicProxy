@@ -107,7 +107,14 @@ Full Cone 且使用 UDP Extension，完美解决代理 QUIC 速度慢等历史�
 
 使用开放友好的 MIT 开源协议，随意修改且随意闭源，想干啥就干啥。
 
-免费提供后端 API 控制用户，见 [API](https://github.com/spongebob888/shadowquic/blob/main/document/api.md)，支持删除或添加用户，并获取流量情况。
+免费提供后端 API 控制用户，支持添加/删除用户并查询流量，适用于 trojan / anytls / shadowquic inbound：
+
+- `GET /users`：列出所有用户及其流量
+- `POST /users`：添加或更新用户，body `{"username":"alice","password":"secret"}`
+- `DELETE /users?username=alice`：删除用户并断开其连接
+- `GET /users/stats?username=alice&clear=true`：查询单个用户流量；`clear=true` 时原子地取值并清零，不传 `username` 返回全部用户
+
+以上接口由核心 API（`api` 配置）提供，沿用 `Authorization: <password>` 鉴权。用户可通过配置文件顶层的 `users` 或 inbound 的 `users` 预置，运行时新增的用户与流量会持久化到 observe 的 cache。
 
 我们保证：所有项目都不会出现机场、VPN、VPS、IP 代理等将自己客户引流到其他竞争对手的广告。
 

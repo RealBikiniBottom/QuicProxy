@@ -17,6 +17,7 @@ pub struct ObservedPacket {
     pub outbound_stats: Option<Arc<Stats>>,
     pub extra_stats: Option<Arc<Stats>>,
     pub inbound_stats: Option<Arc<Stats>>,
+    pub user_stats: Option<Arc<Stats>>,
     pub global_stats: Arc<Stats>,
 }
 
@@ -27,6 +28,7 @@ impl ObservedPacket {
         tracker: ConnectionHandle,
         outbound_tag: Arc<str>,
         extra_outbound_tag: Option<Arc<str>>,
+        user_stats: Option<Arc<Stats>>,
     ) -> Self {
         let inbound_tag = tracker.inbound_tag.clone();
         let outbound_stats = observer
@@ -39,6 +41,9 @@ impl ObservedPacket {
         let inbound_stats = observer
             .get_inbound_stats(&inbound_tag)
             .map(|node| node.stats.clone());
+        if let Some(stats) = &user_stats {
+            stats.inc_active_udp();
+        }
         let global_stats = observer.global_stats_arc();
         Self {
             inner,
@@ -49,6 +54,7 @@ impl ObservedPacket {
             outbound_stats,
             extra_stats,
             inbound_stats,
+            user_stats,
             global_stats,
         }
     }
@@ -104,6 +110,9 @@ impl AnyPacket for ObservedPacket {
         self.add_extra(n, 0);
         self.global_stats.add_traffic(n, 0);
         self.tracker.inc_upload(n);
+        if let Some(stats) = &self.user_stats {
+            stats.inc_upload(n);
+        }
         Ok(n as usize)
     }
 
@@ -115,6 +124,9 @@ impl AnyPacket for ObservedPacket {
         self.add_extra(0, n);
         self.global_stats.add_traffic(0, n);
         self.tracker.inc_download(n);
+        if let Some(stats) = &self.user_stats {
+            stats.inc_download(n);
+        }
         Ok((src, dst, data))
     }
 
@@ -126,6 +138,9 @@ impl AnyPacket for ObservedPacket {
         self.add_extra(0, n);
         self.global_stats.add_traffic(0, n);
         self.tracker.inc_download(n);
+        if let Some(stats) = &self.user_stats {
+            stats.inc_download(n);
+        }
         Ok(())
     }
 
@@ -154,6 +169,9 @@ impl Drop for ObservedPacket {
         if let Some(ref tag) = self.extra_outbound_tag {
             self.observer.on_outbound_close_udp(tag);
         }
+        if let Some(stats) = &self.user_stats {
+            stats.dec_active_udp();
+        }
     }
 }
 
@@ -161,6 +179,7 @@ pub struct ObservedStream<S> {
     pub inner: S,
     pub stats: Arc<Stats>,
     pub extra_stats: Option<Arc<Stats>>,
+    pub user_stats: Option<Arc<Stats>>,
     pub tracker: ConnectionHandle,
     pub observer: Arc<Observer>,
     pub is_inbound: bool,
@@ -171,6 +190,7 @@ impl<S> ObservedStream<S> {
         inner: S,
         stats: Arc<Stats>,
         extra_stats: Option<Arc<Stats>>,
+        user_stats: Option<Arc<Stats>>,
         tracker: ConnectionHandle,
         observer: Arc<Observer>,
         is_inbound: bool,
@@ -179,10 +199,14 @@ impl<S> ObservedStream<S> {
         if let Some(ref s) = extra_stats {
             s.inc_active_tcp();
         }
+        if is_inbound && let Some(ref s) = user_stats {
+            s.inc_active_tcp();
+        }
         Self {
             inner,
             stats,
             extra_stats,
+            user_stats,
             tracker,
             observer,
             is_inbound,
@@ -194,6 +218,9 @@ impl<S> Drop for ObservedStream<S> {
     fn drop(&mut self) {
         self.stats.dec_active_tcp();
         if let Some(ref s) = self.extra_stats {
+            s.dec_active_tcp();
+        }
+        if self.is_inbound && let Some(ref s) = self.user_stats {
             s.dec_active_tcp();
         }
     }
@@ -215,6 +242,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for ObservedStream<S> {
                         self.stats.inc_upload(n);
                         self.tracker.inc_upload(n);
                         self.observer.update_global_traffic(n, 0);
+                        if let Some(ref s) = self.user_stats {
+                            s.inc_upload(n);
+                        }
                     } else {
                         self.stats.inc_download(n);
                     }
@@ -247,6 +277,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ObservedStream<S> {
                         self.stats.inc_download(n_u64);
                         self.tracker.inc_download(n_u64);
                         self.observer.update_global_traffic(0, n_u64);
+                        if let Some(ref s) = self.user_stats {
+                            s.inc_download(n_u64);
+                        }
                     } else {
                         self.stats.inc_upload(n_u64);
                     }
@@ -303,6 +336,7 @@ mod tests {
             inbound_inner,
             inbound_stats.clone(),
             None,
+            None,
             tracker.clone(),
             observer.clone(),
             true,
@@ -310,6 +344,7 @@ mod tests {
         let mut outbound = ObservedStream::new(
             outbound_inner,
             outbound_stats.clone(),
+            None,
             None,
             tracker.clone(),
             observer.clone(),

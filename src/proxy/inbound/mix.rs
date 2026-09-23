@@ -124,7 +124,7 @@ impl AnyInbound for MixInbound {
                                 );
 
                                 router
-                                    .dispatch_stream(Box::new(stream), &target, &tag_clone)
+                                    .dispatch_stream(Box::new(stream), &target, &tag_clone, None)
                                     .instrument(span)
                                     .await
                                     .context("Routing stream error")?;
@@ -164,7 +164,7 @@ impl AnyInbound for MixInbound {
                             );
 
                             router
-                                .dispatch_stream(Box::new(stream), &target, &tag_clone)
+                                .dispatch_stream(Box::new(stream), &target, &tag_clone, None)
                                 .await
                                 .context("Routing error")?;
                         }

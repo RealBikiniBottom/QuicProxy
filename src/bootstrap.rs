@@ -1,6 +1,6 @@
 use crate::cache::{init_cache, shutdown_cache};
 use crate::config::Config;
-use crate::proxy::inbound::init_inbounds;
+use crate::proxy::inbound::{init_inbounds, shutdown_inbounds};
 use crate::proxy::observe::{init_observer, shutdown_observer};
 use crate::proxy::outbound::{init_outbounds, shutdown_outbounds, start_outbound_tests};
 use crate::proxy::router::geoip::{init_geoip, shutdown_geoip};
@@ -87,6 +87,7 @@ pub async fn shutdown_app() {
     shutdown_geoip_db();
     shutdown_outbounds();
     shutdown_observer();
+    shutdown_inbounds();
     shutdown_cache();
 }
 

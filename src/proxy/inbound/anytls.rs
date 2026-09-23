@@ -1,16 +1,17 @@
-use crate::config::InboundConfig;
+use crate::config::{AuthUser, InboundConfig};
 use crate::proxy::TlsConfig;
 use crate::proxy::anytls_proto::*;
+use crate::proxy::observe::{UserAccount, credential_hash, get_observer};
 use crate::proxy::outbound::{AnyPacket, PacketInfo};
 use crate::proxy::router::{Router, get_router};
 use crate::proxy::{SessionCloser, SourceAddr, TargetAddr, inbound};
 use crate::utils::new_io_other_error;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use inbound::AnyInbound;
-use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
@@ -271,17 +272,19 @@ struct InboundSession {
     router: Arc<Router>,
     /// UDP timeout
     udp_timeout: Duration,
+    /// Authenticated user, if user management is enabled.
+    user: Option<UserAccount>,
     closer: Arc<SessionCloser>,
 }
 
 impl InboundSession {
     async fn new(
         tls_stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-        password_hash: &[u8; 32],
         tag: String,
         peer_addr: SocketAddr,
         router: Arc<Router>,
         udp_timeout: Duration,
+        users: Vec<AuthUser>,
     ) -> Result<()> {
         let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
 
@@ -289,7 +292,19 @@ impl InboundSession {
         let mut auth_buf = [0u8; AUTH_HASH_SIZE];
         tls_read.read_exact(&mut auth_buf).await?;
 
-        if &auth_buf != password_hash {
+        let user = get_observer()
+            .as_ref()
+            .and_then(|o| o.authenticate(&tag, &auth_buf))
+            .map(|(username, stats)| UserAccount {
+                username: Arc::from(username.as_str()),
+                stats,
+            });
+        let local_ok = users.iter().any(|u| {
+            credential_hash("anytls", &u.username, &u.password)
+                .map(|credential| credential == auth_buf)
+                .unwrap_or(false)
+        });
+        if user.is_none() && !local_ok {
             // Password mismatch — close connection
             warn!(
                 "Anytls inbound auth failed from {}: password mismatch",
@@ -332,6 +347,7 @@ impl InboundSession {
             peer_addr,
             router,
             udp_timeout,
+            user,
             closer: Arc::new(SessionCloser::new()),
         });
 
@@ -488,6 +504,7 @@ impl InboundSession {
 
         let router = self.router.clone();
         let tag = self.tag.clone();
+        let user = self.user.clone();
         let span = info_span!(
             "tcp",
             i = tag,
@@ -498,7 +515,7 @@ impl InboundSession {
         );
         tokio::spawn(
             async move {
-                if let Err(e) = router.dispatch_stream(stream, &target, &tag).await {
+                if let Err(e) = router.dispatch_stream(stream, &target, &tag, user).await {
                     error!("Anytls inbound TCP routing error: {:?}", e);
                 }
             }
@@ -565,6 +582,7 @@ impl InboundSession {
 
         let router = self.router.clone();
         let tag = self.tag.clone();
+        let user = self.user.clone();
         let udp_timeout = self.udp_timeout;
         let span = info_span!(
             "udp",
@@ -582,6 +600,7 @@ impl InboundSession {
                         &real_target,
                         &client_addr,
                         &tag,
+                        user,
                         None,
                         udp_timeout,
                         None,
@@ -663,19 +682,15 @@ pub struct AnytlsInbound {
     tag: String,
     address: SocketAddr,
     idle_timeout: Duration,
-    password_hash: [u8; 32],
+    users: Arc<ArcSwap<Vec<AuthUser>>>,
     tls: TlsConfig,
 }
 
 impl AnytlsInbound {
-    pub fn new(tag: String, cfg: &InboundConfig) -> Result<Self> {
-        let password = cfg
-            .password
-            .clone()
-            .context("anytls inbound requires password")?;
-        let mut hasher = Sha256::new();
-        hasher.update(password.as_bytes());
-        let password_hash: [u8; 32] = hasher.finalize().into();
+    pub fn new(tag: String, cfg: &InboundConfig, users: Vec<AuthUser>) -> Result<Self> {
+        if users.is_empty() {
+            bail!("anytls inbound '{}' requires password", tag);
+        }
 
         let tls = TlsConfig::from_inbound(cfg)?;
 
@@ -683,11 +698,15 @@ impl AnytlsInbound {
 
         Ok(Self {
             tag,
-            password_hash,
+            users: Arc::new(ArcSwap::from_pointee(users)),
             address,
             idle_timeout: cfg.idle_timeout_or(Duration::from_secs(60)),
             tls,
         })
+    }
+
+    fn users_snapshot(&self) -> Vec<AuthUser> {
+        self.users.load().as_ref().clone()
     }
 
     async fn listen_tcp(&self) -> Result<()> {
@@ -734,7 +753,7 @@ impl AnytlsInbound {
             };
 
             let router = get_router()?;
-            let password_hash = self.password_hash;
+            let users = self.users_snapshot();
             let tag = self.tag.clone();
             let udp_timeout = self.idle_timeout;
             let acceptor = tls_acceptor.clone();
@@ -767,11 +786,11 @@ impl AnytlsInbound {
 
                 if let Err(e) = InboundSession::new(
                     tls_stream,
-                    &password_hash,
                     tag,
                     peer_addr,
                     router,
                     udp_timeout,
+                    users,
                 )
                 .await
                 {
@@ -794,6 +813,32 @@ impl AnyInbound for AnytlsInbound {
 
     async fn listen(&self) -> Result<()> {
         self.listen_tcp().await
+    }
+
+    fn supports_users(&self) -> bool {
+        true
+    }
+
+    async fn add_user(&self, user: &AuthUser) -> Result<()> {
+        let mut users = self.users.load().as_ref().clone();
+        match users.iter_mut().find(|u| u.username == user.username) {
+            Some(existing) => existing.password = user.password.clone(),
+            None => users.push(user.clone()),
+        }
+        self.users.store(Arc::new(users));
+        Ok(())
+    }
+
+    async fn remove_user(&self, username: &str) -> Result<()> {
+        let users: Vec<AuthUser> = self
+            .users
+            .load()
+            .iter()
+            .filter(|u| u.username != username)
+            .cloned()
+            .collect();
+        self.users.store(Arc::new(users));
+        Ok(())
     }
 }
 

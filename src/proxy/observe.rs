@@ -1,7 +1,8 @@
 use arc_swap::ArcSwapOption;
 use bytesize::ByteSize;
 use dashmap::DashMap;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
+use sha2::{Digest, Sha224, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::info;
@@ -9,7 +10,10 @@ use uuid::Uuid;
 
 use super::TargetAddr;
 use crate::cache::Cache;
+use crate::config::AuthUser;
+use crate::proxy::inbound::apply_user_change;
 use crate::proxy::outbound::{self, AnyOutbound, OUTBOUNDS_MAP};
+use crate::proxy::shadowquic_udp::gen_sunny_auth_hash;
 use crate::utils::now_timestamp;
 use crate::utils::shutdown;
 use crate::utils::system::get_memory_usage;
@@ -35,6 +39,8 @@ pub struct ConnectionTracker {
     pub id: Uuid,
     #[serde(serialize_with = "serialize_shared_str")]
     pub inbound_tag: Arc<str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<Arc<str>>,
     pub outbound_tag: Vec<String>,
     pub matched_rule_index: Option<usize>,
     pub final_target: TargetAddr,
@@ -77,6 +83,7 @@ impl ConnectionTracker {
         Self {
             id: Uuid::new_v4(),
             inbound_tag,
+            user: None,
             outbound_tag,
             matched_rule_index,
             origin_target,
@@ -94,6 +101,11 @@ impl ConnectionTracker {
     }
     pub fn inc_download(&self, bytes: u64) {
         self.download.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn with_user(mut self, user: Option<Arc<str>>) -> Self {
+        self.user = user;
+        self
     }
 
     fn uses_outbound(&self, tag: &str) -> bool {
@@ -316,6 +328,100 @@ impl Stats {
     pub fn inc_download(&self, bytes: u64) {
         self.download_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
+
+    /// Atomically read and zero the cumulative counters. Each counter is swapped
+    /// individually, so concurrent traffic is never lost: bytes counted before
+    /// the swap are returned, bytes after it land in the fresh counter.
+    pub fn take_traffic(&self) -> TrafficSnapshot {
+        TrafficSnapshot {
+            upload: self.upload_bytes.swap(0, Ordering::Relaxed),
+            download: self.download_bytes.swap(0, Ordering::Relaxed),
+            total_tcp: self.total_tcp_conns.swap(0, Ordering::Relaxed),
+            total_udp: self.total_udp_conns.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    /// Overwrite the cumulative counters (used when restoring persisted stats).
+    pub fn restore(&self, snapshot: TrafficSnapshot) {
+        self.upload_bytes.store(snapshot.upload, Ordering::Relaxed);
+        self.download_bytes
+            .store(snapshot.download, Ordering::Relaxed);
+        self.total_tcp_conns
+            .store(snapshot.total_tcp, Ordering::Relaxed);
+        self.total_udp_conns
+            .store(snapshot.total_udp, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct TrafficSnapshot {
+    pub upload: u64,
+    pub download: u64,
+    pub total_tcp: u64,
+    pub total_udp: u64,
+}
+
+/// Compute the credential bytes as they appear on the wire for a protocol.
+///
+/// trojan: lowercase hex of SHA224(password) (56 ASCII bytes)
+/// anytls: SHA256(password) (32 bytes)
+/// shadowquic: SHA256("username:password") (64 bytes)
+/// vmess: the uuid's 16-byte cmd_key (the username is the uuid)
+pub fn credential_hash(protocol: &str, username: &str, password: &str) -> anyhow::Result<Vec<u8>> {
+    match protocol {
+        "trojan" => {
+            let mut hasher = Sha224::new();
+            hasher.update(password.as_bytes());
+            Ok(hex::encode(hasher.finalize()).into_bytes())
+        }
+        "anytls" => {
+            let mut hasher = Sha256::new();
+            hasher.update(password.as_bytes());
+            Ok(hasher.finalize().to_vec())
+        }
+        "shadowquic" => Ok(gen_sunny_auth_hash(username, password).to_vec()),
+        "vmess" => {
+            let uuid = uuid::Uuid::parse_str(username)
+                .map_err(|e| anyhow::anyhow!("invalid vmess uuid '{username}': {e}"))?;
+            Ok(crate::proxy::outbound::vmess::vmess_impl::new_id(&uuid)
+                .cmd_key
+                .to_vec())
+        }
+        other => anyhow::bail!("protocol '{other}' does not support user management"),
+    }
+}
+
+/// An authenticated identity: the username plus its shared traffic counters.
+/// The inbound owns the credential; the Observer only tracks stats keyed by
+/// username, so the same user on different inbounds shares one counter.
+#[derive(Clone)]
+pub struct UserAccount {
+    pub username: Arc<str>,
+    pub stats: Arc<Stats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedUser {
+    pub username: String,
+    /// Empty for records written before credential persistence, or for
+    /// config-seeded users whose password is re-read from the config on start.
+    #[serde(default)]
+    pub password: String,
+    pub upload: u64,
+    pub download: u64,
+    pub total_tcp: u64,
+    pub total_udp: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UserStats {
+    pub username: String,
+    pub upload: u64,
+    pub download: u64,
+    pub tcp_conns: u64,
+    pub udp_conns: u64,
+    pub total_tcp: u64,
+    pub total_udp: u64,
 }
 
 use crate::proxy::SessionCloser;
@@ -324,6 +430,10 @@ pub struct Observer {
     inbounds: DashMap<String, Arc<NodeStats>>,
     outbounds: DashMap<String, Arc<NodeStats>>,
     pub realip2domain: Cache<String>,
+    user_stats: DashMap<Arc<str>, Arc<Stats>>,
+    user_creds: DashMap<(Arc<str>, Arc<str>), Vec<u8>>,
+    user_passwords: DashMap<Arc<str>, String>,
+    user_cache: Option<Cache<PersistedUser>>,
     global_stats: Arc<Stats>,
     connections: DashMap<Uuid, ConnectionRecord>,
     dst_traffic: DashMap<String, DstTrafficEntry>,
@@ -363,16 +473,23 @@ impl Drop for ConnectionLifecycle {
 impl Observer {
     pub fn new(cache_name: &str) -> anyhow::Result<Self> {
         let realip2domain = Cache::new_with_tag(cache_name, "observe:realip2domain".to_string())?;
+        let user_cache = Cache::new_with_tag(cache_name, "observe:users".to_string()).ok();
 
-        Ok(Self {
+        let observer = Self {
             inbounds: DashMap::new(),
             outbounds: DashMap::new(),
             realip2domain,
+            user_stats: DashMap::new(),
+            user_creds: DashMap::new(),
+            user_passwords: DashMap::new(),
+            user_cache,
             global_stats: Arc::new(Stats::default()),
             connections: DashMap::new(),
             dst_traffic: DashMap::new(),
             mem_stats: Mutex::new((0, 0, 0)),
-        })
+        };
+        observer.load_persisted_users();
+        Ok(observer)
     }
 
     #[cfg(test)]
@@ -400,6 +517,10 @@ impl Observer {
                 1,
             )
             .expect("create observer test cache"),
+            user_stats: DashMap::new(),
+            user_creds: DashMap::new(),
+            user_passwords: DashMap::new(),
+            user_cache: None,
             global_stats: Arc::new(Stats::default()),
             connections: DashMap::new(),
             dst_traffic: DashMap::new(),
@@ -661,6 +782,225 @@ impl Observer {
             .or_insert_with(|| NodeStats::new(tag, protocol));
     }
 
+    pub fn upsert_user(&self, username: &str) -> Arc<Stats> {
+        self.user_stats
+            .entry(Arc::from(username))
+            .or_insert_with(|| Arc::new(Stats::default()))
+            .clone()
+    }
+
+    pub fn set_user_credential(&self, tag: &str, username: &str, credential: Vec<u8>) {
+        self.user_creds
+            .insert((Arc::from(tag), Arc::from(username)), credential);
+    }
+
+    /// Remember a user's plaintext password so it can be re-applied to inbounds
+    /// on the next start and re-written when persisting stats.
+    pub fn set_user_password(&self, username: &str, password: &str) {
+        self.user_passwords
+            .insert(Arc::from(username), password.to_string());
+    }
+
+    /// Users recovered from the observe cache, ready to be re-registered on the
+    /// inbounds that support user management.
+    pub fn persisted_users(&self) -> Vec<AuthUser> {
+        self.user_passwords
+            .iter()
+            .map(|entry| AuthUser {
+                username: entry.key().to_string(),
+                password: entry.value().clone(),
+            })
+            .collect()
+    }
+
+    pub fn user_account(&self, username: &str) -> Option<UserAccount> {
+        self.user_stats.get(username).map(|stats| UserAccount {
+            username: Arc::from(username),
+            stats: stats.value().clone(),
+        })
+    }
+
+    pub fn authenticate(&self, tag: &str, credential: &[u8]) -> Option<(String, Arc<Stats>)> {
+        self.user_creds
+            .iter()
+            .find(|e| e.key().0.as_ref() == tag && e.value() == credential)
+            .map(|e| (e.key().1.to_string(), e.value().clone()))
+            .and_then(|(username, _)| {
+                let stats = self.user_stats.get(username.as_str())?;
+                Some((username, stats.value().clone()))
+            })
+    }
+
+    pub fn user_stats(&self, username: &str) -> Option<Arc<Stats>> {
+        self.user_stats.get(username).map(|e| e.value().clone())
+    }
+
+    pub fn all_user_stats(&self) -> Vec<(String, Arc<Stats>)> {
+        self.user_stats
+            .iter()
+            .map(|e| (e.key().to_string(), e.value().clone()))
+            .collect()
+    }
+
+    pub async fn add_user(&self, username: &str, password: &str) -> anyhow::Result<()> {
+        let user = AuthUser {
+            username: username.to_string(),
+            password: password.to_string(),
+        };
+        apply_user_change(&user, false).await?;
+        for entry in self.inbounds.iter() {
+            let protocol = &entry.value().protocol;
+            if let Ok(credential) = credential_hash(protocol, username, password) {
+                self.set_user_credential(entry.key(), username, credential);
+            }
+        }
+        self.upsert_user(username);
+        self.user_passwords
+            .insert(Arc::from(username), password.to_string());
+        self.save_persisted(username);
+        Ok(())
+    }
+
+    pub async fn remove_user(&self, username: &str) -> anyhow::Result<bool> {
+        if !self.user_stats.contains_key(username) {
+            return Ok(false);
+        }
+        apply_user_change(
+            &AuthUser {
+                username: username.to_string(),
+                password: String::new(),
+            },
+            true,
+        )
+        .await?;
+        self.user_stats.remove(username);
+        self.user_passwords.remove(username);
+        let tags: Vec<Arc<str>> = self
+            .user_creds
+            .iter()
+            .filter(|e| e.key().1.as_ref() == username)
+            .map(|e| e.key().0.clone())
+            .collect();
+        for tag in tags {
+            self.user_creds.remove(&(tag, Arc::from(username)));
+        }
+        if let Some(cache) = &self.user_cache {
+            let _ = cache.delete(username);
+        }
+        self.kill_connections_by_user(username);
+        Ok(true)
+    }
+
+    pub fn kill_connections_by_user(&self, username: &str) {
+        let to_close: Vec<Uuid> = self
+            .connections
+            .iter()
+            .filter(|e| e.value().tracker.user.as_deref() == Some(username))
+            .map(|e| *e.key())
+            .collect();
+        for id in to_close {
+            if let Some(record) = self.connections.get(&id)
+                && let Some(closer) = &record.closer
+            {
+                closer.close();
+            }
+        }
+    }
+
+    pub fn collect_user_stats(&self, username: Option<&str>, clear: bool) -> Vec<UserStats> {
+        let mut result: Vec<UserStats> = Vec::new();
+        for entry in self.user_stats.iter() {
+            let name = entry.key();
+            let stats = entry.value();
+            if let Some(filter) = username
+                && name.as_ref() != filter
+            {
+                continue;
+            }
+            let snapshot = if clear {
+                stats.take_traffic()
+            } else {
+                TrafficSnapshot {
+                    upload: stats.get_upload_bytes(),
+                    download: stats.get_download_bytes(),
+                    total_tcp: stats.get_total_tcp_conns(),
+                    total_udp: stats.get_total_udp_conns(),
+                }
+            };
+            result.push(UserStats {
+                username: name.to_string(),
+                upload: snapshot.upload,
+                download: snapshot.download,
+                total_tcp: snapshot.total_tcp,
+                total_udp: snapshot.total_udp,
+                tcp_conns: stats.get_active_tcp_conns(),
+                udp_conns: stats.get_active_udp_sessions(),
+            });
+        }
+        result
+    }
+
+    fn save_persisted(&self, username: &str) {
+        let Some(cache) = &self.user_cache else {
+            return;
+        };
+        let Some(stats) = self.user_stats.get(username) else {
+            return;
+        };
+        let password = self
+            .user_passwords
+            .get(username)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default();
+        let persisted = PersistedUser {
+            username: username.to_string(),
+            password,
+            upload: stats.get_upload_bytes(),
+            download: stats.get_download_bytes(),
+            total_tcp: stats.get_total_tcp_conns(),
+            total_udp: stats.get_total_udp_conns(),
+        };
+        if let Err(e) = cache.set(username, &persisted) {
+            tracing::error!("persist user '{}' failed: {}", username, e);
+        }
+    }
+
+    fn load_persisted_users(&self) {
+        let Some(cache) = &self.user_cache else {
+            return;
+        };
+        let entries = match cache.list() {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::error!("load persisted users failed: {}", e);
+                return;
+            }
+        };
+        for (_key, p) in entries {
+            let stats = self
+                .user_stats
+                .entry(Arc::from(p.username.as_str()))
+                .or_insert_with(|| Arc::new(Stats::default()))
+                .clone();
+            stats.restore(TrafficSnapshot {
+                upload: p.upload,
+                download: p.download,
+                total_tcp: p.total_tcp,
+                total_udp: p.total_udp,
+            });
+            if !p.password.is_empty() {
+                self.user_passwords
+                    .insert(Arc::from(p.username.as_str()), p.password);
+            }
+        }
+    }
+
+    fn persist_users(&self) {
+        for (username, _) in self.all_user_stats() {
+            self.save_persisted(&username);
+        }
+    }
+
     pub fn update_outbound_trace(
         &self,
         outbound: Arc<dyn AnyOutbound>,
@@ -768,6 +1108,7 @@ impl Observer {
             );
         }
         info!("--------------------------");
+        self.persist_users();
     }
 
     pub fn spawn_periodic_log(self: &Arc<Self>, interval_secs: u64) -> anyhow::Result<()> {
@@ -966,5 +1307,99 @@ mod tests {
         let error = observer.spawn_periodic_log(0).unwrap_err();
 
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn credential_hash_matches_protocol_wire_format() {
+        assert_eq!(
+            credential_hash("trojan", "default", "secret")
+                .unwrap()
+                .len(),
+            56
+        );
+        assert_eq!(
+            credential_hash("anytls", "default", "secret")
+                .unwrap()
+                .len(),
+            32
+        );
+        assert_eq!(
+            credential_hash("shadowquic", "alice", "secret")
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(credential_hash("socks5", "a", "b").is_err());
+    }
+
+    #[test]
+    fn take_traffic_swaps_cumulative_counters_only() {
+        let stats = Stats::default();
+        stats.add_traffic(10, 20);
+        stats.inc_active_tcp();
+
+        let snapshot = stats.take_traffic();
+
+        assert_eq!(snapshot.upload, 10);
+        assert_eq!(snapshot.download, 20);
+        assert_eq!(snapshot.total_tcp, 1);
+        assert_eq!(stats.get_upload_bytes(), 0);
+        assert_eq!(stats.get_download_bytes(), 0);
+        assert_eq!(stats.get_total_tcp_conns(), 0);
+        // Active connections are live state and must survive a reset.
+        assert_eq!(stats.get_active_tcp_conns(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_remove_and_authenticate_users() {
+        let observer = Observer::new_for_test();
+
+        // The Observer only tracks stats; the inbound computes and registers
+        // credentials. Mirror that here.
+        let stats = observer.upsert_user("alice");
+        let trojan_credential = credential_hash("trojan", "alice", "pw").unwrap();
+        let shadow_credential = credential_hash("shadowquic", "alice", "pw").unwrap();
+        observer.set_user_credential("trojan-a", "alice", trojan_credential.clone());
+        observer.set_user_credential("shadow-a", "alice", shadow_credential.clone());
+
+        let (username, _) = observer
+            .authenticate("trojan-a", &trojan_credential)
+            .expect("trojan user should authenticate");
+        assert_eq!(username, "alice");
+
+        assert!(
+            observer
+                .authenticate("shadow-a", &shadow_credential)
+                .is_some()
+        );
+        assert!(
+            observer
+                .authenticate("trojan-a", &shadow_credential)
+                .is_none()
+        );
+
+        stats.add_traffic(5, 7);
+        let collected = observer.collect_user_stats(Some("alice"), false);
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].upload, 5);
+        assert_eq!(collected[0].download, 7);
+
+        let collected = observer.collect_user_stats(Some("alice"), true);
+        assert_eq!(collected[0].upload, 5);
+        // clear=true zeroes the counters.
+        let collected = observer.collect_user_stats(Some("alice"), false);
+        assert_eq!(collected[0].upload, 0);
+
+        // remove_user drives inbound registration; here only the stat/cred maps
+        // exist, so call apply path via inbounds is skipped, but removal still
+        // drops the tracked state.
+        assert!(observer.remove_user("alice").await.unwrap());
+        assert!(observer.user_stats("alice").is_none());
+        assert!(
+            observer
+                .authenticate("trojan-a", &trojan_credential)
+                .is_none()
+        );
+        assert!(!observer.remove_user("alice").await.unwrap());
     }
 }

@@ -1,6 +1,6 @@
 use crate::config::{Config, NetworkType, RouterMode};
 use crate::dns::AnyDNS;
-use crate::proxy::observe::{ConnectionTracker, get_observer};
+use crate::proxy::observe::{ConnectionTracker, UserAccount, get_observer};
 use crate::proxy::outbound::pool::POOL_SHOULD_RETRY;
 use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, UdpHandler, get_default_outbound};
 use crate::proxy::{SessionCloser, SourceAddr, TargetAddr};
@@ -213,6 +213,7 @@ impl Router {
         final_target: &TargetAddr,
         target: &TargetAddr,
         is_fakeip: bool,
+        user: Option<UserAccount>,
     ) -> (AnyStream, AnyStream, Option<Arc<SessionCloser>>) {
         let Some(obs) = get_observer() else {
             return (inbound_stream, outbound_stream, None);
@@ -254,7 +255,10 @@ impl Router {
             target.clone(),
             is_fakeip,
             false,
-        );
+        )
+        .with_user(user.as_ref().map(|u| u.username.clone()));
+
+        let user_stats = user.as_ref().map(|u| u.stats.clone());
 
         let closer = Arc::new(SessionCloser::new());
         let tracker_arc = obs.add_connection(tracker, Some(closer.clone()));
@@ -264,6 +268,7 @@ impl Router {
                 inbound_stream,
                 inbound_stats,
                 None,
+                user_stats,
                 tracker_arc.clone(),
                 obs.clone(),
                 true,
@@ -272,6 +277,7 @@ impl Router {
                 outbound_stream,
                 outbound_stats,
                 extra_outbound_stats,
+                None,
                 tracker_arc,
                 obs.clone(),
                 false,
@@ -331,8 +337,9 @@ impl Router {
         inbound_stream: AnyStream,
         target: &TargetAddr,
         inbound_tag: &str,
+        user: Option<UserAccount>,
     ) -> anyhow::Result<()> {
-        self.dispatch_stream_with_stop(inbound_stream, target, inbound_tag, None)
+        self.dispatch_stream_with_stop(inbound_stream, target, inbound_tag, user, None)
             .await
     }
 
@@ -341,6 +348,7 @@ impl Router {
         inbound_stream: AnyStream,
         target: &TargetAddr,
         inbound_tag: &str,
+        user: Option<UserAccount>,
         stop_notify: Option<Arc<Notify>>,
     ) -> anyhow::Result<()> {
         // Select outbound
@@ -373,6 +381,7 @@ impl Router {
                 &final_target,
                 target,
                 is_fakeip,
+                user,
             );
 
         info!(
@@ -553,6 +562,7 @@ impl Router {
         original_target: &TargetAddr,
         source_addr: &SourceAddr,
         inbound_tag: &str,
+        user: Option<UserAccount>,
         payload: Option<Bytes>,
         timeout_duration: Duration,
         reset: Option<Arc<Notify>>,
@@ -562,6 +572,7 @@ impl Router {
                 source_addr,
                 original_target,
                 inbound_tag,
+                user,
                 payload.as_deref(),
             )
             .await?;
@@ -727,6 +738,7 @@ impl Router {
         source_addr: &SourceAddr,
         target_addr: &TargetAddr,
         inbound_tag: &str,
+        user: Option<UserAccount>,
         payload: Option<&[u8]>,
     ) -> anyhow::Result<(Arc<dyn AnyPacket>, TargetAddr)> {
         // Match rule to find outbound
@@ -768,7 +780,10 @@ impl Router {
                         target_addr.clone(),
                         is_fakeip,
                         true,
-                    );
+                    )
+                    .with_user(user.as_ref().map(|u| u.username.clone()));
+
+                    let user_stats = user.as_ref().map(|u| u.stats.clone());
 
                     let tracker_arc = obs.add_connection(tracker, out_packet.closer());
 
@@ -785,6 +800,7 @@ impl Router {
                         tracker_arc,
                         stats_tag,
                         extra_outbound_tag,
+                        user_stats,
                     );
                     Ok((Arc::new(wrapped), final_target))
                 } else {
@@ -802,6 +818,7 @@ pub async fn start_udp_loop(
     inbound_packet: Arc<dyn AnyPacket>,
     router: Arc<Router>,
     inbound_tag: String,
+    user: Option<UserAccount>,
     timeout_duration: Duration,
     reset: Arc<Notify>,
 ) {
@@ -835,6 +852,7 @@ pub async fn start_udp_loop(
                 let inbound_tag_clone = inbound_tag.clone();
                 let sessions = sessions.clone();
                 let reset = reset.clone();
+                let user_clone = user.clone();
 
                 let span = info_span!(
                     "udp",
@@ -853,6 +871,7 @@ pub async fn start_udp_loop(
                                 &session_key.1,
                                 &session_key.0,
                                 &inbound_tag_clone,
+                                user_clone,
                                 Some(payload),
                                 timeout_duration,
                                 Some(reset),

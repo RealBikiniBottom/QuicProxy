@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
@@ -67,6 +68,22 @@ impl Default for CacheConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Serialize)]
+pub struct AuthUser {
+    pub username: String,
+    pub password: String,
+}
+
+impl AuthUser {
+    fn new(username: String, password: String) -> Arc<Self> {
+        Arc::new(Self { username, password })
+    }
+
+    fn hash(&self) -> String {
+        format!("{}:{}", self.username, self.password)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -81,6 +98,9 @@ pub struct Config {
     #[serde(default = "default_log_config")]
     pub log: LogConfig,
     pub api: Option<ApiConfig>,
+    /// Users applied to every inbound that supports user management.
+    #[serde(default)]
+    pub users: Vec<AuthUser>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -209,6 +229,7 @@ impl Default for Config {
             observe: None,
             log: LogConfig::default(),
             api: None,
+            users: Vec::new(),
         }
     }
 }
@@ -335,6 +356,12 @@ pub struct InboundConfig {
     pub idle_timeout: Option<u64>,
     pub username: Option<String>,
     pub password: Option<String>,
+    /// VMess user id. Like the outbound, vmess has no username/password, so the
+    /// primary credential is the UUID (and `users[].username` holds a UUID too).
+    pub uuid: Option<String>,
+    /// Per-inbound users. Merged with the top-level `users` list at startup.
+    #[serde(default)]
+    pub users: Vec<AuthUser>,
     pub udp_mod: Option<String>,
     pub congestion_controller: Option<String>,
 
@@ -392,6 +419,59 @@ impl InboundConfig {
     pub fn credentials(&self, tag: &str) -> anyhow::Result<(&str, &str)> {
         let bound = format!("{} inbound '{}'", self.protocol_type, tag);
         required_credentials(&self.username, &self.password, &bound)
+    }
+
+    /// Merge global, inbound-level and legacy single-credential users, keeping
+    /// the first occurrence of each username.
+    pub fn merged_auth_users(&self, global: &[AuthUser]) -> Vec<AuthUser> {
+        let mut users: Vec<AuthUser> = Vec::new();
+        let mut push = |user: AuthUser| {
+            if !users.iter().any(|u| u.username == user.username) {
+                users.push(user);
+            }
+        };
+        for user in global {
+            push(user.clone());
+        }
+        for user in &self.users {
+            push(user.clone());
+        }
+        // VMess has no username/password: the UUID is the only credential, so it
+        // doubles as both the username and the password.
+        if self.protocol_type.eq_ignore_ascii_case("vmess")
+            && let Some(uuid) = &self.uuid
+        {
+            push(AuthUser {
+                username: uuid.clone(),
+                password: uuid.clone(),
+            });
+        }
+        if let Some(password) = &self.password {
+            // With no username the password doubles as the identity, so the
+            // single-credential style never shows up as a synthetic "default".
+            let username = self.username.clone().unwrap_or_else(|| password.clone());
+            push(AuthUser {
+                username,
+                password: password.clone(),
+            });
+        }
+        // ShadowQuic JLS keeps its users in the TLS config; fold them into the
+        // same user list so they are tracked and survive runtime add/remove.
+        if self.protocol_type.eq_ignore_ascii_case("shadowquic")
+            && let Some(tls) = &self.tls
+            && tls.enable_jls
+            && let Some(password) = &tls.jls_password
+        {
+            let username = tls
+                .jls_username
+                .clone()
+                .unwrap_or_else(|| password.clone());
+            push(AuthUser {
+                username,
+                password: password.clone(),
+            });
+        }
+        users
     }
 
     /// Returns a string-valued mode setting or the protocol-specific default.
@@ -623,10 +703,67 @@ impl Default for RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheConfig, DnsConfig, InboundConfig, OutboundConfig, duration_from_secs_or};
+    use super::{AuthUser, CacheConfig, DnsConfig, InboundConfig, OutboundConfig, duration_from_secs_or};
     use crate::cache::DEFAULT_MEMORY_SIZE_MB;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn password_without_username_uses_password_as_identity() {
+        let inbound: InboundConfig = serde_json::from_value(json!({
+            "type": "trojan",
+            "address": "127.0.0.1",
+            "port": 443,
+            "password": "secret"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            inbound.merged_auth_users(&[]),
+            vec![AuthUser {
+                username: "secret".to_string(),
+                password: "secret".to_string(),
+            }]
+        );
+
+        let named: InboundConfig = serde_json::from_value(json!({
+            "type": "trojan",
+            "address": "127.0.0.1",
+            "port": 443,
+            "username": "alice",
+            "password": "secret"
+        }))
+        .unwrap();
+        assert_eq!(
+            named.merged_auth_users(&[]),
+            vec![AuthUser {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn jls_password_without_username_uses_password_as_identity() {
+        let inbound: InboundConfig = serde_json::from_value(json!({
+            "type": "shadowquic",
+            "address": "127.0.0.1",
+            "port": 443,
+            "tls": {
+                "enable_jls": true,
+                "jls_password": "jls-secret"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            inbound.merged_auth_users(&[]),
+            vec![AuthUser {
+                username: "jls-secret".to_string(),
+                password: "jls-secret".to_string(),
+            }]
+        );
+    }
 
     #[test]
     fn duration_from_secs_uses_configured_value_or_default() {

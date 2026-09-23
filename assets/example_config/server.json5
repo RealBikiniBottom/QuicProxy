@@ -1,4 +1,10 @@
 {
+  // Users listed here are registered on every inbound that supports user
+  // management (trojan / anytls / shadowquic). They can also be managed at
+  // runtime through the core API: GET/POST/DELETE /users and GET /users/stats.
+  "users": [
+    { "username": "user", "password": "pwd" }
+  ],
   "inbounds": {
     "shadowquic_inbound": {
       "type": "shadowquic",

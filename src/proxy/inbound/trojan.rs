@@ -1,14 +1,14 @@
-use crate::config::InboundConfig;
+use crate::config::{AuthUser, InboundConfig};
 use crate::proxy::TlsConfig;
+use crate::proxy::observe::{UserAccount, credential_hash, get_observer};
 use crate::proxy::outbound::{AnyPacket, AnyStream, PacketInfo};
 use crate::proxy::router::{Router, get_router};
 use crate::proxy::{SourceAddr, TargetAddr, inbound};
 use crate::utils::new_io_other_error;
-use anyhow::Context;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use inbound::AnyInbound;
-use sha2::{Digest, Sha224};
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
@@ -81,7 +81,7 @@ pub struct TrojanInbound {
     tag: String,
     address: SocketAddr,
     idle_timeout: Duration,
-    password_hash: String,
+    users: Arc<ArcSwap<Vec<AuthUser>>>,
     tls: TlsConfig,
 }
 
@@ -92,12 +92,10 @@ pub enum TrojanHandler<S> {
 }
 
 impl TrojanInbound {
-    pub fn new(tag: String, cfg: &InboundConfig) -> anyhow::Result<Self> {
-        let password = cfg.password.clone().context("requires password")?;
-        let mut hasher = Sha224::new();
-        hasher.update(password.as_bytes());
-        let result = hasher.finalize();
-        let password_hash = hex::encode(result);
+    pub fn new(tag: String, cfg: &InboundConfig, users: Vec<AuthUser>) -> anyhow::Result<Self> {
+        if users.is_empty() {
+            anyhow::bail!("Trojan inbound '{}' requires a password", tag);
+        }
 
         let tls = TlsConfig::from_inbound(cfg)?;
 
@@ -105,11 +103,15 @@ impl TrojanInbound {
 
         Ok(Self {
             tag,
-            password_hash,
+            users: Arc::new(ArcSwap::from_pointee(users)),
             address,
             idle_timeout: cfg.idle_timeout(),
             tls,
         })
+    }
+
+    fn users_snapshot(&self) -> Vec<AuthUser> {
+        self.users.load().as_ref().clone()
     }
 
     async fn listen_tcp(&self) -> anyhow::Result<()> {
@@ -158,7 +160,7 @@ impl TrojanInbound {
             };
             let peer_addr_str = peer_addr.to_string();
             let router = get_router()?;
-            let password_hash = self.password_hash.clone();
+            let users = self.users_snapshot();
             let tag = self.tag.clone();
             let udp_timeout = self.idle_timeout;
             let acceptor = tls_acceptor.clone();
@@ -189,7 +191,7 @@ impl TrojanInbound {
                     None => return,
                 };
 
-                handle_connection(stream, router, password_hash, tag, peer_addr, udp_timeout).await;
+                handle_connection(stream, router, users, tag, peer_addr, udp_timeout).await;
             });
         }
     }
@@ -207,6 +209,32 @@ impl AnyInbound for TrojanInbound {
 
     async fn listen(&self) -> anyhow::Result<()> {
         self.listen_tcp().await
+    }
+
+    fn supports_users(&self) -> bool {
+        true
+    }
+
+    async fn add_user(&self, user: &AuthUser) -> anyhow::Result<()> {
+        let mut users = self.users.load().as_ref().clone();
+        match users.iter_mut().find(|u| u.username == user.username) {
+            Some(existing) => existing.password = user.password.clone(),
+            None => users.push(user.clone()),
+        }
+        self.users.store(Arc::new(users));
+        Ok(())
+    }
+
+    async fn remove_user(&self, username: &str) -> anyhow::Result<()> {
+        let users: Vec<AuthUser> = self
+            .users
+            .load()
+            .iter()
+            .filter(|u| u.username != username)
+            .cloned()
+            .collect();
+        self.users.store(Arc::new(users));
+        Ok(())
     }
 }
 
@@ -251,7 +279,7 @@ where
 async fn handle_connection<S>(
     stream: S,
     router: Arc<Router>,
-    password_hash: String,
+    users: Vec<AuthUser>,
     tag: String,
     peer_addr: SocketAddr,
     udp_timeout: Duration,
@@ -260,7 +288,7 @@ async fn handle_connection<S>(
 {
     async move {
         let result = match run_with_timeout(
-            handle_client(stream, &password_hash),
+            handle_client(stream, &tag, &users),
             udp_timeout,
             &format!("Trojan handshake timeout for client {}", peer_addr),
             &format!("Error handling Trojan client {}", peer_addr),
@@ -272,7 +300,7 @@ async fn handle_connection<S>(
         };
 
         match result {
-            Some(TrojanHandler::Stream(stream, target)) => {
+            Some((TrojanHandler::Stream(stream, target), user)) => {
                 let span = info_span!(
                     "tcp",
                     i = tag,
@@ -283,7 +311,7 @@ async fn handle_connection<S>(
                 );
                 async move {
                     if let Err(e) = router
-                        .dispatch_stream(Box::new(stream), &target, tag.as_ref())
+                        .dispatch_stream(Box::new(stream), &target, tag.as_ref(), user)
                         .await
                     {
                         error!("Routing stream error: {:?}", e);
@@ -292,7 +320,7 @@ async fn handle_connection<S>(
                 .instrument(span)
                 .await;
             }
-            Some(TrojanHandler::Udp(stream, target)) => {
+            Some((TrojanHandler::Udp(stream, target), user)) => {
                 let span = info_span!(
                     "udp",
                     i = tag,
@@ -313,6 +341,7 @@ async fn handle_connection<S>(
                             &target,
                             &client_addr,
                             &tag,
+                            user,
                             None,
                             udp_timeout,
                             None,
@@ -333,8 +362,9 @@ async fn handle_connection<S>(
 
 async fn handle_client<S>(
     mut stream: S,
-    password_hash: &str,
-) -> std::io::Result<Option<TrojanHandler<S>>>
+    tag: &str,
+    users: &[AuthUser],
+) -> std::io::Result<Option<(TrojanHandler<S>, Option<UserAccount>)>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -359,10 +389,20 @@ where
         )));
     }
 
-    // Avoid allocation: compare bytes directly instead of converting to String
-    let received_hash =
-        std::str::from_utf8(hash).map_err(|_| new_io_other_error("Invalid UTF-8 in hash"))?;
-    if !received_hash.eq_ignore_ascii_case(&password_hash) {
+    let received_hash = hash.to_ascii_lowercase();
+    let account = get_observer()
+        .as_ref()
+        .and_then(|o| o.authenticate(tag, &received_hash))
+        .map(|(username, stats)| UserAccount {
+            username: Arc::from(username.as_str()),
+            stats,
+        });
+    let local_ok = users.iter().any(|u| {
+        credential_hash("trojan", &u.username, &u.password)
+            .map(|credential| credential == received_hash)
+            .unwrap_or(false)
+    });
+    if account.is_none() && !local_ok {
         return Err(new_io_other_error("Invalid Trojan password"));
     }
 
@@ -389,11 +429,11 @@ where
         1 => {
             // CONNECT
             // The remaining stream is the payload.
-            Ok(Some(TrojanHandler::Stream(stream, target_addr)))
+            Ok(Some((TrojanHandler::Stream(stream, target_addr), account)))
         }
         3 => {
             // UDP ASSOCIATE
-            Ok(Some(TrojanHandler::Udp(stream, target_addr)))
+            Ok(Some((TrojanHandler::Udp(stream, target_addr), account)))
         }
         _ => Err(new_io_other_error(format!("Unsupported CMD: {}", cmd))),
     }

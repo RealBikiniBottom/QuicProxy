@@ -1,29 +1,34 @@
 use anyhow::bail;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use dashmap::DashMap;
 use quinn::{ConnectionError, VarInt};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use crate::config::InboundConfig;
+use crate::config::{AuthUser, InboundConfig};
 use crate::proxy::inbound::AnyInbound;
+use crate::proxy::observe::{UserAccount, get_observer};
 use crate::proxy::outbound::UdpMode;
 use crate::proxy::router::Router;
 use crate::proxy::router::get_router;
 use crate::proxy::shadowquic_udp::{
     ExtensionRequest, PerConnectionState, ShadowQuicUdpPacket, ShadowUdpReceiver,
-    UDP_CONTEXT_ID_RECONNECT_MARGIN, auth_sunnyquic, gen_sunny_auth_hash, read_context_id,
-    read_extension_request, read_request_head, run_bistream_recv_listener, start_datagram_loop,
-    start_unistream_listener, write_conn_stats_response, write_ext_error_not_available,
+    UDP_CONTEXT_ID_RECONNECT_MARGIN, gen_sunny_auth_hash, read_context_id,
+    read_extension_request, read_request_head, read_sunny_auth, run_bistream_recv_listener,
+    start_datagram_loop, start_unistream_listener, write_conn_stats_response,
+    write_ext_error_not_available,
 };
 use crate::proxy::{TargetAddr, TlsConfig};
 use anyhow::Context;
 
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 use crate::utils::quic_wrap::quinn_wrap::QuinnServer;
+use crate::utils::quic_wrap::quinn_wrap::ServerConfigUpdater;
 
 use tracing::{Instrument, debug, error, field, info, info_span};
 
@@ -35,7 +40,12 @@ pub struct ShadowQuicInbound {
     address: String,
     port: u16,
     tls: TlsConfig,
-    auth_hash: Option<[u8; 64]>,
+    users: Arc<ArcSwap<Vec<AuthUser>>>,
+    jls_updater: OnceLock<Arc<ServerConfigUpdater>>,
+    /// Live QUIC connections keyed by remote address, paired with the user
+    /// (JLS iv / sunnyquic username) that authentication resolved to. Used to
+    /// terminate a user's sessions when it is removed at runtime.
+    conns: Arc<DashMap<SocketAddr, (Arc<quinn::Connection>, Option<Arc<str>>)>>,
     enable_gso: bool,
     enable_mtudis: bool,
     min_mtu: u16,
@@ -46,24 +56,26 @@ pub struct ShadowQuicInbound {
 }
 
 impl ShadowQuicInbound {
-    pub fn new(tag: String, cfg: &InboundConfig) -> anyhow::Result<Self> {
+    pub fn new(tag: String, cfg: &InboundConfig, users: Vec<AuthUser>) -> anyhow::Result<Self> {
         let tls = TlsConfig::from_inbound(cfg)?;
 
         if !tls.enable && !tls.enable_jls {
             anyhow::bail!("ShadowQuic inbound requires TLS to be enabled");
         }
 
-        let mut auth_hash = None;
-        if !tls.enable_jls {
-            let (username, password) = cfg.credentials(&tag)?;
-            auth_hash = Some(gen_sunny_auth_hash(username, password));
+        if !tls.enable_jls && users.is_empty() {
+            anyhow::bail!("ShadowQuic inbound '{}' requires username and password", tag);
         }
+
+        let users = Arc::new(ArcSwap::from_pointee(users));
 
         let (address, port) = cfg.endpoint()?;
 
         Ok(Self {
             tag,
-            auth_hash,
+            users,
+            jls_updater: OnceLock::new(),
+            conns: Arc::new(DashMap::new()),
             congestion_controller: cfg.congestion_controller.clone(),
             tls,
             address: address.to_string(),
@@ -82,6 +94,7 @@ impl ShadowQuicInbound {
         target: TargetAddr,
         router: Arc<Router>,
         inbound_tag: &str,
+        user: Option<UserAccount>,
         per_conn: Arc<PerConnectionState>,
         conn: Arc<quinn::Connection>,
         idle_timeout: Duration,
@@ -126,6 +139,7 @@ impl ShadowQuicInbound {
                 &target,
                 &source_addr,
                 inbound_tag,
+                user,
                 None,
                 idle_timeout,
                 None,
@@ -146,6 +160,7 @@ impl AnyInbound for ShadowQuicInbound {
 
     async fn listen(&self) -> anyhow::Result<()> {
         let listen_addr = SocketAddr::new(self.address.parse::<IpAddr>()?, self.port);
+        let initial_users = self.users.load().as_ref().clone();
         let mut listener = QuinnServer::new(
             listen_addr,
             self.idle_timeout,
@@ -155,8 +170,7 @@ impl AnyInbound for ShadowQuicInbound {
             self.tls.sni.clone(),
             self.tls.alpns.clone(),
             self.tls.zero_rtt,
-            self.tls.jls_username.clone(),
-            self.tls.jls_password.clone(),
+            &initial_users,
             self.tls.enable_jls,
             self.enable_gso,
             self.enable_mtudis,
@@ -165,10 +179,16 @@ impl AnyInbound for ShadowQuicInbound {
         )
         .with_context(|| format!("QUIC server failed to listen on {}", listen_addr))?;
 
-        let auth_hash = self.auth_hash;
+        if self.tls.enable_jls {
+            let _ = self.jls_updater.set(listener.updater());
+        }
+
+        let is_jls = self.tls.enable_jls;
+        let users_store = self.users.clone();
         let session_timeout = self.idle_timeout();
         let tag = self.tag.clone();
         let router = get_router()?;
+        let conns = self.conns.clone();
 
         info!("ShadowQuic inbound listening on {}", listen_addr);
 
@@ -180,10 +200,33 @@ impl AnyInbound for ShadowQuicInbound {
                     let per_conn = Arc::new(PerConnectionState::new());
                     let router = router.clone();
                     let tag = tag.clone();
+                    let users_store = users_store.clone();
+                    let conns = conns.clone();
+                    let remote_addr = conn.remote_address();
 
                     tokio::spawn(async move {
+                        // Register the connection so a runtime remove_user can
+                        // close it. `authed` starts as the JLS identity (known
+                        // at handshake time) and is filled in after sunnyquic
+                        // auth for non-JLS connections.
+                        conns.insert(remote_addr, (conn.clone(), None));
+
                         let res: anyhow::Result<()> = async {
-                            let mut is_authed = auth_hash.is_none();
+                            let observer = get_observer();
+                            let mut authed_user: Option<UserAccount> = if is_jls {
+                                conn.jls_chosen_user().and_then(|name| {
+                                    observer.as_ref().and_then(|o| o.user_account(&name))
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(user) = &authed_user
+                                && let Some(mut entry) = conns.get_mut(&remote_addr)
+                            {
+                                entry.1 = Some(user.username.clone());
+                            }
+                            let has_users = users_store.load().iter().next().is_some();
+                            let mut is_authed = is_jls || !has_users;
                             let mut services_started = false;
 
                             loop {
@@ -204,15 +247,32 @@ impl AnyInbound for ShadowQuicInbound {
 
                                 let mut bistream = Box::new(QuinnBistream::new(send, recv));
                                 if !is_authed {
-                                    if let Some(auth_hash) = auth_hash {
-                                        auth_sunnyquic(&mut bistream, auth_hash, session_timeout)
+                                    let received =
+                                        read_sunny_auth(&mut bistream, session_timeout)
                                             .await
                                             .context("auth failed")?;
-
-                                        is_authed = true;
-                                        info!("Sunnyquic auth ok");
-                                        continue;
+                                    authed_user = observer
+                                        .as_ref()
+                                        .and_then(|o| o.authenticate(&tag, &received))
+                                        .map(|(username, stats)| UserAccount {
+                                            username: Arc::from(username.as_str()),
+                                            stats,
+                                        });
+                                    let local_ok = users_store.load().iter().any(|u| {
+                                        gen_sunny_auth_hash(&u.username, &u.password) == received
+                                    });
+                                    if authed_user.is_none() && !local_ok {
+                                        bail!("Invalid auth hash");
                                     }
+                                    if let Some(mut entry) = conns.get_mut(&remote_addr) {
+                                        entry.1 = authed_user
+                                            .as_ref()
+                                            .map(|u| u.username.clone());
+                                    }
+
+                                    is_authed = true;
+                                    info!("Sunnyquic auth ok");
+                                    continue;
                                 }
 
                                 if !services_started {
@@ -235,6 +295,7 @@ impl AnyInbound for ShadowQuicInbound {
                                 let router = router.clone();
                                 let per_conn = per_conn.clone();
                                 let conn = conn.clone();
+                                let user = authed_user.clone();
                                 let remote_addr = conn.remote_address().to_string();
 
                                 info!("Accepted proxy request from bistream");
@@ -255,7 +316,9 @@ impl AnyInbound for ShadowQuicInbound {
                                                     o = field::Empty
                                                 );
                                                 router
-                                                    .dispatch_stream(bistream, &target, &tag)
+                                                    .dispatch_stream(
+                                                        bistream, &target, &tag, user,
+                                                    )
                                                     .instrument(span)
                                                     .await?;
                                             }
@@ -278,6 +341,7 @@ impl AnyInbound for ShadowQuicInbound {
                                                     target,
                                                     router,
                                                     tag.as_str(),
+                                                    user,
                                                     per_conn,
                                                     conn,
                                                     session_timeout,
@@ -351,6 +415,7 @@ impl AnyInbound for ShadowQuicInbound {
                             error!("QUIC conn error: {:#}", e);
                         }
 
+                        conns.remove(&remote_addr);
                         conn.close(VarInt::from_u32(SHADOWQUIC_CLOSE_CODE), b"");
                         info!("QUIC conn {} closed", conn.remote_address());
                     });
@@ -363,5 +428,123 @@ impl AnyInbound for ShadowQuicInbound {
         }
 
         Ok(())
+    }
+
+    fn supports_users(&self) -> bool {
+        true
+    }
+
+    async fn add_user(&self, user: &AuthUser) -> anyhow::Result<()> {
+        let mut users = self.users.load().as_ref().clone();
+        match users.iter_mut().find(|u| u.username == user.username) {
+            Some(existing) => existing.password = user.password.clone(),
+            None => users.push(user.clone()),
+        }
+        self.users.store(Arc::new(users.clone()));
+        if let Some(updater) = self.jls_updater.get() {
+            updater.update_jls_users(&users)?;
+        }
+        Ok(())
+    }
+
+    async fn remove_user(&self, username: &str) -> anyhow::Result<()> {
+        let users: Vec<AuthUser> = self
+            .users
+            .load()
+            .iter()
+            .filter(|u| u.username != username)
+            .cloned()
+            .collect();
+        self.users.store(Arc::new(users.clone()));
+        if let Some(updater) = self.jls_updater.get() {
+            updater.update_jls_users(&users)?;
+        }
+        // Terminate the removed user's live sessions: set_server_config only
+        // affects new handshakes, so existing connections would otherwise keep
+        // proxying with the now-revoked credential.
+        let stale: Vec<SocketAddr> = self
+            .conns
+            .iter()
+            .filter(|e| e.value().1.as_deref() == Some(username))
+            .map(|e| *e.key())
+            .collect();
+        for addr in stale {
+            if let Some((_, (conn, _))) = self.conns.remove(&addr) {
+                conn.close(VarInt::from_u32(SHADOWQUIC_CLOSE_CODE), b"user removed");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_inbound(users: Vec<AuthUser>) -> ShadowQuicInbound {
+        let cfg: InboundConfig = serde_json5::from_str(
+            r#"{ type: "shadowquic", address: "127.0.0.1", port: 0, username: "seed", password: "pw", tls: { enable: true } }"#,
+        )
+        .unwrap();
+        ShadowQuicInbound::new("sq_in".to_string(), &cfg, users).unwrap()
+    }
+
+    fn usernames(inbound: &ShadowQuicInbound) -> Vec<String> {
+        inbound
+            .users
+            .load()
+            .iter()
+            .map(|u| u.username.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn add_user_appends_and_updates() {
+        let inbound = test_inbound(vec![AuthUser {
+            username: "seed".to_string(),
+            password: "pw".to_string(),
+        }]);
+
+        inbound
+            .add_user(&AuthUser {
+                username: "alice".to_string(),
+                password: "a1".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(usernames(&inbound), vec!["seed", "alice"]);
+
+        // Same username updates the password in place.
+        inbound
+            .add_user(&AuthUser {
+                username: "alice".to_string(),
+                password: "a2".to_string(),
+            })
+            .await
+            .unwrap();
+        let users = inbound.users.load();
+        assert_eq!(users.len(), 2);
+        assert_eq!(
+            users.iter().find(|u| u.username == "alice").unwrap().password,
+            "a2"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_user_drops_only_the_target() {
+        let inbound = test_inbound(vec![
+            AuthUser {
+                username: "seed".to_string(),
+                password: "pw".to_string(),
+            },
+            AuthUser {
+                username: "alice".to_string(),
+                password: "a1".to_string(),
+            },
+        ]);
+
+        inbound.remove_user("alice").await.unwrap();
+
+        assert_eq!(usernames(&inbound), vec!["seed"]);
     }
 }

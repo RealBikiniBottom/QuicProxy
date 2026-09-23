@@ -111,7 +111,7 @@ impl AnyInbound for Socks5Inbound {
                             format_duration(start_time.elapsed())
                         );
                         if let Err(e) = router
-                            .dispatch_stream(Box::new(stream), &target, &tag_clone)
+                            .dispatch_stream(Box::new(stream), &target, &tag_clone, None)
                             .instrument(span)
                             .await
                         {
@@ -270,7 +270,7 @@ pub async fn start_udp_worker(
         reset_clone.notify_waiters();
     });
 
-    start_udp_loop(inbound_packet, router, inbound_tag, timeout_duration, reset).await;
+    start_udp_loop(inbound_packet, router, inbound_tag, None, timeout_duration, reset).await;
 }
 
 pub async fn handle_client(

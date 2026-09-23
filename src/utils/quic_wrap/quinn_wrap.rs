@@ -1,4 +1,5 @@
 use anyhow::{Context as _, bail};
+use arc_swap::ArcSwap;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::{Pin, pin};
@@ -19,6 +20,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::utils::new_io_other_error;
 use crate::utils::socket::socket_helpers::try_create_dualstack_udpsocket;
+use crate::config::AuthUser;
 
 use super::{QuicBistream, QuicConnection, QuicUnistream};
 
@@ -286,6 +288,43 @@ pub struct QuinnServer {
     // The accept task holds its own endpoint clone; keeping one here lets Drop
     // close the endpoint, which stops the listener and ends the accept task.
     endpoint: quinn::Endpoint,
+    updater: Arc<ServerConfigUpdater>,
+}
+
+/// Rebuilds the QUIC server configuration so JLS users can be added or removed
+/// at runtime. Existing connections keep their old configuration; only new
+/// handshakes see the updated user list, matching quinn's `set_server_config`.
+pub struct ServerConfigUpdater {
+    endpoint: quinn::Endpoint,
+    crypto: ArcSwap<quinn::rustls::ServerConfig>,
+    transport_config: Arc<TransportConfig>,
+    server_name: String,
+}
+
+impl ServerConfigUpdater {
+    fn apply(&self, crypto: quinn::rustls::ServerConfig) -> anyhow::Result<()> {
+        self.crypto.store(Arc::new(crypto.clone()));
+        let quic = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+            .map_err(|e| anyhow::anyhow!("rebuild QUIC server config: {e}"))?;
+        let mut config = ServerConfig::with_crypto(Arc::new(quic));
+        config.transport_config(self.transport_config.clone());
+        self.endpoint.set_server_config(Some(config));
+        Ok(())
+    }
+
+    pub fn update_jls_users(&self, users: &[AuthUser]) -> anyhow::Result<()> {
+        let base = self.crypto.load();
+        let mut crypto = (**base).clone();
+        let mut jls = quinn::rustls::jls::JlsServerConfig::default();
+        for user in users {
+            jls = jls.add_user(user.password.clone(), user.username.clone());
+        }
+        jls = jls
+            .enable(true)
+            .with_server_name(self.server_name.clone());
+        crypto.jls_config = jls.into();
+        self.apply(crypto)
+    }
 }
 
 impl QuinnServer {
@@ -298,62 +337,63 @@ impl QuinnServer {
         sni: Option<String>,
         alpn: Option<Vec<String>>,
         zero_rtt: bool,
-        jls_username: String,
-        jls_password: String,
+        jls_users: &[AuthUser],
         is_jls: bool,
         enable_gso: bool,
         enable_mtudis: bool,
         initial_mtu: u16,
         min_mtu: u16,
     ) -> anyhow::Result<Self> {
-        let server_name = sni.as_deref().unwrap_or("apple.com");
-        let mut server_config = if is_jls {
-            let mut jls_config = quinn::rustls::jls::JlsServerConfig::default();
-            jls_config = jls_config
-                .enable(true)
-                .add_user(jls_password, jls_username)
-                .with_server_name(server_name.to_string());
+        let server_name = sni.as_deref().unwrap_or("apple.com").to_string();
 
+        let (cert_chain, private_key) = if is_jls {
             // JLS encrypts the handshake with a PSK, so the certificate only
             // satisfies rustls' structure and a self-signed one is fine.
-            let (cert_chain, private_key) = generate_self_signed_cert()?;
+            generate_self_signed_cert()?
+        } else if let (Some(cp), Some(kp)) = (cert_path, key_path) {
+            (load_certs(cp)?, load_keys(kp)?)
+        } else {
+            tracing::info!(
+                "No TLS cert configured for QUIC, generating default self-signed certificate"
+            );
+            generate_self_signed_cert()?
+        };
 
-            let mut config = quinn::rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(cert_chain, private_key)?;
-            config.jls_config = jls_config.into();
+        let mut crypto = quinn::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, private_key)?;
 
-            config.alpn_protocols = alpn
+        if is_jls {
+            let mut jls_config = quinn::rustls::jls::JlsServerConfig::default();
+            for user in jls_users {
+                jls_config = jls_config.add_user(user.password.clone(), user.username.clone());
+            }
+            jls_config = jls_config
+                .enable(true)
+                .with_server_name(server_name.clone());
+
+            crypto.alpn_protocols = alpn
                 .unwrap_or_default()
                 .into_iter()
                 .map(|s| s.into_bytes())
                 .collect();
-            config.max_early_data_size = if zero_rtt { u32::MAX } else { 0 };
-            config.send_half_rtt_data = zero_rtt;
-            let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(config)?;
-            ServerConfig::with_crypto(Arc::new(quic_server_config))
-        } else {
-            let (certs, key) = if let (Some(cp), Some(kp)) = (cert_path, key_path) {
-                (load_certs(cp)?, load_keys(kp)?)
-            } else {
-                tracing::info!(
-                    "No TLS cert configured for QUIC, generating default self-signed certificate"
-                );
-                generate_self_signed_cert()?
-            };
+            crypto.max_early_data_size = if zero_rtt { u32::MAX } else { 0 };
+            crypto.send_half_rtt_data = zero_rtt;
+            crypto.jls_config = jls_config.into();
+        }
 
-            ServerConfig::with_single_cert(certs, key)?
-        };
-        let transport_config = make_transport_config(
+        let transport_config = Arc::new(make_transport_config(
             idle_timeout,
             congestion_controller.as_deref(),
             enable_gso,
             enable_mtudis,
             initial_mtu,
             min_mtu,
-        );
+        ));
 
-        server_config.transport_config(Arc::new(transport_config));
+        let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(crypto.clone())?;
+        let mut server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));
+        server_config.transport_config(transport_config.clone());
 
         let socket = try_create_dualstack_udpsocket(addr)?;
         let runtime =
@@ -364,6 +404,13 @@ impl QuinnServer {
             socket,
             runtime,
         )?;
+
+        let updater = Arc::new(ServerConfigUpdater {
+            endpoint: endpoint.clone(),
+            crypto: ArcSwap::from_pointee(crypto),
+            transport_config,
+            server_name,
+        });
 
         let (tx, rx): (
             mpsc::Sender<Arc<quinn::Connection>>,
@@ -391,6 +438,7 @@ impl QuinnServer {
         Ok(Self {
             accept_connection_rx: rx,
             endpoint,
+            updater,
         })
     }
 
@@ -400,6 +448,10 @@ impl QuinnServer {
             .recv()
             .await
             .ok_or(new_io_other_error("Listener closed"))
+    }
+
+    pub fn updater(&self) -> Arc<ServerConfigUpdater> {
+        self.updater.clone()
     }
 }
 

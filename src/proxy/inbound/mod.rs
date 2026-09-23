@@ -4,19 +4,21 @@ pub mod mix;
 pub mod shadowquic;
 pub mod socks5;
 pub mod trojan;
+pub mod vmess;
 
 #[cfg(feature = "premium")]
 pub use crate::premium::tun;
 #[cfg(feature = "premium")]
 use crate::premium::tun::tun::TunInbound;
 
-use crate::config::Config;
+use crate::config::{AuthUser, Config};
 use crate::proxy::inbound::anytls::AnytlsInbound;
 use crate::proxy::inbound::http::HttpInbound;
 use crate::proxy::inbound::mix::MixInbound;
 use crate::proxy::inbound::shadowquic::ShadowQuicInbound;
 use crate::proxy::inbound::socks5::Socks5Inbound;
 use crate::proxy::inbound::trojan::TrojanInbound;
+use crate::proxy::inbound::vmess::VmessInbound;
 use crate::proxy::observe::get_observer;
 use crate::utils::interface::InterfaceManager;
 use crate::utils::shutdown;
@@ -24,22 +26,42 @@ pub use crate::utils::socket::socket_helpers::try_create_dualstack_tcplistener a
 use crate::utils::system_proxy::{SystemProxyGuard, set_system_proxy};
 use anyhow::bail;
 use async_trait::async_trait;
-use std::sync::Arc;
+use dashmap::DashMap;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::error;
 
 pub fn init_inbounds(cfg: &Config) -> anyhow::Result<()> {
+    let observer = get_observer();
     for (name, item) in cfg.inbounds.iter() {
         let protocol = item.protocol_type.clone().to_lowercase();
         let name_clone = name.clone();
+        let mut merged_users = item.merged_auth_users(&cfg.users);
+        if let Some(observer) = &observer {
+            for user in observer.persisted_users() {
+                if merged_users.iter().any(|u| u.username == user.username) {
+                    continue;
+                }
+                if crate::proxy::observe::credential_hash(&protocol, &user.username, &user.password)
+                    .is_ok()
+                {
+                    merged_users.push(user);
+                }
+            }
+        }
 
         let inbound: Arc<dyn AnyInbound> = match protocol.as_str() {
-            "shadowquic" => Arc::new(ShadowQuicInbound::new(name_clone, item)?),
+            "shadowquic" => Arc::new(ShadowQuicInbound::new(
+                name_clone,
+                item,
+                merged_users.clone(),
+            )?),
             "socks5" => Arc::new(Socks5Inbound::new(name_clone, item)?),
             "http" => Arc::new(HttpInbound::new(name_clone, item)?),
             "mix" => Arc::new(MixInbound::new(name_clone, item)?),
-            "trojan" => Arc::new(TrojanInbound::new(name_clone, item)?),
-            "anytls" => Arc::new(AnytlsInbound::new(name_clone, item)?),
+            "trojan" => Arc::new(TrojanInbound::new(name_clone, item, merged_users.clone())?),
+            "anytls" => Arc::new(AnytlsInbound::new(name_clone, item, merged_users.clone())?),
+            "vmess" => Arc::new(VmessInbound::new(name_clone, item, merged_users.clone())?),
             #[cfg(feature = "premium")]
             "tun" => Arc::new(TunInbound::new(name_clone, item)),
             #[cfg(not(feature = "premium"))]
@@ -51,8 +73,21 @@ pub fn init_inbounds(cfg: &Config) -> anyhow::Result<()> {
             }
         };
 
-        if let Some(observer) = get_observer() {
+        register_inbound(name, inbound.clone());
+
+        if let Some(observer) = &observer {
             observer.register_inbound(name, inbound.protocol());
+            if inbound.supports_users() {
+                for user in &merged_users {
+                    observer.upsert_user(&user.username);
+                    observer.set_user_password(&user.username, &user.password);
+                    if let Ok(credential) =
+                        crate::proxy::observe::credential_hash(inbound.protocol(), &user.username, &user.password)
+                    {
+                        observer.set_user_credential(name, &user.username, credential);
+                    }
+                }
+            }
         }
 
         let name_for_log = name.clone();
@@ -106,6 +141,52 @@ pub trait AnyInbound: Send + Sync {
     fn idle_timeout(&self) -> Duration;
 
     async fn listen(&self) -> anyhow::Result<()>;
+
+    /// Whether this inbound keeps its own user list that must be refreshed when
+    /// users are added or removed at runtime.
+    fn supports_users(&self) -> bool {
+        false
+    }
+
+    /// Add or update a user on this inbound at runtime.
+    async fn add_user(&self, _user: &AuthUser) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Remove a user from this inbound at runtime.
+    async fn remove_user(&self, _username: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+static INBOUNDS: LazyLock<DashMap<String, Arc<dyn AnyInbound>>> = LazyLock::new(DashMap::new);
+
+pub fn register_inbound(tag: &str, inbound: Arc<dyn AnyInbound>) {
+    INBOUNDS.insert(tag.to_string(), inbound);
+}
+
+pub fn shutdown_inbounds() {
+    INBOUNDS.clear();
+}
+
+/// Apply a user change to every inbound that supports user management.
+pub async fn apply_user_change(user: &AuthUser, remove: bool) -> anyhow::Result<()> {
+    let targets: Vec<(String, Arc<dyn AnyInbound>)> = INBOUNDS
+        .iter()
+        .filter(|e| e.value().supports_users())
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    for (tag, inbound) in &targets {
+        let result = if remove {
+            inbound.remove_user(&user.username).await
+        } else {
+            inbound.add_user(user).await
+        };
+        if let Err(e) = result {
+            anyhow::bail!("apply user to inbound '{}' failed: {}", tag, e);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

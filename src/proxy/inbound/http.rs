@@ -102,6 +102,7 @@ impl AnyInbound for HttpInbound {
                                     Box::new(handler.stream),
                                     &handler.target,
                                     &tag_clone,
+                                    None,
                                 )
                                 .await
                             {

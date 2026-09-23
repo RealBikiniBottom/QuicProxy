@@ -5,7 +5,7 @@
       "address": "127.0.0.1",
       "idle_timeout": 500,
       "set_system_proxy": false,
-      "port": 1102
+      "port": 1101
     },
     "tun_inbound": {
       "type": "tun",
@@ -15,7 +15,7 @@
       ],
       "idle_timeout": 100,
       "mtu": 1424,
-      "auto_route": true
+      "auto_route": false
     },
     "sq_inbound": {
       "type": "shadowquic",
@@ -33,7 +33,7 @@
     },
     "trojan_inbound": {
       "type": "trojan",
-      "password": "testpassword123",
+      "password": "pwd",
       "address": "127.0.0.1",
       "port": 2234,
       "tls": {
@@ -43,7 +43,7 @@
     "anytls_inbound": {
       "type": "anytls",
       "address": "127.0.0.1",
-      "password": "testpassword123",
+      "password": "pwd",
       "port": 2343,
       "tls": {
         "enable": true,
@@ -55,21 +55,21 @@
     "servers": {
       "autoSelect": {
         "type": "urltest",
-        "default_outbound": "real_out2",
+        "default_outbound": "real_out",
         "outbounds": [
-          "real_out2",
+          "real_out",
         ]
       },
-      "real_out2": {
+      "real_out": {
         "type": "shadowquic",
-        "address": "23.27.96.75",
-        "port": 443,
+        "address": "127.0.0.1",
+        "port": 2344,
         "idle_timeout": 50,
         "udp_mod": "datagram",
         "tls": {
           "enable_jls": true,
-          "jls_username": "039d85c31c9f",
-          "jls_password": "5b0adc7f253e51df2996bbaab6bd5d67",
+          "jls_username": "test_user",
+          "jls_password": "test_pwd",
           "alpn": [],
           "zero_rtt": true,
           "sni": "www.apple.com"
@@ -80,17 +80,7 @@
         "address": "127.0.0.1",
         // "port": 8443,
         "port": 2343,
-        "password": "testpassword123",
-        "tls": {
-          "enable": true,
-          "insecure": true,
-        }
-      },
-      "real_out": {
-        "type": "trojan",
-        "address": "127.0.0.1",
-        "port": 2234,
-        "password": "testpassword123",
+        "password": "pwd",
         "tls": {
           "enable": true,
           "insecure": true,
@@ -110,11 +100,11 @@
       },
       "proxy": {
         "type": "selector",
-        "default_outbound": "real_out2",
+        "default_outbound": "real_out",
         "cache": "all_cache",
         "outbounds": [
           "autoSelect",
-          "real_out2",
+          "real_out",
         ]
       },
       "direct": {
@@ -224,7 +214,7 @@
       {
         "mode": ["rule"],
         "geoip": ["cn"],
-        "outbound": "real_out2"
+        "outbound": "real_out"
       }
     ]
   },
@@ -269,9 +259,14 @@
     }
   },
   "observe": {
-    "enabled": false,
+    "enabled": true,
     "cache": "all_cache",
-    "log_interval": 15
+    "log_interval": 150
+  },
+  "api": {
+    "address": "127.0.0.1",
+    "password": "",
+    "port": 1235
   },
   "log": {
     "level": "info",

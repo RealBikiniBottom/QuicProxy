@@ -99,7 +99,14 @@ Even with TUN enabled, memory usage in heavy daily use is usually still below 20
 
 Released under the permissive MIT license, so you can modify it freely and even keep your own changes closed source if that fits your use case.
 
-A backend API for user management is provided for free. See the [API](https://github.com/spongebob888/shadowquic/blob/main/document/api.md). It supports adding or deleting users and checking traffic usage.
+A backend API for user management is provided for free, available for trojan / anytls / shadowquic inbounds:
+
+- `GET /users`: list every user with traffic usage
+- `POST /users`: add or update a user, body `{"username":"alice","password":"secret"}`
+- `DELETE /users?username=alice`: remove a user and close its connections
+- `GET /users/stats?username=alice&clear=true`: fetch one user's usage; `clear=true` atomically reads and zeroes the counters (omit `username` for all users)
+
+These endpoints are served by the core API (`api` config) and use the same `Authorization: <password>` auth. Users can be seeded through the top-level `users` list or an inbound's `users`; runtime additions and traffic counters persist to the observe cache.
 
 We guarantee that none of our projects will include ads that redirect your users to competing providers such as airports, VPNs, VPS services, or IP proxy sellers.
 
