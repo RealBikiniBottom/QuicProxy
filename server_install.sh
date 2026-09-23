@@ -14,6 +14,7 @@ CONFIG_PATH="${INSTALL_DIR}/server.json5"
 BIN_PATH="${INSTALL_DIR}/quicproxy"
 SERVICE_NAME="quicproxy"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+API_STATE_FILE="${INSTALL_DIR}/.core_api"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases/latest"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/quicproxy-core-linux-x64.tar.gz"
 
@@ -303,6 +304,67 @@ find_free_udp_port() {
   return 1
 }
 
+find_free_api_port() {
+  # Core API 使用独立 TCP 端口，避开已分配的 anytls / trojan 端口
+  local exclude_a="${1:-}"
+  local exclude_b="${2:-}"
+  local candidates=(8080 8081 8443 9090 10080 18080 28080 38080)
+  for port in "${candidates[@]}"; do
+    [[ "$port" == "$exclude_a" || "$port" == "$exclude_b" ]] && continue
+    if check_tcp_port_free "$port"; then
+      echo "$port"
+      return 0
+    fi
+  done
+  local candidate
+  local offset
+  for ((offset = 1; offset <= 200; offset++)); do
+    candidate=$((8080 + offset))
+    [[ "$candidate" == "$exclude_a" || "$candidate" == "$exclude_b" ]] && continue
+    if check_tcp_port_free "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+setup_core_api() {
+  log_step "配置 Core API..."
+
+  local env_api_port="${API_PORT:-}"
+
+  API_PASSWORD=""
+  API_PORT=""
+
+  if [[ -f "$API_STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$API_STATE_FILE" 2>/dev/null || true
+  fi
+
+  [[ -n "$env_api_port" ]] && API_PORT="$env_api_port"
+
+  if [[ -z "${API_PASSWORD:-}" ]]; then
+    API_PASSWORD=$(openssl rand -hex 16 2>/dev/null || cat /dev/urandom 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 32)
+    log_info "已生成 Core API 密码"
+  else
+    log_info "已复用 Core API 密码"
+  fi
+
+  if [[ -n "${API_PORT:-}" ]] && check_tcp_port_free "$API_PORT"; then
+    log_info "Core API(TCP) → ${API_PORT} (复用)"
+  else
+    API_PORT=$(find_free_api_port "${ANYTLS_PORT:-}" "${TROJAN_PORT:-}") || {
+      log_error "未找到空闲 TCP 端口给 Core API, 请手动指定: API_PORT=18080 sudo bash server_install.sh"
+      exit 1
+    }
+    log_info "Core API(TCP) → ${API_PORT}"
+  fi
+
+  printf 'API_PASSWORD=%q\nAPI_PORT=%q\n' "$API_PASSWORD" "$API_PORT" > "$API_STATE_FILE"
+  chmod 600 "$API_STATE_FILE"
+}
+
 detect_available_port() {
   log_step "检测可用端口..."
 
@@ -551,6 +613,7 @@ JSON5EOF
       "type": "anytls",
       "address": "::",
       "port": ${ANYTLS_PORT},
+      "username": "${USERNAME}",
       "password": "${PASSWORD}",
       "tls": {
         "enable": true,
@@ -572,12 +635,14 @@ JSON5EOF
       "type": "trojan",
       "address": "::",
       "port": ${TROJAN_PORT},
+      "username": "${USERNAME}",
       "password": "${PASSWORD}",
       "transport": {
         "type": "tcp"
       },
       "tls": {
         "enable": true,
+        "sni": "${sni}",
         "insecure": true
       }
     }${trailing}
@@ -602,6 +667,22 @@ JSON5EOF
   },
   "router": {
     "default_mode": "rule"
+  },
+  "observe": {
+    "enabled": true,
+    "cache": "all_cache",
+    "log_interval": 30
+  },
+  "api": {
+    "address": "::",
+    "port": ${API_PORT},
+    "password": "${API_PASSWORD}"
+  },
+  "subscription": {
+    "host": "${SERVER_IPV4:-$SERVER_IP}",
+    "name": "${SERVER_COUNTRY}",
+    "update_interval": 24,
+    "web_page_url": "https://github.com/RealBikiniBottom/QuicProxy"
   },
   "dns": {
     "default_server": "local_dns",
@@ -662,53 +743,44 @@ UNITEOF
   fi
 }
 
-ensure_qrencode() {
-  command -v qrencode &>/dev/null && return 0
-
-  log_info "未检测到 qrencode, 尝试自动安装..."
-  local installer=""
-  for cmd in apt-get dnf yum; do
-    if command -v "$cmd" &>/dev/null; then
-      installer="$cmd"
-      break
+wait_for_core_api() {
+  local i
+  for ((i = 0; i < 20; i++)); do
+    if curl -sf --connect-timeout 2 --max-time 3 -o /dev/null \
+      -H "Authorization: Bearer ${API_PASSWORD}" \
+      "http://127.0.0.1:${API_PORT}/version" 2>/dev/null; then
+      return 0
     fi
+    sleep 0.5
   done
-
-  [[ -z "$installer" ]] && return 1
-
-  if [[ "$installer" == "apt-get" ]]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode &>/dev/null || return 1
-  else
-    "$installer" install -y -q qrencode &>/dev/null || return 1
-  fi
-
-  command -v qrencode &>/dev/null
+  return 1
 }
 
 print_qr_code() {
-  local url="$1"
+  local text="$1"
   local BOLD_WHITE='\033[1;37m'
-
+  local qr=""
   echo ""
   echo -e "  ${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "  ${YELLOW}║${NC}  ${BOLD_WHITE}📱 shadowquic (IPv4) 二维码${NC}                              ${YELLOW}║${NC}"
-  echo -e "  ${YELLOW}║${NC}  ${CYAN}用客户端扫码即可导入该节点${NC}                                ${YELLOW}║${NC}"
+  echo -e "  ${YELLOW}║${NC}  ${BOLD_WHITE}📱 订阅二维码${NC}                                            ${YELLOW}║${NC}"
+  echo -e "  ${YELLOW}║${NC}  ${CYAN}由 Core API 生成，扫码即可导入整个订阅${NC}                    ${YELLOW}║${NC}"
   echo -e "  ${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
   echo ""
 
-  if ! ensure_qrencode; then
-    log_warn "无法安装 qrencode, 跳过二维码显示"
-    log_info "可手动安装后查看: qrencode -t ANSIUTF8 '${url}'"
+  qr=$(curl -sf --connect-timeout 5 --max-time 20 \
+    -H "Authorization: Bearer ${API_PASSWORD}" \
+    --get --data-urlencode "text=${text}" \
+    "http://127.0.0.1:${API_PORT}/qr" 2>/dev/null) || {
+    log_warn "无法从 Core API 获取二维码, 跳过显示"
+    return
+  }
+
+  if [[ -z "$qr" ]]; then
+    log_warn "Core API 返回空二维码, 跳过显示"
     return
   fi
 
-  if ! qrencode -t ANSIUTF8 -m 2 "$url" 2>/dev/null; then
-    qrencode -t ANSI -m 2 "$url" || {
-      log_warn "二维码生成失败"
-      return
-    }
-  fi
-
+  printf '%s\n' "$qr"
   echo ""
 }
 
@@ -728,7 +800,6 @@ generate_subscription_url() {
   local urls=()
   local addresses=()
   local families=()
-  local sq_ipv4_url=""
   [[ -n "${SERVER_IPV4:-}" ]] && addresses+=("${SERVER_IPV4}") && families+=("IPv4")
   [[ -n "${SERVER_IPV6:-}" ]] && addresses+=("${SERVER_IPV6}") && families+=("IPv6")
 
@@ -742,15 +813,13 @@ generate_subscription_url() {
     if $sq_enabled; then
       tag=$(printf "%s-%02d-%s" "${SERVER_COUNTRY}" "${node_num}" "$family")
       node_num=$((node_num + 1))
-      local sq_url="sq://${USERNAME}:${PASSWORD}@${uri_host}:${SQ_PORT}?sni=${sni}&zero_rtt=true#${tag}"
-      urls+=("$sq_url")
-      [[ "$family" == "IPv4" ]] && sq_ipv4_url="$sq_url"
+      urls+=("sq://${USERNAME}:${PASSWORD}@${uri_host}:${SQ_PORT}?sni=${sni}&zero_rtt=true#${tag}")
     fi
 
     if $anytls_enabled; then
       tag=$(printf "%s-%02d-%s" "${SERVER_COUNTRY}" "${node_num}" "$family")
       node_num=$((node_num + 1))
-      urls+=("anytls://${PASSWORD}@${uri_host}:${ANYTLS_PORT}?sni=${sni}&jls_u=${USERNAME}&jls_p=${PASSWORD}#${tag}")
+      urls+=("anytls://${PASSWORD}@${uri_host}:${ANYTLS_PORT}/?sni=${sni}&jls_u=${USERNAME}&jls_p=${PASSWORD}#${tag}")
     fi
 
     if $trojan_enabled; then
@@ -760,8 +829,17 @@ generate_subscription_url() {
     fi
   done
 
-  # 将订阅写入文件，方便之后查看、systemd 日志也会引用这个路径
-  printf '%s\n' "${urls[@]}" > "${INSTALL_DIR}/subscription.txt"
+  # Core API 订阅（推荐）：由核心进程动态生成，自动附带流量统计
+  local sub_host="${SERVER_IPV4:-$SERVER_IP}"
+  local sub_uri_host="$sub_host"
+  [[ "$sub_host" == *:* ]] && sub_uri_host="[$sub_host]"
+  local core_sub_url="http://${sub_uri_host}:${API_PORT}/sub?username=${USERNAME}&password=${PASSWORD}"
+
+  # 备份：首行为 Core API 订阅地址（推荐），其余为直连节点
+  {
+    echo "${core_sub_url}"
+    printf '%s\n' "${urls[@]}"
+  } > "${INSTALL_DIR}/subscription.txt"
 
   # 突出显示订阅链接
   local BOLD='\033[1m'
@@ -773,6 +851,12 @@ generate_subscription_url() {
   echo -e "  ${YELLOW}║${NC}  ${CYAN}请复制下面单独一整行链接，或复制备份文件内容${NC}                ${YELLOW}║${NC}"
   echo -e "  ${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
 
+  echo ""
+  echo -e "  ${YELLOW}Core API 订阅（推荐）:${NC}"
+  echo -e "${GREEN}${BOLD}${core_sub_url}${NC}"
+  echo ""
+
+  echo -e "  ${YELLOW}直连节点链接:${NC}"
   local url
   for url in "${urls[@]}"; do
     echo -e "${GREEN}${BOLD}${url}${NC}"
@@ -780,7 +864,19 @@ generate_subscription_url() {
 
   echo ""
 
-  [[ -n "$sq_ipv4_url" ]] && print_qr_code "$sq_ipv4_url"
+  # 验证 Core API 订阅是否可用
+  if ! wait_for_core_api; then
+    log_warn "Core API 暂未就绪, 订阅与二维码可能暂时不可用"
+  fi
+
+  local sub_body=""
+  if sub_body=$(curl -sf --connect-timeout 5 --max-time 20 "${core_sub_url}" 2>/dev/null); then
+    log_info "Core API 订阅已就绪 (${#sub_body} 字节)"
+  else
+    log_warn "暂时无法从 Core API 获取订阅, 请稍后重试: ${core_sub_url}"
+  fi
+
+  print_qr_code "$core_sub_url"
 
   log_info "以上订阅链接已备份到 ${INSTALL_DIR}/subscription.txt"
   log_info "可以随时用 cat ${INSTALL_DIR}/subscription.txt 查看"
@@ -827,6 +923,7 @@ main() {
   download_and_extract
   generate_credentials
   detect_available_port
+  setup_core_api
   detect_server_ip
   detect_server_country
   write_server_config

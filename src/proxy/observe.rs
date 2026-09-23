@@ -835,6 +835,12 @@ impl Observer {
         self.user_stats.get(username).map(|e| e.value().clone())
     }
 
+    pub fn user_password(&self, username: &str) -> Option<String> {
+        self.user_passwords
+            .get(username)
+            .map(|entry| entry.value().clone())
+    }
+
     pub fn all_user_stats(&self) -> Vec<(String, Arc<Stats>)> {
         self.user_stats
             .iter()

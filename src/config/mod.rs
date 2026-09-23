@@ -98,9 +98,23 @@ pub struct Config {
     #[serde(default = "default_log_config")]
     pub log: LogConfig,
     pub api: Option<ApiConfig>,
+    /// Settings used by the core API to render subscription links for clients.
+    pub subscription: Option<SubscriptionConfig>,
     /// Users applied to every inbound that supports user management.
     #[serde(default)]
     pub users: Vec<AuthUser>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SubscriptionConfig {
+    /// Public host (IP or domain) advertised in generated node links.
+    pub host: String,
+    /// Optional base name prefixed to every generated node.
+    pub name: Option<String>,
+    /// `profile-update-interval` header value, in hours.
+    pub update_interval: Option<u64>,
+    /// `profile-web-page-url` header value.
+    pub web_page_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -229,6 +243,7 @@ impl Default for Config {
             observe: None,
             log: LogConfig::default(),
             api: None,
+            subscription: None,
             users: Vec::new(),
         }
     }

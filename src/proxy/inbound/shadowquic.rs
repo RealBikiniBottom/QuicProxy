@@ -475,6 +475,36 @@ impl AnyInbound for ShadowQuicInbound {
         }
         Ok(())
     }
+
+    fn build_sub_link(&self, host: &str, user: &AuthUser, name: &str) -> Option<String> {
+        use crate::proxy::inbound::{encode_uri_component, uri_host};
+
+        if !self
+            .users
+            .load()
+            .iter()
+            .any(|u| u.username == user.username)
+        {
+            return None;
+        }
+
+        let host = uri_host(host);
+        let mut params: Vec<String> = Vec::new();
+        if let Some(sni) = self.tls.sni.as_deref().filter(|s| !s.is_empty()) {
+            params.push(format!("sni={}", encode_uri_component(sni)));
+        }
+        params.push("zero_rtt=true".to_string());
+
+        Some(format!(
+            "sq://{}:{}@{}:{}?{}#{}",
+            encode_uri_component(&user.username),
+            encode_uri_component(&user.password),
+            host,
+            self.port,
+            params.join("&"),
+            encode_uri_component(name),
+        ))
+    }
 }
 
 #[cfg(test)]

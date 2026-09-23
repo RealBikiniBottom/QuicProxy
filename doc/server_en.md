@@ -33,9 +33,9 @@ The script automatically:
 1. Downloads the latest `quicproxy` binary
 2. Generates random credentials
 3. Detects the port and public IP automatically
-4. Writes the server configuration to `server.json5`
+4. Writes the server configuration to `server.json5` (including `observe` / `api` / `subscription`)
 5. Registers and starts a `systemd` service
-6. Prints the subscription link
+6. Prints the subscription link (Core API subscription + direct nodes) and a QR code
 
 ```bash
 # Show the subscription link
@@ -46,6 +46,18 @@ systemctl status   quicproxy
 systemctl restart  quicproxy
 journalctl -u quicproxy -f
 ```
+
+---
+
+## Subscription
+
+The script enables the core API and observe, then prints a Core API subscription URL:
+
+```
+http://<public-ip>:<api-port>/sub?username=<user>&password=<password>
+```
+
+Import this URL directly in the client (the script also renders a QR code through the Core API). Node links are generated dynamically by each inbound, and the `subscription-userinfo` response header reports the user's used traffic in real time. Traffic and time are unlimited by default, while consumption keeps being counted.
 
 ---
 
@@ -68,7 +80,8 @@ Key settings include inbound usernames and passwords, ports, and TLS/SNI options
 /opt/quicproxy/
 ├── quicproxy            # Binary
 ├── server.json5         # Core configuration
-└── subscription.txt     # Subscription link
+├── subscription.txt     # Subscription link
+└── .core_api            # Core API password and port
 ```
 
 ---

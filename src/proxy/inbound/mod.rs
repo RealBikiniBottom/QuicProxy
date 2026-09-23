@@ -27,9 +27,54 @@ use crate::utils::system_proxy::{SystemProxyGuard, set_system_proxy};
 use anyhow::bail;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::error;
+
+/// Encode everything except the RFC 3986 unreserved characters so a value can be
+/// safely embedded in a URI userinfo, query or fragment component.
+const URI_COMPONENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'!')
+    .add(b'"')
+    .add(b'#')
+    .add(b'$')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b'+')
+    .add(b',')
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'=')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+pub(crate) fn encode_uri_component(value: &str) -> String {
+    utf8_percent_encode(value, URI_COMPONENT).to_string()
+}
+
+/// Bracket an IPv6 literal so it can be used as a URI authority.
+pub(crate) fn uri_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
 
 pub fn init_inbounds(cfg: &Config) -> anyhow::Result<()> {
     let observer = get_observer();
@@ -157,6 +202,12 @@ pub trait AnyInbound: Send + Sync {
     async fn remove_user(&self, _username: &str) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Build a share link for this inbound using the given public host and user.
+    /// Returns `None` for protocols that have no share format.
+    fn build_sub_link(&self, _host: &str, _user: &AuthUser, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 static INBOUNDS: LazyLock<DashMap<String, Arc<dyn AnyInbound>>> = LazyLock::new(DashMap::new);
@@ -167,6 +218,36 @@ pub fn register_inbound(tag: &str, inbound: Arc<dyn AnyInbound>) {
 
 pub fn shutdown_inbounds() {
     INBOUNDS.clear();
+}
+
+/// Build share links for every registered inbound, using the public host and
+/// the given user. Inbounds are ordered by tag for a stable subscription body.
+pub fn build_sub_links(host: &str, user: &AuthUser, base_name: Option<&str>) -> Vec<String> {
+    let mut inbounds: Vec<(String, Arc<dyn AnyInbound>)> = INBOUNDS
+        .iter()
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    inbounds.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut links = Vec::new();
+    for (tag, inbound) in inbounds {
+        let protocol = inbound.protocol();
+        let name = match base_name {
+            Some(base) if !base.is_empty() => format!("{base}-{protocol}"),
+            _ => {
+                let trimmed = tag.strip_suffix("_inbound").unwrap_or(&tag);
+                if trimmed.is_empty() {
+                    protocol.to_string()
+                } else {
+                    trimmed.to_string()
+                }
+            }
+        };
+        if let Some(link) = inbound.build_sub_link(host, user, &name) {
+            links.push(link);
+        }
+    }
+    links
 }
 
 /// Apply a user change to every inbound that supports user management.
@@ -191,8 +272,22 @@ pub async fn apply_user_change(user: &AuthUser, remove: bool) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::create_tcp_listener;
+    use super::{create_tcp_listener, encode_uri_component, uri_host};
     use tokio::net::TcpStream;
+
+    #[test]
+    fn uri_component_encodes_reserved_characters() {
+        assert_eq!(encode_uri_component("my tag"), "my%20tag");
+        assert_eq!(encode_uri_component("a&b=c"), "a%26b%3Dc");
+        assert_eq!(encode_uri_component("cdn.example.com"), "cdn.example.com");
+    }
+
+    #[test]
+    fn uri_host_brackets_ipv6_only() {
+        assert_eq!(uri_host("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(uri_host("1.2.3.4"), "1.2.3.4");
+        assert_eq!(uri_host("[2001:db8::1]"), "[2001:db8::1]");
+    }
 
     #[tokio::test]
     async fn unspecified_ipv6_listener_accepts_both_ip_families() {

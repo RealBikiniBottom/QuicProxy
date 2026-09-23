@@ -8,11 +8,14 @@ use crate::proxy::{
     router::get_router,
 };
 use crate::utils::http_outbound::request_via_outbound_with_dns;
-use crate::{config::RouterMode, proxy::inbound::create_tcp_listener};
+use crate::{
+    config::{AuthUser, RouterMode},
+    proxy::inbound::{build_sub_links, create_tcp_listener},
+};
 use axum::{
     Router,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{get, put},
 };
@@ -34,6 +37,7 @@ pub struct CoreApiState {
     pub observer: Arc<Observer>,
     pub router: Arc<crate::proxy::router::Router>,
     pub shutdown_tx: Sender<()>,
+    pub subscription: Option<crate::config::SubscriptionConfig>,
 }
 
 // ─── Router 构建 ───
@@ -60,7 +64,7 @@ pub async fn init_core_api(
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
     let password: Arc<str> = Arc::from(api.password);
 
-    let app = Router::new()
+    let protected = Router::new()
         .route("/observe", get(get_observe))
         .route("/selector", put(put_selector))
         .route("/mode", get(get_mode).put(put_mode))
@@ -75,14 +79,20 @@ pub async fn init_core_api(
         .route("/users", get(get_users).post(post_user).delete(delete_user))
         .route("/users/stats", get(get_user_stats))
         .route("/version", get(get_runtime_core_version))
+        .route("/qr", get(get_qr))
         .route_layer(axum::middleware::from_fn_with_state(
             password,
             auth_middleware,
-        ))
+        ));
+
+    let app = Router::new()
+        .route("/sub", get(get_subscription))
+        .merge(protected)
         .layer(axum::middleware::from_fn(cors_middleware))
         .with_state(CoreApiState {
             shutdown_tx,
             router: get_router()?,
+            subscription: cfg.subscription.clone(),
             observer: match get_observer() {
                 Some(o) => o,
                 None => {
@@ -512,6 +522,125 @@ async fn get_user_stats(
     Ok(Json(stats))
 }
 
+// ─── Handler: Subscription ───
+
+#[derive(Deserialize)]
+struct SubscriptionParams {
+    username: Option<String>,
+    password: Option<String>,
+}
+
+async fn get_subscription(
+    State(state): State<CoreApiState>,
+    Query(params): Query<SubscriptionParams>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let Some(cfg) = &state.subscription else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let Some(username) = params.username.as_deref().filter(|s| !s.is_empty()) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let Some(password) = params.password.as_deref() else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    match state.observer.user_password(username) {
+        Some(stored) if stored == password => {}
+        _ => return Err(StatusCode::UNAUTHORIZED),
+    }
+
+    let user = AuthUser {
+        username: username.to_string(),
+        password: password.to_string(),
+    };
+    let links = build_sub_links(&cfg.host, &user, cfg.name.as_deref());
+    if links.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let (upload, download) = state
+        .observer
+        .user_stats(username)
+        .map(|stats| (stats.get_upload_bytes(), stats.get_download_bytes()))
+        .unwrap_or((0, 0));
+
+    let mut response = (StatusCode::OK, links.join("\n") + "\n").into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        HeaderName::from_static("subscription-userinfo"),
+        HeaderValue::from_str(&format!(
+            "upload={upload}; download={download}; total=0; expire=0"
+        ))
+        .unwrap(),
+    );
+
+    let display_name = cfg.name.clone().unwrap_or_else(|| "quicproxy".to_string());
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "attachment; filename*=UTF-8''{}",
+        crate::proxy::inbound::encode_uri_component(&display_name)
+    )) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    if let Some(interval) = cfg.update_interval
+        && let Ok(value) = HeaderValue::from_str(&interval.to_string())
+    {
+        headers.insert(HeaderName::from_static("profile-update-interval"), value);
+    }
+    if let Some(url) = &cfg.web_page_url
+        && let Ok(value) = HeaderValue::from_str(url)
+    {
+        headers.insert(HeaderName::from_static("profile-web-page-url"), value);
+    }
+
+    Ok(response)
+}
+
+// ─── Handler: QR ───
+
+#[derive(Deserialize)]
+struct QrParams {
+    text: String,
+}
+
+async fn get_qr(Query(params): Query<QrParams>) -> Result<impl IntoResponse, StatusCode> {
+    let text = render_qr_text(&params.text).ok_or(StatusCode::BAD_REQUEST)?;
+    let mut response = (StatusCode::OK, text).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    Ok(response)
+}
+
+/// Render a QR code as plain text using `#` for dark modules and spaces for
+/// light ones, with a two-module quiet zone. Each module is two characters wide
+/// so the result stays roughly square in a terminal.
+fn render_qr_text(data: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    let width = code.width();
+    let colors = code.to_colors();
+    let quiet = 2usize;
+    let total = width + quiet * 2;
+
+    let mut out = String::with_capacity(total * (total * 2 + 1));
+    for y in 0..total {
+        for x in 0..total {
+            let dark = x >= quiet
+                && x < quiet + width
+                && y >= quiet
+                && y < quiet + width
+                && colors[(y - quiet) * width + (x - quiet)] == qrcode::Color::Dark;
+            out.push_str(if dark { "##" } else { "  " });
+        }
+        out.push('\n');
+    }
+    Some(out)
+}
+
 fn system_instance() -> &'static Mutex<System> {
     static SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
     SYSTEM.get_or_init(|| Mutex::new(System::new_all()))
@@ -611,7 +740,7 @@ struct ObserveResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::build_core_version_info;
+    use super::{build_core_version_info, render_qr_text};
 
     #[test]
     fn core_version_metadata_is_available() {
@@ -619,5 +748,16 @@ mod tests {
 
         assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
         assert!(!info.build_date.is_empty());
+    }
+
+    #[test]
+    fn qr_renders_plain_text_with_quiet_zone() {
+        let qr = render_qr_text("hello").expect("qr");
+        let lines: Vec<&str> = qr.lines().collect();
+
+        assert!(lines.len() > 10);
+        assert!(lines.iter().all(|line| line.len() == lines[0].len()));
+        assert!(qr.contains('#'));
+        assert!(lines[0].trim().is_empty(), "first row should be quiet zone");
     }
 }

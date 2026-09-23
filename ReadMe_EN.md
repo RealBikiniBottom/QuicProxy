@@ -108,6 +108,22 @@ A backend API for user management is provided for free, available for trojan / a
 
 These endpoints are served by the core API (`api` config) and use the same `Authorization: <password>` auth. Users can be seeded through the top-level `users` list or an inbound's `users`; runtime additions and traffic counters persist to the observe cache.
 
+The core API also distributes subscriptions. Node links are generated dynamically by each inbound, so there is nothing to maintain by hand:
+
+- `GET /sub?username=alice&password=secret`: a public endpoint (no API password) that returns the user's sq / anytls / trojan nodes and reports their used traffic through the `subscription-userinfo` response header. Traffic and time are unlimited by default (`total=0; expire=0`), while consumption keeps being counted
+- `GET /qr?text=<url>`: renders text as a plain-text QR code (`#`/spaces) and requires the API password
+
+The `subscription` config supplies the public host and metadata:
+
+```json5
+"subscription": {
+  "host": "1.2.3.4",             // public address embedded in node links
+  "name": "MyNode",              // optional node name prefix
+  "update_interval": 24,         // optional profile-update-interval header (hours)
+  "web_page_url": "https://..."  // optional profile-web-page-url header
+}
+```
+
 We guarantee that none of our projects will include ads that redirect your users to competing providers such as airports, VPNs, VPS services, or IP proxy sellers.
 
 ## Donations

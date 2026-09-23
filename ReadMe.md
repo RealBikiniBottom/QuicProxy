@@ -116,6 +116,22 @@ Full Cone 且使用 UDP Extension，完美解决代理 QUIC 速度慢等历史�
 
 以上接口由核心 API（`api` 配置）提供，沿用 `Authorization: <password>` 鉴权。用户可通过配置文件顶层的 `users` 或 inbound 的 `users` 预置，运行时新增的用户与流量会持久化到 observe 的 cache。
 
+核心 API 同时提供订阅分发能力，节点链接由各 inbound 动态生成，无需手工维护：
+
+- `GET /sub?username=alice&password=secret`：公开接口（无需 API 密码），按用户返回 sq / anytls / trojan 节点订阅，并在 `subscription-userinfo` 响应头中携带该用户已用流量；默认不限流量、不限时间（`total=0; expire=0`），但持续统计耗费流量
+- `GET /qr?text=<url>`：将文本渲染为纯文本二维码（`#`/空格），需 API 密码鉴权
+
+订阅使用 `subscription` 配置指定对外主机与元信息，例如：
+
+```json5
+"subscription": {
+  "host": "1.2.3.4",             // 写入节点链接的公网地址
+  "name": "MyNode",              // 可选，节点名前缀
+  "update_interval": 24,         // 可选，profile-update-interval 响应头（小时）
+  "web_page_url": "https://..."  // 可选，profile-web-page-url 响应头
+}
+```
+
 我们保证：所有项目都不会出现机场、VPN、VPS、IP 代理等将自己客户引流到其他竞争对手的广告。
 
 ## 捐助
