@@ -15,16 +15,16 @@ use bytes::{Buf, BytesMut};
 use futures::{Sink, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::timeout;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest,
     error::Error as WsError,
     protocol::{Message, WebSocketConfig},
 };
-use tokio_tungstenite::WebSocketStream;
 
 use crate::config::TransportConfig;
-use crate::proxy::outbound::AnyStream;
 use crate::proxy::TargetAddr;
+use crate::proxy::outbound::AnyStream;
 
 /// Wrap `stream` (an established TCP or TCP+TLS connection) with the stream
 /// transport configured on an outbound.
@@ -59,9 +59,9 @@ async fn connect_websocket(
 ) -> Result<WsByteStream<AnyStream>> {
     let authority = ws_authority(transport, server);
     let path = ws_path(transport);
-    let request = format!("ws://{}{}", authority, path).into_client_request().map_err(|e| {
-        new_ws_error(format!("invalid websocket request URL: {}", e))
-    })?;
+    let request = format!("ws://{}{}", authority, path)
+        .into_client_request()
+        .map_err(|e| new_ws_error(format!("invalid websocket request URL: {}", e)))?;
 
     let config = WebSocketConfig::default();
     let (ws, _response) = timeout(
@@ -192,8 +192,8 @@ where
             Poll::Ready(Ok(())) => {}
         }
 
-        if let Err(error) = Pin::new(&mut this.inner)
-            .start_send(Message::Binary(buf.to_vec().into()))
+        if let Err(error) =
+            Pin::new(&mut this.inner).start_send(Message::Binary(buf.to_vec().into()))
         {
             return Poll::Ready(Err(ws_io_error(error)));
         }
@@ -213,10 +213,7 @@ where
         }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
         match Pin::new(&mut this.inner).poll_flush(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
@@ -226,10 +223,7 @@ where
         }
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
         // Sends the websocket close frame (half-close). Reads may still
         // continue until the peer closes the connection, mirroring TCP

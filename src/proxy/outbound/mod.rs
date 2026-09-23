@@ -256,8 +256,7 @@ pub fn try_get_outbound_by_tag(tag: &str) -> Arc<dyn AnyOutbound> {
         Some(r) => return r.clone(),
         // Falling back to the default can only fail before init_outbounds has
         // run, which is a startup-ordering invariant violation.
-        None => get_default_outbound()
-            .expect("default outbound must be registered before lookups"),
+        None => get_default_outbound().expect("default outbound must be registered before lookups"),
     }
 }
 

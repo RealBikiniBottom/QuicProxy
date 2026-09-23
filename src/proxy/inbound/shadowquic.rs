@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use quinn::{ConnectionError, VarInt};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -18,10 +18,9 @@ use crate::proxy::router::Router;
 use crate::proxy::router::get_router;
 use crate::proxy::shadowquic_udp::{
     ExtensionRequest, PerConnectionState, ShadowQuicUdpPacket, ShadowUdpReceiver,
-    UDP_CONTEXT_ID_RECONNECT_MARGIN, gen_sunny_auth_hash, read_context_id,
-    read_extension_request, read_request_head, read_sunny_auth, run_bistream_recv_listener,
-    start_datagram_loop, start_unistream_listener, write_conn_stats_response,
-    write_ext_error_not_available,
+    UDP_CONTEXT_ID_RECONNECT_MARGIN, gen_sunny_auth_hash, read_context_id, read_extension_request,
+    read_request_head, read_sunny_auth, run_bistream_recv_listener, start_datagram_loop,
+    start_unistream_listener, write_conn_stats_response, write_ext_error_not_available,
 };
 use crate::proxy::{TargetAddr, TlsConfig};
 use anyhow::Context;
@@ -64,7 +63,10 @@ impl ShadowQuicInbound {
         }
 
         if !tls.enable_jls && users.is_empty() {
-            anyhow::bail!("ShadowQuic inbound '{}' requires username and password", tag);
+            anyhow::bail!(
+                "ShadowQuic inbound '{}' requires username and password",
+                tag
+            );
         }
 
         let users = Arc::new(ArcSwap::from_pointee(users));
@@ -247,10 +249,9 @@ impl AnyInbound for ShadowQuicInbound {
 
                                 let mut bistream = Box::new(QuinnBistream::new(send, recv));
                                 if !is_authed {
-                                    let received =
-                                        read_sunny_auth(&mut bistream, session_timeout)
-                                            .await
-                                            .context("auth failed")?;
+                                    let received = read_sunny_auth(&mut bistream, session_timeout)
+                                        .await
+                                        .context("auth failed")?;
                                     authed_user = observer
                                         .as_ref()
                                         .and_then(|o| o.authenticate(&tag, &received))
@@ -265,9 +266,7 @@ impl AnyInbound for ShadowQuicInbound {
                                         bail!("Invalid auth hash");
                                     }
                                     if let Some(mut entry) = conns.get_mut(&remote_addr) {
-                                        entry.1 = authed_user
-                                            .as_ref()
-                                            .map(|u| u.username.clone());
+                                        entry.1 = authed_user.as_ref().map(|u| u.username.clone());
                                     }
 
                                     is_authed = true;
@@ -316,9 +315,7 @@ impl AnyInbound for ShadowQuicInbound {
                                                     o = field::Empty
                                                 );
                                                 router
-                                                    .dispatch_stream(
-                                                        bistream, &target, &tag, user,
-                                                    )
+                                                    .dispatch_stream(bistream, &target, &tag, user)
                                                     .instrument(span)
                                                     .await?;
                                             }
@@ -476,7 +473,7 @@ impl AnyInbound for ShadowQuicInbound {
         Ok(())
     }
 
-    fn build_sub_link(&self, host: &str, user: &AuthUser, name: &str) -> Option<String> {
+    fn build_sub_link(&self, host: &str, user: &AuthUser, name: &str) -> Vec<String> {
         use crate::proxy::inbound::{encode_uri_component, uri_host};
 
         if !self
@@ -485,7 +482,7 @@ impl AnyInbound for ShadowQuicInbound {
             .iter()
             .any(|u| u.username == user.username)
         {
-            return None;
+            return Vec::new();
         }
 
         let host = uri_host(host);
@@ -495,7 +492,7 @@ impl AnyInbound for ShadowQuicInbound {
         }
         params.push("zero_rtt=true".to_string());
 
-        Some(format!(
+        vec![format!(
             "sq://{}:{}@{}:{}?{}#{}",
             encode_uri_component(&user.username),
             encode_uri_component(&user.password),
@@ -503,7 +500,7 @@ impl AnyInbound for ShadowQuicInbound {
             self.port,
             params.join("&"),
             encode_uri_component(name),
-        ))
+        )]
     }
 }
 
@@ -555,7 +552,11 @@ mod tests {
         let users = inbound.users.load();
         assert_eq!(users.len(), 2);
         assert_eq!(
-            users.iter().find(|u| u.username == "alice").unwrap().password,
+            users
+                .iter()
+                .find(|u| u.username == "alice")
+                .unwrap()
+                .password,
             "a2"
         );
     }

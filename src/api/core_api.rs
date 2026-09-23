@@ -553,7 +553,7 @@ async fn get_subscription(
         username: username.to_string(),
         password: password.to_string(),
     };
-    let links = build_sub_links(&cfg.host, &user, cfg.name.as_deref());
+    let links = build_sub_links(&cfg.hosts(), &user, cfg.name.as_deref());
     if links.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -616,27 +616,46 @@ async fn get_qr(Query(params): Query<QrParams>) -> Result<impl IntoResponse, Sta
     Ok(response)
 }
 
-/// Render a QR code as plain text using `#` for dark modules and spaces for
-/// light ones, with a two-module quiet zone. Each module is two characters wide
-/// so the result stays roughly square in a terminal.
+/// Render a QR code for a terminal using half-block glyphs, packing two module
+/// rows into one text line. Modules stay square (a terminal cell is about twice
+/// as tall as it is wide) while the code remains narrow enough not to wrap in an
+/// 80-column terminal. ANSI colors force a white background with black modules
+/// so scanners work regardless of the terminal's color scheme.
 fn render_qr_text(data: &str) -> Option<String> {
+    const QR_COLOR: &str = "\x1b[30;47m";
+    const RESET: &str = "\x1b[0m";
+
     let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
     let width = code.width();
     let colors = code.to_colors();
     let quiet = 2usize;
     let total = width + quiet * 2;
 
-    let mut out = String::with_capacity(total * (total * 2 + 1));
-    for y in 0..total {
+    let is_dark = |x: usize, y: usize| -> bool {
+        x >= quiet
+            && x < quiet + width
+            && y >= quiet
+            && y < quiet + width
+            && colors[(y - quiet) * width + (x - quiet)] == qrcode::Color::Dark
+    };
+
+    let mut out = String::with_capacity((total / 2 + 1) * (total + 12));
+    let mut y = 0;
+    while y < total {
+        out.push_str(QR_COLOR);
         for x in 0..total {
-            let dark = x >= quiet
-                && x < quiet + width
-                && y >= quiet
-                && y < quiet + width
-                && colors[(y - quiet) * width + (x - quiet)] == qrcode::Color::Dark;
-            out.push_str(if dark { "##" } else { "  " });
+            let top = is_dark(x, y);
+            let bottom = y + 1 < total && is_dark(x, y + 1);
+            out.push(match (top, bottom) {
+                (true, true) => '\u{2588}',
+                (false, false) => ' ',
+                (true, false) => '\u{2580}',
+                (false, true) => '\u{2584}',
+            });
         }
+        out.push_str(RESET);
         out.push('\n');
+        y += 2;
     }
     Some(out)
 }
@@ -751,13 +770,40 @@ mod tests {
     }
 
     #[test]
-    fn qr_renders_plain_text_with_quiet_zone() {
+    fn qr_renders_half_blocks_with_quiet_zone() {
         let qr = render_qr_text("hello").expect("qr");
-        let lines: Vec<&str> = qr.lines().collect();
+        let stripped = strip_ansi(&qr);
+        let lines: Vec<&str> = stripped.lines().collect();
 
-        assert!(lines.len() > 10);
-        assert!(lines.iter().all(|line| line.len() == lines[0].len()));
-        assert!(qr.contains('#'));
+        assert!(lines.len() > 5);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().count() == lines[0].chars().count())
+        );
+        assert!(stripped.contains('\u{2588}'));
         assert!(lines[0].trim().is_empty(), "first row should be quiet zone");
+        assert!(
+            lines[0].chars().count() < 45,
+            "QR should fit an 80-column terminal"
+        );
+    }
+
+    fn strip_ansi(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 }

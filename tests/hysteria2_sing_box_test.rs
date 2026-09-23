@@ -197,7 +197,9 @@ async fn wait_for_tcp(port: u16, child: &mut ChildGuard, name: &str) {
 }
 
 async fn spawn_tcp_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TCP echo");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind TCP echo");
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
@@ -480,9 +482,7 @@ async fn start_hy2_pair(
     ));
     let mut command = Command::new(&*SING_BOX_BINARY);
     command.arg("run").arg("-c").arg(server_config.path());
-    let child = command
-        .spawn()
-        .expect("spawn sing-box hy2 server");
+    let child = command.spawn().expect("spawn sing-box hy2 server");
     let mut server = ChildGuard {
         child,
         _config: server_config,

@@ -221,7 +221,9 @@ mod user_management_test {
             // The revoked QUIC connection must not keep serving new streams.
             // With the connection left alive, a second request would reuse it
             // and succeed despite the removed credential.
-            let second = tokio::net::TcpStream::connect(ctx.last_proxy().addr).await.unwrap();
+            let second = tokio::net::TcpStream::connect(ctx.last_proxy().addr)
+                .await
+                .unwrap();
             let reused = open_proxied_stream_on(second, &ctx, Duration::from_secs(2))
                 .await
                 .is_ok();
@@ -238,7 +240,6 @@ mod user_management_test {
             .expect("remove-user kill test timed out after 25s");
     }
 }
-
 
 // ─── Connection Reuse Tests ───────────────────────────────────────────────
 mod connection_reuse_test {

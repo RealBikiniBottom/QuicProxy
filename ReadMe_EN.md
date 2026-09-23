@@ -111,16 +111,24 @@ These endpoints are served by the core API (`api` config) and use the same `Auth
 The core API also distributes subscriptions. Node links are generated dynamically by each inbound, so there is nothing to maintain by hand:
 
 - `GET /sub?username=alice&password=secret`: a public endpoint (no API password) that returns the user's sq / anytls / trojan nodes and reports their used traffic through the `subscription-userinfo` response header. Traffic and time are unlimited by default (`total=0; expire=0`), while consumption keeps being counted
-- `GET /qr?text=<url>`: renders text as a plain-text QR code (`#`/spaces) and requires the API password
+- `GET /qr?text=<url>`: renders text as a terminal QR code (half-block glyphs that merge two module rows per line so the code fits an 80-column terminal) and requires the API password
 
 The `subscription` config supplies the public host and metadata:
 
 ```json5
 "subscription": {
-  "host": "1.2.3.4",             // public address embedded in node links
+  "host": "1.2.3.4",             // public address embedded in node links; string or array
   "name": "MyNode",              // optional node name prefix
   "update_interval": 24,         // optional profile-update-interval header (hours)
   "web_page_url": "https://..."  // optional profile-web-page-url header
+}
+```
+
+`host` may also be an array to publish several addresses at once (IPv6 nodes lead, and every node name is suffixed with `-IPv4` / `-IPv6`):
+
+```json5
+"subscription": {
+  "host": ["2001:db8::1", "1.2.3.4"]
 }
 ```
 

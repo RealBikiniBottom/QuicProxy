@@ -146,10 +146,7 @@ impl ShadowQuicOutbound {
                         Ok(()) => {
                             let mut lock = cache.lock().await;
                             if lock.take().is_some() {
-                                info!(
-                                    "[{}] reset shadowquic outbound because iface changed",
-                                    tag
-                                );
+                                info!("[{}] reset shadowquic outbound because iface changed", tag);
                             }
                         }
                         // Lagged means we missed change events, not that the

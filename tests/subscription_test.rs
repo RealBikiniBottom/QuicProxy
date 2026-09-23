@@ -117,7 +117,7 @@ fn write_config(api_port: u16, inbound_port: u16, db_path: &Path) -> PathBuf {
         "observe": { "enabled": true, "cache": "obs_cache", "log_interval": 30 },
         "api": { "address": "127.0.0.1", "port": api_port, "password": API_PASSWORD },
         "subscription": {
-            "host": "203.0.113.7",
+            "host": ["203.0.113.7", "2001:db8::1"],
             "name": "TestNode",
             "update_interval": 24,
             "web_page_url": "https://example.com"
@@ -166,15 +166,31 @@ async fn subscription_and_qr_endpoints() {
         Some("24")
     );
     let body = response.text().await.expect("sub body");
-    assert!(
-        body.starts_with(&format!("trojan://{PASSWORD}@203.0.113.7:{inbound_port}")),
-        "unexpected subscription body: {body}"
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some(
+            format!(
+                "trojan://{PASSWORD}@[2001:db8::1]:{inbound_port}?sni=cdn.example.com&type=tcp&insecure=true#TestNode-trojan-IPv6"
+            )
+            .as_str()
+        ),
+        "IPv6 node should lead the subscription body: {body}"
+    );
+    assert_eq!(
+        lines.get(1).copied(),
+        Some(
+            format!(
+                "trojan://{PASSWORD}@203.0.113.7:{inbound_port}?sni=cdn.example.com&type=tcp&insecure=true#TestNode-trojan-IPv4"
+            )
+            .as_str()
+        ),
+        "IPv4 node should follow: {body}"
     );
     assert!(
         body.contains("sni=cdn.example.com"),
         "subscription should carry the inbound SNI: {body}"
     );
-    assert!(body.contains("TestNode-trojan"), "node name: {body}");
 
     // Wrong password must be rejected.
     let response = client
@@ -203,7 +219,10 @@ async fn subscription_and_qr_endpoints() {
         .expect("GET /qr");
     assert_eq!(authorized.status(), reqwest::StatusCode::OK);
     let qr = authorized.text().await.expect("qr body");
-    assert!(qr.contains('#'), "QR should contain dark modules");
+    assert!(
+        qr.contains('\u{2588}'),
+        "QR should contain dark modules: {qr:?}"
+    );
 
     core.stop().await;
     let _ = std::fs::remove_file(&db_path);

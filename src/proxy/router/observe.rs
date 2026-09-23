@@ -220,7 +220,9 @@ impl<S> Drop for ObservedStream<S> {
         if let Some(ref s) = self.extra_stats {
             s.dec_active_tcp();
         }
-        if self.is_inbound && let Some(ref s) = self.user_stats {
+        if self.is_inbound
+            && let Some(ref s) = self.user_stats
+        {
             s.dec_active_tcp();
         }
     }

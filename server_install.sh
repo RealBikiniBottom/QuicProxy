@@ -562,6 +562,17 @@ write_server_config() {
 
   local sni="www.apple.com"
 
+  # 订阅对外地址：同时写入 IPv6 与 IPv4（如有），IPv6 排在前面
+  local sub_hosts=""
+  if [[ -n "${SERVER_IPV6:-}" ]]; then
+    sub_hosts="\"${SERVER_IPV6}\""
+  fi
+  if [[ -n "${SERVER_IPV4:-}" ]]; then
+    [[ -n "$sub_hosts" ]] && sub_hosts="${sub_hosts}, "
+    sub_hosts="${sub_hosts}\"${SERVER_IPV4}\""
+  fi
+  [[ -z "$sub_hosts" ]] && sub_hosts="\"${SERVER_IP}\""
+
   local sq_enabled=false
   local anytls_enabled=false
   local trojan_enabled=false
@@ -679,7 +690,7 @@ JSON5EOF
     "password": "${API_PASSWORD}"
   },
   "subscription": {
-    "host": "${SERVER_IPV4:-$SERVER_IP}",
+    "host": [${sub_hosts}],
     "name": "${SERVER_COUNTRY}",
     "update_interval": 24,
     "web_page_url": "https://github.com/RealBikiniBottom/QuicProxy"
@@ -800,8 +811,8 @@ generate_subscription_url() {
   local urls=()
   local addresses=()
   local families=()
-  [[ -n "${SERVER_IPV4:-}" ]] && addresses+=("${SERVER_IPV4}") && families+=("IPv4")
   [[ -n "${SERVER_IPV6:-}" ]] && addresses+=("${SERVER_IPV6}") && families+=("IPv6")
+  [[ -n "${SERVER_IPV4:-}" ]] && addresses+=("${SERVER_IPV4}") && families+=("IPv4")
 
   local index host family uri_host tag
   for index in "${!addresses[@]}"; do

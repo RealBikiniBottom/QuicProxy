@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
@@ -74,16 +73,6 @@ pub struct AuthUser {
     pub password: String,
 }
 
-impl AuthUser {
-    fn new(username: String, password: String) -> Arc<Self> {
-        Arc::new(Self { username, password })
-    }
-
-    fn hash(&self) -> String {
-        format!("{}:{}", self.username, self.password)
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -107,14 +96,41 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SubscriptionConfig {
-    /// Public host (IP or domain) advertised in generated node links.
-    pub host: String,
+    /// Public host(s) advertised in generated node links. Accepts either a
+    /// single string or an array, e.g. `"1.2.3.4"` or
+    /// `["2001:db8::1", "1.2.3.4"]`.
+    pub host: SubscriptionHost,
     /// Optional base name prefixed to every generated node.
     pub name: Option<String>,
     /// `profile-update-interval` header value, in hours.
     pub update_interval: Option<u64>,
     /// `profile-web-page-url` header value.
     pub web_page_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum SubscriptionHost {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl SubscriptionConfig {
+    /// Non-empty hosts with IPv6 entries first so v6 nodes lead the
+    /// subscription body.
+    pub fn hosts(&self) -> Vec<String> {
+        let raw = match &self.host {
+            SubscriptionHost::Single(host) => vec![host.clone()],
+            SubscriptionHost::Multiple(hosts) => hosts.clone(),
+        };
+        let mut hosts: Vec<String> = raw
+            .into_iter()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+        hosts.sort_by_key(|h| !h.contains(':'));
+        hosts
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -477,10 +493,7 @@ impl InboundConfig {
             && tls.enable_jls
             && let Some(password) = &tls.jls_password
         {
-            let username = tls
-                .jls_username
-                .clone()
-                .unwrap_or_else(|| password.clone());
+            let username = tls.jls_username.clone().unwrap_or_else(|| password.clone());
             push(AuthUser {
                 username,
                 password: password.clone(),
@@ -718,7 +731,10 @@ impl Default for RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthUser, CacheConfig, DnsConfig, InboundConfig, OutboundConfig, duration_from_secs_or};
+    use super::{
+        AuthUser, CacheConfig, DnsConfig, InboundConfig, OutboundConfig, SubscriptionConfig,
+        duration_from_secs_or,
+    };
     use crate::cache::DEFAULT_MEMORY_SIZE_MB;
     use serde_json::json;
     use std::time::Duration;
@@ -848,5 +864,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(inbound.socket_addr().unwrap(), "[::]:1080".parse().unwrap());
+    }
+
+    #[test]
+    fn subscription_host_accepts_string_or_array_with_ipv6_first() {
+        let single: SubscriptionConfig = serde_json::from_value(json!({
+            "host": "1.2.3.4"
+        }))
+        .unwrap();
+        assert_eq!(single.hosts(), vec!["1.2.3.4".to_string()]);
+
+        let multiple: SubscriptionConfig = serde_json::from_value(json!({
+            "host": ["1.2.3.4", "2001:db8::1", ""]
+        }))
+        .unwrap();
+        assert_eq!(
+            multiple.hosts(),
+            vec!["2001:db8::1".to_string(), "1.2.3.4".to_string()]
+        );
     }
 }

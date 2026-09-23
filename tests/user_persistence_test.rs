@@ -197,10 +197,8 @@ fn write_config(api_port: u16, inbound_port: u16, db_path: &Path) -> PathBuf {
 
 #[tokio::test]
 async fn users_survive_restart_and_deletion_stays_deleted() {
-    let db_path = std::env::temp_dir().join(format!(
-        "quicproxy-user-persist-{}.db",
-        std::process::id()
-    ));
+    let db_path =
+        std::env::temp_dir().join(format!("quicproxy-user-persist-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&db_path);
 
     let api_port = free_port().await;

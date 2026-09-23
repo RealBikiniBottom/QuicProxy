@@ -126,9 +126,11 @@ pub fn init_inbounds(cfg: &Config) -> anyhow::Result<()> {
                 for user in &merged_users {
                     observer.upsert_user(&user.username);
                     observer.set_user_password(&user.username, &user.password);
-                    if let Ok(credential) =
-                        crate::proxy::observe::credential_hash(inbound.protocol(), &user.username, &user.password)
-                    {
+                    if let Ok(credential) = crate::proxy::observe::credential_hash(
+                        inbound.protocol(),
+                        &user.username,
+                        &user.password,
+                    ) {
                         observer.set_user_credential(name, &user.username, credential);
                     }
                 }
@@ -203,10 +205,10 @@ pub trait AnyInbound: Send + Sync {
         Ok(())
     }
 
-    /// Build a share link for this inbound using the given public host and user.
-    /// Returns `None` for protocols that have no share format.
-    fn build_sub_link(&self, _host: &str, _user: &AuthUser, _name: &str) -> Option<String> {
-        None
+    /// Build share links for this inbound using the given public host and user.
+    /// Returns an empty vec for protocols that have no share format.
+    fn build_sub_link(&self, _host: &str, _user: &AuthUser, _name: &str) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -220,9 +222,11 @@ pub fn shutdown_inbounds() {
     INBOUNDS.clear();
 }
 
-/// Build share links for every registered inbound, using the public host and
-/// the given user. Inbounds are ordered by tag for a stable subscription body.
-pub fn build_sub_links(host: &str, user: &AuthUser, base_name: Option<&str>) -> Vec<String> {
+/// Build share links for every registered inbound, using the given public hosts
+/// and user. Hosts are emitted IPv6 first, and inbounds are ordered by tag so
+/// the subscription body is stable. Every node name is suffixed with its
+/// address family (`-IPv4` / `-IPv6`).
+pub fn build_sub_links(hosts: &[String], user: &AuthUser, base_name: Option<&str>) -> Vec<String> {
     let mut inbounds: Vec<(String, Arc<dyn AnyInbound>)> = INBOUNDS
         .iter()
         .map(|e| (e.key().clone(), e.value().clone()))
@@ -230,21 +234,23 @@ pub fn build_sub_links(host: &str, user: &AuthUser, base_name: Option<&str>) -> 
     inbounds.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut links = Vec::new();
-    for (tag, inbound) in inbounds {
-        let protocol = inbound.protocol();
-        let name = match base_name {
-            Some(base) if !base.is_empty() => format!("{base}-{protocol}"),
-            _ => {
-                let trimmed = tag.strip_suffix("_inbound").unwrap_or(&tag);
-                if trimmed.is_empty() {
-                    protocol.to_string()
-                } else {
-                    trimmed.to_string()
+    for host in hosts {
+        let family = if host.contains(':') { "IPv6" } else { "IPv4" };
+        for (tag, inbound) in &inbounds {
+            let protocol = inbound.protocol();
+            let name = match base_name {
+                Some(base) if !base.is_empty() => format!("{base}-{protocol}-{family}"),
+                _ => {
+                    let trimmed = tag.strip_suffix("_inbound").unwrap_or(tag);
+                    let base = if trimmed.is_empty() {
+                        protocol
+                    } else {
+                        trimmed
+                    };
+                    format!("{base}-{family}")
                 }
-            }
-        };
-        if let Some(link) = inbound.build_sub_link(host, user, &name) {
-            links.push(link);
+            };
+            links.extend(inbound.build_sub_link(host, user, &name));
         }
     }
     links

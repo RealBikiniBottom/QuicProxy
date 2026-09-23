@@ -245,10 +245,7 @@ async fn assert_large_tcp_echo(socks_port: u16, target: SocketAddr) {
             *byte = ((offset.wrapping_mul(31) + round * 17) % 251) as u8;
         }
         tokio::time::timeout(LARGE_IO_TIMEOUT, async {
-            tokio::try_join!(
-                writer.write_all(&payload),
-                reader.read_exact(&mut echoed)
-            )
+            tokio::try_join!(writer.write_all(&payload), reader.read_exact(&mut echoed))
         })
         .await
         .unwrap_or_else(|_| {
@@ -396,8 +393,17 @@ async fn check_trojan(
     label: &str,
 ) {
     let server_port = free_tcp_port();
-    let mut server = spawn_sing_box(sing_box_trojan_config(server_port, transport.clone(), server_tls));
-    wait_for_tcp(server_port, &mut server, &format!("sing-box {label} server")).await;
+    let mut server = spawn_sing_box(sing_box_trojan_config(
+        server_port,
+        transport.clone(),
+        server_tls,
+    ));
+    wait_for_tcp(
+        server_port,
+        &mut server,
+        &format!("sing-box {label} server"),
+    )
+    .await;
 
     let socks_port = free_tcp_port();
     let mut client = spawn_quicproxy(quicproxy_trojan_config(

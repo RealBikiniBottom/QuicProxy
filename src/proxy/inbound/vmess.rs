@@ -20,13 +20,13 @@ use crate::config::{AuthUser, InboundConfig};
 use crate::proxy::inbound::{AnyInbound, create_tcp_listener};
 use crate::proxy::observe::{UserAccount, get_observer};
 use crate::proxy::outbound::vmess::vmess_impl::{
-    AeadCipher, AeadCipherHelper, COMMAND_UDP, CHUNK_SIZE, ID,
+    AeadCipher, AeadCipherHelper, CHUNK_SIZE, COMMAND_UDP, ID,
     KDF_SALT_CONST_AEAD_RESP_HEADER_LEN_IV, KDF_SALT_CONST_AEAD_RESP_HEADER_LEN_KEY,
     KDF_SALT_CONST_AEAD_RESP_HEADER_PAYLOAD_IV, KDF_SALT_CONST_AEAD_RESP_HEADER_PAYLOAD_KEY,
     KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_AEAD_IV, KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_AEAD_KEY,
     KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV,
     KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY, MAX_CHUNK_SIZE, OPTION_CHUNK_STREAM,
-    SECURITY_AES_128_GCM, SECURITY_CHACHA20_POLY1305, SECURITY_NONE, VERSION, VmessSecurity, new_id,
+    SECURITY_AES_128_GCM, SECURITY_CHACHA20_POLY1305, VERSION, VmessSecurity, new_id,
     vmess_kdf_1_one_shot, vmess_kdf_3_one_shot,
 };
 use crate::proxy::outbound::{AnyPacket, PacketInfo};
@@ -38,7 +38,6 @@ pub struct VmessInbound {
     address: SocketAddr,
     idle_timeout: Duration,
     users: Arc<ArcSwap<Vec<AuthUser>>>,
-    security: u8,
 }
 
 impl VmessInbound {
@@ -61,7 +60,6 @@ impl VmessInbound {
             address: cfg.socket_addr()?,
             idle_timeout: cfg.idle_timeout(),
             users: Arc::new(ArcSwap::from_pointee(users)),
-            security: resolve_security(cfg.udp_mode_or("auto"))?,
         })
     }
 
@@ -89,13 +87,12 @@ impl AnyInbound for VmessInbound {
             let router = get_router()?;
             let tag = self.tag.clone();
             let users = self.users_snapshot();
-            let security = self.security;
             let idle_timeout = self.idle_timeout;
 
             tokio::spawn(async move {
                 let result = tokio::time::timeout(
                     Duration::from_secs(10),
-                    handle_client(socket, &tag, &users, security, idle_timeout),
+                    handle_client(socket, &tag, &users, idle_timeout),
                 )
                 .await;
                 match result {
@@ -145,7 +142,6 @@ async fn accept<S>(
     mut stream: S,
     tag: &str,
     users: &[AuthUser],
-    security: u8,
 ) -> anyhow::Result<(VmessServerStream<S>, Option<UserAccount>)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -217,25 +213,20 @@ where
             })
     });
 
-    let mut server_stream = VmessServerStream::new(stream, request, security, peer_addr_placeholder());
+    let mut server_stream = VmessServerStream::new(stream, request);
     server_stream.send_response_header().await?;
     Ok((server_stream, user))
-}
-
-fn peer_addr_placeholder() -> SocketAddr {
-    "0.0.0.0:0".parse().unwrap()
 }
 
 async fn handle_client(
     socket: tokio::net::TcpStream,
     tag: &str,
     users: &[AuthUser],
-    security: u8,
     idle_timeout: Duration,
 ) -> anyhow::Result<()> {
     let peer_addr = socket.peer_addr()?;
 
-    let (stream, user) = accept(socket, tag, users, security).await?;
+    let (stream, user) = accept(socket, tag, users).await?;
     let is_udp = stream.is_udp;
 
     let router = get_router()?;
@@ -268,29 +259,6 @@ async fn handle_client(
             .instrument(span)
             .await
     }
-}
-
-fn resolve_security(name: &str) -> anyhow::Result<u8> {
-    Ok(match name {
-        "aes-128-gcm" => SECURITY_AES_128_GCM,
-        "chacha20-poly1305" => SECURITY_CHACHA20_POLY1305,
-        "none" => SECURITY_NONE,
-        "auto" => {
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "s390x"))]
-            {
-                SECURITY_AES_128_GCM
-            }
-            #[cfg(not(any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "s390x"
-            )))]
-            {
-                SECURITY_CHACHA20_POLY1305
-            }
-        }
-        other => bail!("unsupported vmess security: {other}"),
-    })
 }
 
 struct VmessRequest {
@@ -391,7 +359,6 @@ enum WriteState {
 pub struct VmessServerStream<S> {
     stream: S,
     dst: TargetAddr,
-    peer_addr: SocketAddr,
     resp_v: u8,
     is_udp: bool,
     is_aead: bool,
@@ -408,16 +375,15 @@ pub struct VmessServerStream<S> {
 }
 
 impl<S> VmessServerStream<S> {
-    fn new(inner: S, request: VmessRequest, security: u8, peer_addr: SocketAddr) -> Self {
+    fn new(inner: S, request: VmessRequest) -> Self {
         let VmessRequest {
             dst,
             resp_v,
             req_body_iv,
             req_body_key,
             is_udp,
-            ..
+            security,
         } = request;
-        let _ = security;
 
         let is_aead = true;
         let (resp_body_key, resp_body_iv) = (
@@ -456,7 +422,6 @@ impl<S> VmessServerStream<S> {
         Self {
             stream: inner,
             dst,
-            peer_addr,
             resp_v,
             is_udp,
             is_aead,
@@ -481,9 +446,11 @@ where
         let mut buf = BytesMut::new();
         if self.is_aead {
             let len_key =
-                &vmess_kdf_1_one_shot(&self.resp_body_key, KDF_SALT_CONST_AEAD_RESP_HEADER_LEN_KEY)[..16];
+                &vmess_kdf_1_one_shot(&self.resp_body_key, KDF_SALT_CONST_AEAD_RESP_HEADER_LEN_KEY)
+                    [..16];
             let len_iv =
-                &vmess_kdf_1_one_shot(&self.resp_body_iv, KDF_SALT_CONST_AEAD_RESP_HEADER_LEN_IV)[..12];
+                &vmess_kdf_1_one_shot(&self.resp_body_iv, KDF_SALT_CONST_AEAD_RESP_HEADER_LEN_IV)
+                    [..12];
             buf.put_slice(&aes_gcm_encrypt(
                 len_key,
                 len_iv,
@@ -529,13 +496,18 @@ where
             let this = &mut *self;
             match this.read_state {
                 ReadState::WaitingLength => {
-                    if !ready!(poll_read_exact(&mut this.stream, cx, 2, &mut this.read_buf, true))? {
+                    if !ready!(poll_read_exact(
+                        &mut this.stream,
+                        cx,
+                        2,
+                        &mut this.read_buf,
+                        true
+                    ))? {
                         this.read_state = ReadState::Closed;
                         return Poll::Ready(Ok(()));
                     }
-                    let len =
-                        u16::from_be_bytes(this.read_buf.split().as_ref().try_into().unwrap())
-                            as usize;
+                    let len = u16::from_be_bytes(this.read_buf.split().as_ref().try_into().unwrap())
+                        as usize;
                     if len > MAX_CHUNK_SIZE {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -545,7 +517,13 @@ where
                     this.read_state = ReadState::WaitingData(len);
                 }
                 ReadState::WaitingData(size) => {
-                    ready!(poll_read_exact(&mut this.stream, cx, size, &mut this.read_buf, false))?;
+                    ready!(poll_read_exact(
+                        &mut this.stream,
+                        cx,
+                        size,
+                        &mut this.read_buf,
+                        false
+                    ))?;
                     let overhead = this
                         .read_cipher
                         .as_ref()
@@ -559,9 +537,9 @@ where
                             )));
                         }
                         let cipher = this.read_cipher.as_mut().unwrap();
-                        cipher
-                            .decrypt_inplace(&mut this.read_buf)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        cipher.decrypt_inplace(&mut this.read_buf).map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?;
                         let data_len = size - overhead;
                         this.read_buf.truncate(data_len);
                         this.read_state = ReadState::FlushingData(data_len);
@@ -617,7 +595,9 @@ where
                     }
                     if overhead > 0 {
                         let cipher = this.write_cipher.as_mut().unwrap();
-                        cipher.encrypt_inplace(&mut piece).map_err(io::Error::other)?;
+                        cipher
+                            .encrypt_inplace(&mut piece)
+                            .map_err(io::Error::other)?;
                     }
                     this.write_buf.unsplit(piece);
                     this.write_state = WriteState::FlushingData(consume, (0, this.write_buf.len()));
@@ -626,7 +606,10 @@ where
                     let slice = &this.write_buf[written..total];
                     let n = ready!(Pin::new(&mut this.stream).poll_write(cx, slice))?;
                     if n == 0 {
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")));
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "write zero",
+                        )));
                     }
                     let new_written = written + n;
                     if new_written < total {
@@ -800,11 +783,12 @@ mod tests {
         let (server_rd, server_wr) = tokio::io::split(server_io);
 
         let users = vec![user(uuid)];
-        let sec = resolve_security(security).unwrap();
 
         let client = async {
-            let stream: crate::proxy::outbound::AnyStream =
-                Box::new(DuplexHalf { rd: client_rd, wr: client_wr });
+            let stream: crate::proxy::outbound::AnyStream = Box::new(DuplexHalf {
+                rd: client_rd,
+                wr: client_wr,
+            });
             let opt = VmessOption {
                 uuid: uuid.to_string(),
                 alter_id: 0,
@@ -826,9 +810,7 @@ mod tests {
                 rd: server_rd,
                 wr: server_wr,
             };
-            let (mut server_stream, _user) = accept(stream, "vmess-in", &users, sec)
-                .await
-                .unwrap();
+            let (mut server_stream, _user) = accept(stream, "vmess-in", &users).await.unwrap();
             assert_eq!(server_stream.dst.to_string(), "example.com:443");
             let mut buf = vec![0u8; payload.len()];
             server_stream.read_exact(&mut buf).await.unwrap();
@@ -899,8 +881,10 @@ mod tests {
         let users = vec![user("11111111-1111-1111-1111-111111111111")];
 
         let client = async {
-            let stream: crate::proxy::outbound::AnyStream =
-                Box::new(DuplexHalf { rd: client_rd, wr: client_wr });
+            let stream: crate::proxy::outbound::AnyStream = Box::new(DuplexHalf {
+                rd: client_rd,
+                wr: client_wr,
+            });
             let opt = VmessOption {
                 uuid: UUID.to_string(),
                 alter_id: 0,
@@ -914,8 +898,11 @@ mod tests {
         };
 
         let server = async {
-            let stream = DuplexHalf { rd: server_rd, wr: server_wr };
-            let result = accept(stream, "vmess-in", &users, SECURITY_AES_128_GCM).await;
+            let stream = DuplexHalf {
+                rd: server_rd,
+                wr: server_wr,
+            };
+            let result = accept(stream, "vmess-in", &users).await;
             assert!(result.is_err(), "unknown uuid must not authenticate");
         };
 
@@ -931,8 +918,10 @@ mod tests {
         let (server_rd, server_wr) = tokio::io::split(server_io);
 
         let client = async {
-            let stream: crate::proxy::outbound::AnyStream =
-                Box::new(DuplexHalf { rd: client_rd, wr: client_wr });
+            let stream: crate::proxy::outbound::AnyStream = Box::new(DuplexHalf {
+                rd: client_rd,
+                wr: client_wr,
+            });
             let opt = VmessOption {
                 uuid: UUID.to_string(),
                 alter_id: 0,
@@ -947,10 +936,11 @@ mod tests {
         };
 
         let server = async {
-            let stream = DuplexHalf { rd: server_rd, wr: server_wr };
-            let (mut server_stream, _) = accept(stream, "vmess-in", &users, SECURITY_AES_128_GCM)
-                .await
-                .unwrap();
+            let stream = DuplexHalf {
+                rd: server_rd,
+                wr: server_wr,
+            };
+            let (mut server_stream, _) = accept(stream, "vmess-in", &users).await.unwrap();
             let mut b = [0u8; 1];
             server_stream.read_exact(&mut b).await.unwrap();
             assert_eq!(&b, b"x");

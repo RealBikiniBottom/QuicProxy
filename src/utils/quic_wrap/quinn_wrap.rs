@@ -18,9 +18,9 @@ use tokio::sync::mpsc;
 
 use tracing::{debug, error, info, trace, warn};
 
+use crate::config::AuthUser;
 use crate::utils::new_io_other_error;
 use crate::utils::socket::socket_helpers::try_create_dualstack_udpsocket;
-use crate::config::AuthUser;
 
 use super::{QuicBistream, QuicConnection, QuicUnistream};
 
@@ -319,9 +319,7 @@ impl ServerConfigUpdater {
         for user in users {
             jls = jls.add_user(user.password.clone(), user.username.clone());
         }
-        jls = jls
-            .enable(true)
-            .with_server_name(self.server_name.clone());
+        jls = jls.enable(true).with_server_name(self.server_name.clone());
         crypto.jls_config = jls.into();
         self.apply(crypto)
     }

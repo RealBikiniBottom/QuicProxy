@@ -119,16 +119,24 @@ Full Cone 且使用 UDP Extension，完美解决代理 QUIC 速度慢等历史�
 核心 API 同时提供订阅分发能力，节点链接由各 inbound 动态生成，无需手工维护：
 
 - `GET /sub?username=alice&password=secret`：公开接口（无需 API 密码），按用户返回 sq / anytls / trojan 节点订阅，并在 `subscription-userinfo` 响应头中携带该用户已用流量；默认不限流量、不限时间（`total=0; expire=0`），但持续统计耗费流量
-- `GET /qr?text=<url>`：将文本渲染为纯文本二维码（`#`/空格），需 API 密码鉴权
+- `GET /qr?text=<url>`：将文本渲染为终端二维码（半块字符，两行模块合并为一行，宽度适配 80 列终端），需 API 密码鉴权
 
 订阅使用 `subscription` 配置指定对外主机与元信息，例如：
 
 ```json5
 "subscription": {
-  "host": "1.2.3.4",             // 写入节点链接的公网地址
+  "host": "1.2.3.4",             // 写入节点链接的公网地址，支持字符串或数组
   "name": "MyNode",              // 可选，节点名前缀
   "update_interval": 24,         // 可选，profile-update-interval 响应头（小时）
   "web_page_url": "https://..."  // 可选，profile-web-page-url 响应头
+}
+```
+
+`host` 也可以是数组以同时下发多个地址（IPv6 节点优先，节点名会带上 `-IPv4` / `-IPv6` 后缀）：
+
+```json5
+"subscription": {
+  "host": ["2001:db8::1", "1.2.3.4"]
 }
 ```
 

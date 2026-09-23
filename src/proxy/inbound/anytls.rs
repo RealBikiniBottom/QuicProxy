@@ -7,9 +7,9 @@ use crate::proxy::router::{Router, get_router};
 use crate::proxy::{SessionCloser, SourceAddr, TargetAddr, inbound};
 use crate::utils::new_io_other_error;
 use anyhow::{Result, bail};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
-use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use inbound::AnyInbound;
 use std::fs::File;
@@ -784,15 +784,9 @@ impl AnytlsInbound {
                         }
                     };
 
-                if let Err(e) = InboundSession::new(
-                    tls_stream,
-                    tag,
-                    peer_addr,
-                    router,
-                    udp_timeout,
-                    users,
-                )
-                .await
+                if let Err(e) =
+                    InboundSession::new(tls_stream, tag, peer_addr, router, udp_timeout, users)
+                        .await
                 {
                     debug!("Anytls inbound session ended for {}: {:?}", peer_addr, e);
                 }
@@ -841,7 +835,7 @@ impl AnyInbound for AnytlsInbound {
         Ok(())
     }
 
-    fn build_sub_link(&self, host: &str, user: &AuthUser, name: &str) -> Option<String> {
+    fn build_sub_link(&self, host: &str, user: &AuthUser, name: &str) -> Vec<String> {
         use crate::proxy::inbound::{encode_uri_component, uri_host};
 
         if !self
@@ -850,7 +844,7 @@ impl AnyInbound for AnytlsInbound {
             .iter()
             .any(|u| u.username == user.username)
         {
-            return None;
+            return Vec::new();
         }
 
         let host = uri_host(host);
@@ -868,12 +862,12 @@ impl AnyInbound for AnytlsInbound {
             format!("?{}", params.join("&"))
         };
 
-        Some(format!(
+        vec![format!(
             "anytls://{}@{host}:{}/{query}#{}",
             encode_uri_component(&user.password),
             self.address.port(),
             encode_uri_component(name),
-        ))
+        )]
     }
 }
 

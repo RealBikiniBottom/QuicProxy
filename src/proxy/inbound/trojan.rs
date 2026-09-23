@@ -237,7 +237,7 @@ impl AnyInbound for TrojanInbound {
         Ok(())
     }
 
-    fn build_sub_link(&self, host: &str, user: &AuthUser, name: &str) -> Option<String> {
+    fn build_sub_link(&self, host: &str, user: &AuthUser, name: &str) -> Vec<String> {
         use crate::proxy::inbound::{encode_uri_component, uri_host};
 
         if !self
@@ -246,7 +246,7 @@ impl AnyInbound for TrojanInbound {
             .iter()
             .any(|u| u.username == user.username)
         {
-            return None;
+            return Vec::new();
         }
 
         let host = uri_host(host);
@@ -257,13 +257,13 @@ impl AnyInbound for TrojanInbound {
         params.push("type=tcp".to_string());
         params.push("insecure=true".to_string());
 
-        Some(format!(
+        vec![format!(
             "trojan://{}@{host}:{}?{}#{}",
             encode_uri_component(&user.password),
             self.address.port(),
             params.join("&"),
             encode_uri_component(name),
-        ))
+        )]
     }
 }
 
