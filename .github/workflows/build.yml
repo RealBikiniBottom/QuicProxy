@@ -109,6 +109,21 @@ jobs:
             throw "missing wintun.dll: $wintunDll"
           }
 
+      - name: Update version in Inno Setup script
+        shell: pwsh
+        run: |
+          $cargoToml = Get-Content "Cargo.toml" -Raw
+          if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
+            $version = $matches[1]
+          } else {
+            throw "Failed to extract version from Cargo.toml"
+          }
+          
+          $issPath = "assets/windows_setup.iss"
+          $content = Get-Content $issPath -Raw
+          $updatedContent = $content -replace 'AppVersion=[^\r\n]+', "AppVersion=$version"
+          Set-Content -Path $issPath -Value $updatedContent -NoNewline
+
       - name: Compile Inno Setup Installer
         shell: pwsh
         run: |
