@@ -83,7 +83,10 @@ impl TargetAddr {
                 let port = stream.read_u16().await?;
                 let domain = String::from_utf8(domain_bytes)
                     .map_err(|e| new_io_other_error(format!("Invalid domain: {}", e)))?;
-                Ok(TargetAddr::Domain(domain, port))
+                match domain.parse::<IpAddr>() {
+                    Ok(ip) => Ok(TargetAddr::Ip(SocketAddr::new(ip, port))),
+                    Err(_) => Ok(TargetAddr::Domain(domain, port)),
+                }
             }
             4 => {
                 let mut ip_bytes = [0u8; 16];
@@ -326,6 +329,41 @@ impl SessionCloser {
     /// 检查是否已关闭
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod target_addr_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn socks_domain_ip_literals_are_normalized() {
+        for (host, expected, atyp) in [
+            ("192.0.2.1", "192.0.2.1:443", 1),
+            ("2001:db8::1", "[2001:db8::1]:443", 4),
+            ("::ffff:192.0.2.1", "[::ffff:192.0.2.1]:443", 4),
+        ] {
+            let mut packet = TargetAddr::Domain(host.into(), 443).to_bytes();
+            packet.extend_from_slice(b"payload");
+            let mut stream = packet.as_slice();
+
+            let target = TargetAddr::read_from(&mut stream).await.unwrap();
+
+            assert_eq!(target, TargetAddr::Ip(expected.parse().unwrap()));
+            assert_eq!(target.to_bytes()[0], atyp);
+            assert_eq!(stream, b"payload");
+        }
+    }
+
+    #[tokio::test]
+    async fn socks_domain_names_remain_domains() {
+        for host in ["example.com", "192.0.2.1.example.com", "192.0.2.256"] {
+            let expected = TargetAddr::Domain(host.into(), 53);
+            let packet = expected.to_bytes();
+            let target = TargetAddr::read_from(&mut packet.as_slice()).await.unwrap();
+
+            assert_eq!(target, expected);
+        }
     }
 }
 
