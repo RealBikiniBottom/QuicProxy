@@ -146,8 +146,15 @@ jobs:
         shell: pwsh
         run: |
           $versionNum = "${{ github.ref_name }}" -replace '^v', ''
+          if ($versionNum -notmatch '^[0-9]+(\.[0-9]+)+$') {
+            throw "invalid version tag: '${{ github.ref_name }}'"
+          }
           $cargoToml = Get-Content "Cargo.toml" -Raw
-          $cargoToml = $cargoToml -replace '(?m)^(version\s*=\s*)"[^"]*"', "`${1}`"$versionNum`""
+          # Anchor to [package] section; naive first-match would hit elsewhere
+          if ($cargoToml -notmatch '(?s)\[package\][^\[]*?version\s*=\s*"[^"]*"') {
+            throw "no version key found in Cargo.toml [package] section"
+          }
+          $cargoToml = $cargoToml -replace '(?s)(\[package\][^\[]*?version\s*=\s*)"[^"]*"', "`${1}`"$versionNum`""
           Set-Content -Path "Cargo.toml" -Value $cargoToml -NoNewline
           Write-Host "✓ Synced Cargo.toml version to $versionNum"
 
@@ -189,14 +196,16 @@ jobs:
         shell: pwsh
         run: |
           $cargoToml = Get-Content "Cargo.toml" -Raw
-          if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
+          # Must anchor to [package]: other sections ([dependencies] etc.) contain
+          # version = "..." keys that would otherwise match first
+          if ($cargoToml -match '(?s)\[package\][^\[]*?version\s*=\s*"([^"]+)"') {
             $version = $matches[1]
             $versionStr = "v$version"
             echo "VERSION_STR=$versionStr" >> $env:GITHUB_OUTPUT
             echo "VERSION_NUM=$version" >> $env:GITHUB_OUTPUT
             Write-Host "✓ Extracted version: $versionStr"
           } else {
-            throw "Failed to extract version from Cargo.toml"
+            throw "Failed to extract version from Cargo.toml [package] section"
           }
 
       - name: Sync core version to Flutter code
@@ -275,6 +284,23 @@ jobs:
               Write-Host "  File: $($_.FullName) - $([math]::Round($_.Length/1KB, 2)) KB"
             }
           }
+
+      - name: Update version in Inno Setup script
+        shell: pwsh
+        run: |
+          $version = "${{ steps.extract_version.outputs.VERSION_NUM }}"
+          if ($version -notmatch '^[0-9]+(\.[0-9]+)+$') {
+            throw "invalid version extracted from Cargo.toml: '$version'"
+          }
+
+          $issPath = "./assets/windows_setup.iss"
+          $content = Get-Content $issPath -Raw
+          if ($content -notmatch 'AppVersion=[^\r\n]+') {
+            throw "AppVersion directive not found in $issPath"
+          }
+          $updatedContent = $content -replace 'AppVersion=[^\r\n]+', "AppVersion=$version"
+          Set-Content -Path $issPath -Value $updatedContent -NoNewline
+          Write-Host "✓ Set installer AppVersion to $version"
 
       - name: Compile Inno Setup Installer
         shell: pwsh

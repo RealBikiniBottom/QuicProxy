@@ -59,11 +59,12 @@ jobs:
         run: |
           # Read version from Cargo.toml
           $cargoToml = Get-Content "Cargo.toml" -Raw
-          if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
+          # Must anchor to [package]: other sections contain version = "..." keys
+          if ($cargoToml -match '(?s)\[package\][^\[]*?version\s*=\s*"([^"]+)"') {
             $version = $matches[1]
             $versionStr = "v$version"
           } else {
-            throw "Failed to extract version from Cargo.toml"
+            throw "Failed to extract version from Cargo.toml [package] section"
           }
           
           # Update version in vpn_service.dart
@@ -89,11 +90,12 @@ jobs:
         run: |
           # Read version from Cargo.toml
           $cargoToml = Get-Content "Cargo.toml" -Raw
-          if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
+          # Must anchor to [package]: other sections contain version = "..." keys
+          if ($cargoToml -match '(?s)\[package\][^\[]*?version\s*=\s*"([^"]+)"') {
             $version = $matches[1]
             $versionDir = "v$version"
           } else {
-            throw "Failed to extract version from Cargo.toml"
+            throw "Failed to extract version from Cargo.toml [package] section"
           }
           
           $exe = "target/x86_64-pc-windows-msvc/release/quicproxy.exe"
@@ -113,14 +115,18 @@ jobs:
         shell: pwsh
         run: |
           $cargoToml = Get-Content "Cargo.toml" -Raw
-          if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
+          # Must anchor to [package]: other sections contain version = "..." keys
+          if ($cargoToml -match '(?s)\[package\][^\[]*?version\s*=\s*"([^"]+)"') {
             $version = $matches[1]
           } else {
-            throw "Failed to extract version from Cargo.toml"
+            throw "Failed to extract version from Cargo.toml [package] section"
           }
           
           $issPath = "assets/windows_setup.iss"
           $content = Get-Content $issPath -Raw
+          if ($content -notmatch 'AppVersion=[^\r\n]+') {
+            throw "AppVersion directive not found in $issPath"
+          }
           $updatedContent = $content -replace 'AppVersion=[^\r\n]+', "AppVersion=$version"
           Set-Content -Path $issPath -Value $updatedContent -NoNewline
 
