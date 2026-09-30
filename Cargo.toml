@@ -28,8 +28,8 @@ hex = "0"
 base64 = "0"
 simple-dns = "0"
 reqwest = { version = "0", default-features = false, features = ["rustls-tls", "json", "socks"] }
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0", features = ["client", "http1", "tokio"] }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0", features = ["client", "http1", "http2", "tokio"] }
 http-body-util = "0"
 rand = "0.10"
 httparse = "1"

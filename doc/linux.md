@@ -58,7 +58,13 @@ curl -X POST ${BASE}/api/core/start -H "Authorization: ${PASS}"
 
 # 查看核心状态
 curl ${BASE}/api/core/status -H "Authorization: ${PASS}"
+```
 
+---
+
+## 目录结构
+
+```text
 /opt/quicproxy/
 ├── quicproxy            # 二进制
 ├── config.json          # 管理配置

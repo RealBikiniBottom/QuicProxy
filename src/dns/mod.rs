@@ -7,7 +7,6 @@ use crate::utils::{format_duration, now_timestamp};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::Bytes;
 use dashmap::DashMap;
-use hyper::header::HeaderMap;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use rand::seq::IndexedRandom;
 use simple_dns::rdata::RData;
@@ -22,7 +21,8 @@ use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
-use crate::utils::http_outbound;
+mod doh;
+use doh::DohClient;
 
 static DNS_MAP: LazyLock<DashMap<String, Arc<dyn AnyDNS>>> = LazyLock::new(DashMap::new);
 static BLOCK_DDR: AtomicBool = AtomicBool::new(false);
@@ -761,7 +761,7 @@ pub struct HttpsDns {
     pub max_ttl: Option<Duration>,
     pub outbound: Arc<dyn AnyOutbound>,
     pub byte_cache: DnsByteCache,
-    url: String,
+    client: DohClient,
     dns_server_name: Option<String>,
     pub reject_ipv6: bool,
 }
@@ -773,7 +773,8 @@ impl HttpsDns {
             .clone()
             .ok_or_else(|| anyhow!("dns '{}' requires address", tag))?;
         let port = cfg.port.unwrap_or(443);
-        let url = format!("https://{}:{}/dns-query", address, port);
+        let client = DohClient::new(&address, port, "/dns-query", cfg.dns.clone())
+            .with_context(|| format!("dns '{}' has invalid DoH address", tag))?;
 
         let min_ttl = cfg.min_ttl.map(Duration::from_secs);
         let max_ttl = cfg.max_ttl.map(Duration::from_secs);
@@ -806,7 +807,7 @@ impl HttpsDns {
             outbound,
             dns_server_name: cfg.dns.clone(),
             byte_cache,
-            url,
+            client,
             reject_ipv6,
         }))
     }
@@ -838,24 +839,12 @@ impl AnyDNS for HttpsDns {
         let packet_bytes = packet
             .build_bytes_vec()
             .map_err(|e| anyhow!("Failed to build DNS query packet: {e}"))?;
-        let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", "application/dns-message".parse().unwrap());
+        let response = self
+            .client
+            .query(&outbound, Bytes::from(packet_bytes), outbound.connect_timeout())
+            .await?;
 
-        let response = http_outbound::request_post_via_outbound(
-            outbound.clone(),
-            self.dns_server(),
-            &self.url,
-            outbound.connect_timeout(),
-            Some(&headers),
-            Bytes::from(packet_bytes),
-        )
-        .await?;
-
-        if !response.status.is_success() {
-            bail!("DoH server returned error: {}", response.status)
-        }
-
-        parse_owned_packet(&response.body, "HTTPS response")
+        parse_owned_packet(&response, "HTTPS response")
     }
 
     fn default_outbound(&self) -> Arc<dyn AnyOutbound> {

@@ -553,6 +553,13 @@ jobs:
       - name: List web download assets
         run: ls -la src/premium/web/static/assets/
 
+      - name: Embed Flutter web preview
+        run: |
+          FLUTTER_WEB_TMP="$RUNNER_TEMP/flutter-web-full"
+          rm -rf "$FLUTTER_WEB_TMP"
+          unzip -q src/premium/web/static/assets/QuicProxy-Web-Full.zip -d "$FLUTTER_WEB_TMP"
+          node src/premium/web/scripts/sync-flutter-preview.mjs "$FLUTTER_WEB_TMP"
+
       - name: Install web dependencies
         working-directory: ./src/premium/web
         run: npm install
