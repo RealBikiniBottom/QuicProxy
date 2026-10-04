@@ -55,10 +55,12 @@ tracing-appender = "0"
 hashbrown = { version = "0", features = ["serde"] }
 ipnet = "2"
 netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip", rev ="49434359ed59cae05092c1055396289ba2297389" }
+netstack-smoltcp = { git = "https://github.com/cavivie/netstack-smoltcp", rev = "f29f90b841ac508397dbf280787c8de4686d4da4" }
 tun-rs = { version = "2", features = ["async", "async_framed", "utun_fd"], optional = true, git = "https://github.com/tun-rs/tun-rs", branch = "main" }
 netdev = "0"
 etherparse = "0"
-libc = "0"
+# libc 0.2.190 gated ctl_info/sockaddr_ctl/CTLIOCGINFO to macOS only, which breaks tun-rs on iOS.
+libc = "=0.2.189"
 tokio-rustls = { git = "https://github.com/spongebob888/tokio-rustls", branch = "main", default-features = false, features = ["ring", "logging", "tls12"] }
 anyhow = { version = "1", features = ["backtrace"] }
 tracing-error = "0"

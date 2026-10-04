@@ -373,6 +373,24 @@ pub struct TransportConfig {
     pub service_name: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TunStack {
+    Lwip,
+    Smoltcp,
+    System,
+}
+
+impl Default for TunStack {
+    fn default() -> Self {
+        if crate::utils::os::is_mobile() {
+            TunStack::System
+        } else {
+            TunStack::Lwip
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct InboundConfig {
     #[serde(rename = "type")]
@@ -413,6 +431,8 @@ pub struct InboundConfig {
     pub tun_name: Option<String>,
     pub tun_address: Option<Vec<String>>,
     pub tun_fd: Option<i32>,
+    #[serde(default)]
+    pub tun_stack: TunStack,
 }
 
 impl InboundConfig {
