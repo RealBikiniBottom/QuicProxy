@@ -127,6 +127,71 @@ impl RedbStore {
         }
         Ok(entries)
     }
+
+    /// Merges a batch into the table in a single write transaction, so the whole batch costs one
+    /// commit instead of one per entry.
+    pub fn merge_entries<T, F>(
+        &self,
+        table_name: &str,
+        items: Vec<(String, T)>,
+        merge: F,
+    ) -> Result<()>
+    where
+        T: Serialize + DeserializeOwned,
+        F: Fn(&mut T, T),
+    {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let def = TableDefinition::<&str, &[u8]>::new(table_name);
+            let mut table = write_txn.open_table(def)?;
+            for (key, value) in items {
+                let existing: Option<T> = match table.get(key.as_str())? {
+                    Some(guard) => serde_json::from_slice(guard.value()).ok(),
+                    None => None,
+                };
+                let merged = match existing {
+                    Some(mut current) => {
+                        merge(&mut current, value);
+                        current
+                    }
+                    None => value,
+                };
+                let bytes = serde_json::to_vec(&merged)?;
+                table.insert(key.as_str(), bytes.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Reads and removes every entry in one write transaction. Undecodable entries are removed
+    /// too, otherwise a single corrupt row would make the table grow forever.
+    pub fn drain_entries<T: DeserializeOwned>(&self, table_name: &str) -> Result<Vec<(String, T)>> {
+        let write_txn = self.db.begin_write()?;
+        let entries = {
+            let def = TableDefinition::<&str, &[u8]>::new(table_name);
+            let mut table = write_txn.open_table(def)?;
+            let mut keys = Vec::new();
+            let mut entries = Vec::new();
+            for item in table.iter()? {
+                let (key, value) = item?;
+                let key = key.value().to_owned();
+                if let Ok(value) = serde_json::from_slice::<T>(value.value()) {
+                    entries.push((key.clone(), value));
+                }
+                keys.push(key);
+            }
+            for key in &keys {
+                table.remove(key.as_str())?;
+            }
+            entries
+        };
+        write_txn.commit()?;
+        Ok(entries)
+    }
 }
 
 /// Resolve `path` against the current directory so that the same database file always maps to

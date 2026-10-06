@@ -162,4 +162,15 @@ where
     pub fn list(&self) -> Result<Vec<(String, T)>> {
         self.db.get_all_entries::<T>(&self.table_name_for_disk_db)
     }
+
+    pub fn merge_many<F>(&self, items: Vec<(String, T)>, merge: F) -> Result<()>
+    where
+        F: Fn(&mut T, T),
+    {
+        self.db.merge_entries(&self.table_name_for_disk_db, items, merge)
+    }
+
+    pub fn drain(&self) -> Result<Vec<(String, T)>> {
+        self.db.drain_entries::<T>(&self.table_name_for_disk_db)
+    }
 }

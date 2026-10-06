@@ -113,7 +113,11 @@ impl ConnectionTracker {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Once the in-memory map holds this many destinations it is merged into the cache and cleared,
+/// so the Network Extension stays bounded while the app is not polling `/traffic`.
+const DST_TRAFFIC_FLUSH_THRESHOLD: usize = 256;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DstTrafficEntry {
     pub domain: String,
     pub ip: String,
@@ -121,6 +125,20 @@ pub struct DstTrafficEntry {
     pub upload: u64,
     pub download: u64,
     pub last_active: u64,
+}
+
+impl DstTrafficEntry {
+    fn absorb(&mut self, newer: DstTrafficEntry) {
+        self.upload = self.upload.saturating_add(newer.upload);
+        self.download = self.download.saturating_add(newer.download);
+        self.last_active = self.last_active.max(newer.last_active);
+        if !newer.ip.is_empty() {
+            self.ip = newer.ip;
+        }
+        if !newer.outbound_tag.is_empty() {
+            self.outbound_tag = newer.outbound_tag;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -437,6 +455,10 @@ pub struct Observer {
     global_stats: Arc<Stats>,
     connections: DashMap<Uuid, ConnectionRecord>,
     dst_traffic: DashMap<String, DstTrafficEntry>,
+    dst_traffic_cache: Option<Cache<DstTrafficEntry>>,
+    // Serializes flush and drain so an entry is never in flight between map and cache while
+    // the API reads both.
+    dst_traffic_flush: Mutex<()>,
     mem_stats: Mutex<(u64, u64, u64)>,
 }
 
@@ -474,6 +496,8 @@ impl Observer {
     pub fn new(cache_name: &str) -> anyhow::Result<Self> {
         let realip2domain = Cache::new_with_tag(cache_name, "observe:realip2domain".to_string())?;
         let user_cache = Cache::new_with_tag(cache_name, "observe:users".to_string()).ok();
+        let dst_traffic_cache =
+            Cache::new_with_tag(cache_name, "observe:dst_traffic".to_string()).ok();
 
         let observer = Self {
             inbounds: DashMap::new(),
@@ -486,6 +510,8 @@ impl Observer {
             global_stats: Arc::new(Stats::default()),
             connections: DashMap::new(),
             dst_traffic: DashMap::new(),
+            dst_traffic_cache,
+            dst_traffic_flush: Mutex::new(()),
             mem_stats: Mutex::new((0, 0, 0)),
         };
         observer.load_persisted_users();
@@ -524,6 +550,15 @@ impl Observer {
             global_stats: Arc::new(Stats::default()),
             connections: DashMap::new(),
             dst_traffic: DashMap::new(),
+            dst_traffic_cache: Some(
+                Cache::new(
+                    Self::test_cache_db_path(),
+                    "observe:test:dst_traffic".to_string(),
+                    1,
+                )
+                .expect("create observer test dst traffic cache"),
+            ),
+            dst_traffic_flush: Mutex::new(()),
             mem_stats: Mutex::new((0, 0, 0)),
         })
     }
@@ -614,6 +649,44 @@ impl Observer {
                 });
             }
         }
+
+        if self.dst_traffic.len() >= DST_TRAFFIC_FLUSH_THRESHOLD {
+            self.flush_dst_traffic();
+        }
+    }
+
+    fn take_dst_traffic(&self) -> Vec<DstTrafficEntry> {
+        // Remove the keys seen by this snapshot one by one. Updates that win the
+        // race are included in this batch; entries inserted afterwards remain for
+        // the next take instead of being erased by a map-wide clear().
+        let keys: Vec<String> = self
+            .dst_traffic
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.dst_traffic.remove(&key).map(|(_, entry)| entry))
+            .collect()
+    }
+
+    fn flush_dst_traffic(&self) {
+        let Some(cache) = &self.dst_traffic_cache else {
+            return;
+        };
+        // Skip when a flush or drain is already running; the next closed connection retries.
+        let _guard = match self.dst_traffic_flush.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        let items: Vec<(String, DstTrafficEntry)> = self
+            .take_dst_traffic()
+            .into_iter()
+            .map(|entry| (entry.domain.clone(), entry))
+            .collect();
+        if let Err(e) = cache.merge_many(items, DstTrafficEntry::absorb) {
+            tracing::error!("flush destination traffic to cache failed: {}", e);
+        }
     }
 
     pub fn kill_connection(&self, id: &str) -> bool {
@@ -665,18 +738,32 @@ impl Observer {
     }
 
     pub fn drain_dst_traffic(&self) -> Vec<DstTrafficEntry> {
-        // Remove the keys seen by this snapshot one by one. Updates that win the
-        // race are included in this batch; entries inserted afterwards remain for
-        // the next drain instead of being erased by a map-wide clear().
-        let keys: Vec<String> = self
-            .dst_traffic
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-        let mut entries: Vec<DstTrafficEntry> = keys
-            .into_iter()
-            .filter_map(|key| self.dst_traffic.remove(&key).map(|(_, entry)| entry))
-            .collect();
+        let _guard = self
+            .dst_traffic_flush
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut merged: std::collections::HashMap<String, DstTrafficEntry> =
+            std::collections::HashMap::new();
+        if let Some(cache) = &self.dst_traffic_cache {
+            match cache.drain() {
+                Ok(items) => merged.extend(items),
+                Err(e) => tracing::error!("drain destination traffic cache failed: {}", e),
+            }
+        }
+        // Cached entries are older than the in-memory ones, so the map's ip/outbound win.
+        for entry in self.take_dst_traffic() {
+            match merged.entry(entry.domain.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                    occupied.get_mut().absorb(entry)
+                }
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(entry);
+                }
+            }
+        }
+
+        let mut entries: Vec<DstTrafficEntry> = merged.into_values().collect();
         entries.sort_unstable_by(|a, b| a.domain.cmp(&b.domain));
         entries
     }
@@ -1304,6 +1391,43 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].upload, CONNECTIONS as u64 * 10);
         assert_eq!(entries[0].download, CONNECTIONS as u64 * 20);
+        assert!(observer.drain_dst_traffic().is_empty());
+    }
+
+    #[test]
+    fn destination_traffic_flushes_to_cache_and_drains_both() {
+        let observer = Observer::new_for_test();
+        let close = |host: &str, upload: u64, download: u64| {
+            let tracker = ConnectionTracker::new(
+                Arc::from("mixed"),
+                vec!["direct".to_string()],
+                None,
+                TargetAddr::Domain(host.to_string(), 443),
+                TargetAddr::Domain(host.to_string(), 443),
+                false,
+                false,
+            );
+            let tracker = observer.add_connection(tracker, None);
+            tracker.inc_upload(upload);
+            tracker.inc_download(download);
+            observer.remove_connection(&tracker.id);
+        };
+
+        close("shared.test", 1, 2);
+        for i in 0..DST_TRAFFIC_FLUSH_THRESHOLD {
+            close(&format!("host{i}.test"), 1, 1);
+        }
+        assert!(observer.dst_traffic.len() < DST_TRAFFIC_FLUSH_THRESHOLD);
+        close("shared.test", 3, 4);
+
+        let entries = observer.drain_dst_traffic();
+        assert_eq!(entries.len(), DST_TRAFFIC_FLUSH_THRESHOLD + 1);
+        let shared = entries
+            .iter()
+            .find(|entry| entry.domain.contains("shared.test"))
+            .expect("shared destination present");
+        assert_eq!(shared.upload, 4);
+        assert_eq!(shared.download, 6);
         assert!(observer.drain_dst_traffic().is_empty());
     }
 
