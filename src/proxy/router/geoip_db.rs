@@ -15,10 +15,12 @@ use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use hyper::http::Method;
 use memmap2::Mmap;
+use serde::Serialize;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 pub type GeoIpReader = maxminddb::Reader<Mmap>;
@@ -48,6 +50,12 @@ pub fn get_geoip_db_by_tag(tag: &str) -> Result<Arc<GeoipDB>> {
     }
 }
 
+pub fn list_geoip_db() -> Vec<GeoipDBInfo> {
+    let mut list: Vec<_> = GEOIP_DB_MAP.iter().map(|db| db.info()).collect();
+    list.sort_by(|a, b| a.tag.cmp(&b.tag));
+    list
+}
+
 pub fn load_db_file(path: &str) -> Result<Arc<GeoIpReader>> {
     if !Path::new(path).exists() {
         bail!("path does not exists.")
@@ -65,6 +73,17 @@ pub struct GeoipDB {
     pub download_outbound: Arc<dyn AnyOutbound>,
     pub update_interval: Duration,
     pub reader: SharedGeoIpReader,
+    update_lock: Mutex<()>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GeoipDBInfo {
+    pub tag: String,
+    pub path: String,
+    pub url: Option<String>,
+    pub size: u64,
+    /// File mtime in unix seconds, 0 when the file is missing.
+    pub updated_at: u64,
 }
 
 impl GeoipDB {
@@ -101,6 +120,7 @@ impl GeoipDB {
             cache,
             url: cfg.url.clone(),
             reader: ArcSwapOption::empty(),
+            update_lock: Mutex::new(()),
         })
     }
 
@@ -168,13 +188,30 @@ impl GeoipDB {
         Ok(result)
     }
 
+    pub fn info(&self) -> GeoipDBInfo {
+        let meta = std::fs::metadata(&self.path).ok();
+        let updated_at = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        GeoipDBInfo {
+            tag: self.tag.clone(),
+            path: self.path.clone(),
+            url: self.url.clone(),
+            size: meta.map(|m| m.len()).unwrap_or(0),
+            updated_at,
+        }
+    }
+
     pub fn close_reader(&self) {
         self.reader.store(None);
     }
 
     fn record_update_success(&self) {
-        if let (Some(cache), Some(url)) = (&self.cache, &self.url) {
-            let key = format!("tag:{},url:{},path:{}", self.tag, url, self.path);
+        if let Some(cache) = &self.cache {
+            let key = self.get_key();
             let now_secs = now_timestamp();
             if let Err(e) = cache.set(&key, &now_secs) {
                 warn!(
@@ -226,6 +263,8 @@ impl GeoipDB {
         if self.url.is_none() {
             bail!("missing url for remote db")
         }
+        // Manual updates from the API can race the scheduled updater on the same tmp file.
+        let _guard = self.update_lock.lock().await;
         let tmp_path = format!("{}.tmp", self.path);
 
         if let Err(e) = self.download_db(&tmp_path).await {

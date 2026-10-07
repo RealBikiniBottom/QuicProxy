@@ -5,6 +5,7 @@
 use crate::proxy::outbound::{AnyOutbound, OUTBOUNDS_MAP};
 use crate::proxy::{
     observe::{NodeStats, Observer, get_observer},
+    router::geoip_db::{get_geoip_db_by_tag, list_geoip_db},
     router::get_router,
 };
 use crate::utils::http_outbound::request_via_outbound_with_dns;
@@ -17,7 +18,7 @@ use axum::{
     extract::{Query, State},
     http::{HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Json},
-    routing::{get, put},
+    routing::{get, post, put},
 };
 use hashbrown::HashMap;
 use hyper::http::Method;
@@ -80,6 +81,8 @@ pub async fn init_core_api(
         .route("/users/stats", get(get_user_stats))
         .route("/version", get(get_runtime_core_version))
         .route("/qr", get(get_qr))
+        .route("/geoip_db", get(get_geoip_db))
+        .route("/geoip_db/update", post(post_geoip_db_update))
         .route_layer(axum::middleware::from_fn_with_state(
             password,
             auth_middleware,
@@ -185,6 +188,27 @@ async fn put_mode(
 ) -> Result<impl IntoResponse, StatusCode> {
     state.router.set_mode(payload.mode).await;
     Ok(StatusCode::OK)
+}
+
+async fn get_geoip_db() -> impl IntoResponse {
+    Json(list_geoip_db())
+}
+
+#[derive(Deserialize)]
+struct GeoipDbUpdate {
+    tag: String,
+}
+
+async fn post_geoip_db_update(
+    Json(payload): Json<GeoipDbUpdate>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let db =
+        get_geoip_db_by_tag(&payload.tag).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    db.update_db().await.map_err(|e| {
+        error!("Manual GeoIP update for '{}' failed: {:#}", db.tag, e);
+        (StatusCode::BAD_GATEWAY, format!("{:#}", e))
+    })?;
+    Ok(Json(db.info()))
 }
 
 #[derive(Deserialize)]
