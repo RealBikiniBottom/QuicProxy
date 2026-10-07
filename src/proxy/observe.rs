@@ -320,7 +320,7 @@ impl Stats {
 
     pub fn dec_active_tcp(&self) {
         self.active_tcp_conns
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             })
             .ok();
@@ -333,7 +333,7 @@ impl Stats {
 
     pub fn dec_active_udp(&self) {
         self.active_udp_conns
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             })
             .ok();

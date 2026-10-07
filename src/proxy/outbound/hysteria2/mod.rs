@@ -1071,7 +1071,7 @@ impl AnyOutbound for Hysteria2Outbound {
         }
         let session_id = state
             .next_session_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
                 if id == u32::MAX { None } else { Some(id + 1) }
             })
             .map_err(|_| anyhow::anyhow!("[{}] hy2 UDP session id space exhausted", self.tag()))?;
