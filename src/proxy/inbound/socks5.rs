@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::{self, Duration};
 use tracing::{Instrument, error, info, info_span};
 use tracing::{debug, field};
@@ -257,28 +257,38 @@ pub async fn start_udp_worker(
 
     let reset = Arc::new(Notify::new());
     let reset_clone = reset.clone();
+    let (control_closed_tx, control_closed_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         let mut drain_buf = [0u8; 1];
         loop {
+            // RFC 1928: the UDP association ends when the TCP control
+            // connection closes. A closed stream keeps returning Ok(0), so
+            // treating it as "continue" would spin this task forever.
             match tcp_socket.read(&mut drain_buf).await {
-                Err(_) => break,
-                Ok(0) => continue,
+                Err(_) | Ok(0) => break,
                 Ok(_) => continue,
             }
         }
-        debug!("tcp control stream reset");
+        debug!("tcp control stream closed");
         reset_clone.notify_waiters();
+        let _ = control_closed_tx.send(());
     });
 
-    start_udp_loop(
-        inbound_packet,
-        router,
-        inbound_tag,
-        None,
-        timeout_duration,
-        reset,
-    )
-    .await;
+    // start_udp_loop only returns on a socket error, so stop it explicitly once
+    // the association ends; otherwise the relay socket and task leak.
+    tokio::select! {
+        _ = start_udp_loop(
+            inbound_packet,
+            router,
+            inbound_tag,
+            None,
+            timeout_duration,
+            reset,
+        ) => {}
+        _ = control_closed_rx => {
+            debug!("SOCKS5 UDP association closed");
+        }
+    }
 }
 
 pub async fn handle_client(
