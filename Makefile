@@ -38,13 +38,10 @@ run_web_manager: build
 	./target/release/quicproxy --manage --port 8081 --web-dir ./src/premium/quicproxy_flutter/build/web
 
 USE_MIMALLOC ?= 0
-USE_SNMALLOC ?= 0
 CARGO_FLAGS = --release
 
 ifeq ($(USE_MIMALLOC), 1)
 	CARGO_FLAGS += --features mimalloc
-else ifeq ($(USE_SNMALLOC), 1)
-	CARGO_FLAGS += --features snmalloc
 endif
 
 build:
@@ -54,16 +51,16 @@ debug_build:
 	cargo build
 
 build-linux-cross:
-	DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --release --target x86_64-unknown-linux-musl
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --release --target x86_64-unknown-linux-musl --features mimalloc
 
 build-linux-aarch64-cross:
-	DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --release --target aarch64-unknown-linux-musl
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --release --target aarch64-unknown-linux-musl --features mimalloc
 
 build-linux-armv7-cross:
-	DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --release --target armv7-unknown-linux-musleabihf
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --release --target armv7-unknown-linux-musleabihf --features mimalloc
 
 build-windows-cross:
-	DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --release --target x86_64-pc-windows-gnu
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --release --target x86_64-pc-windows-gnu --features mimalloc
 
 deploy: build-linux-all
 	bash ./src/premium/test/deploy_test.sh

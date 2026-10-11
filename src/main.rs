@@ -31,10 +31,6 @@ use tracing::info;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(feature = "snmalloc")]
-#[global_allocator]
-static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
-
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {

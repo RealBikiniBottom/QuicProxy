@@ -37,7 +37,7 @@ jobs:
       - uses: taiki-e/install-action@cross
 
       - name: Build
-        run: cross build --release --target x86_64-unknown-linux-musl
+        run: cross build --release --target x86_64-unknown-linux-musl --features mimalloc
 
       - name: Package
         run: |
@@ -77,7 +77,7 @@ jobs:
       - uses: taiki-e/install-action@cross
 
       - name: Build
-        run: cross build --release --target aarch64-unknown-linux-musl
+        run: cross build --release --target aarch64-unknown-linux-musl --features mimalloc
 
       - name: Package
         run: |
@@ -117,7 +117,7 @@ jobs:
       - uses: taiki-e/install-action@cross
 
       - name: Build
-        run: cross build --release --target armv7-unknown-linux-musleabihf
+        run: cross build --release --target armv7-unknown-linux-musleabihf --features mimalloc
 
       - name: Package
         run: |
@@ -169,7 +169,7 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build Core
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --target x86_64-pc-windows-msvc --features mimalloc
 
       - name: Package Core (Native)
         shell: pwsh
