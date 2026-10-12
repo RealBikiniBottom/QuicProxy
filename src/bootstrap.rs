@@ -8,6 +8,7 @@ use crate::proxy::router::geoip_db::{init_geoip_db, shutdown_geoip_db};
 use crate::proxy::router::{init_router, shutdown_router};
 use crate::utils::interface::InterfaceManager;
 use crate::utils::logging;
+use crate::utils::ntp::{init_ntp, shutdown_ntp};
 use crate::utils::shutdown;
 use crate::utils::system_proxy::clear_system_proxy;
 use crate::{
@@ -83,6 +84,7 @@ pub async fn shutdown_app() {
 
     shutdown_router();
     shutdown_dns();
+    shutdown_ntp();
     shutdown_geoip();
     shutdown_geoip_db();
     shutdown_outbounds();
@@ -103,6 +105,9 @@ pub async fn init_app(mut config: Config) -> Result<Option<tokio::sync::mpsc::Re
 
     init_dns(&config).context("Failed to init dns")?;
     debug!("init_dns");
+
+    init_ntp(&config).context("Failed to init ntp")?;
+    debug!("init_ntp");
 
     init_geoip_db(&config)
         .await

@@ -654,13 +654,13 @@ impl AnytlsClient {
             } else {
                 root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             }
-            let mut config = rustls::ClientConfig::builder()
+            let mut config = crate::utils::ntp::tls::client_builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
             crate::proxy::configure_jls_client(&mut config, tls);
             Ok(config)
         } else {
-            let mut config = rustls::ClientConfig::builder()
+            let mut config = crate::utils::ntp::tls::client_builder()
                 .with_root_certificates(rustls::RootCertStore::empty())
                 .with_no_client_auth();
             config

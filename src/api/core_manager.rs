@@ -356,10 +356,7 @@ impl CoreManager {
 
     fn push_log(&self, message: String) {
         let timestamp = {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            format!("{}", now.as_millis())
+            format!("{}", crate::utils::ntp::unix_time().as_millis())
         };
         if let Ok(mut logs) = self.inner.logs.try_lock() {
             logs.push_back(CoreLogEntry { timestamp, message });

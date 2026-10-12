@@ -123,7 +123,7 @@ impl TrojanInbound {
             if let (Some(cert_path), Some(key_path)) = (&self.tls.cert, &self.tls.key) {
                 let certs = load_certs(cert_path)?;
                 let key = load_keys(key_path)?;
-                rustls::ServerConfig::builder()
+                crate::utils::ntp::tls::server_builder()
                     .with_no_client_auth()
                     .with_single_cert(certs, key)
                     .map_err(|e| new_io_other_error(format!("TLS config error: {}", e)))?
@@ -138,7 +138,7 @@ impl TrojanInbound {
                 let private_key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
                     .map_err(|e| new_io_other_error(format!("Invalid private key: {}", e)))?;
 
-                rustls::ServerConfig::builder()
+                crate::utils::ntp::tls::server_builder()
                     .with_no_client_auth()
                     .with_single_cert(cert_chain, private_key)
                     .map_err(|e| new_io_other_error(format!("TLS config error: {}", e)))?

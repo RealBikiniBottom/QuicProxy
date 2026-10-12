@@ -97,7 +97,7 @@ impl DohClient {
 
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let mut tls_config = rustls::ClientConfig::builder()
+        let mut tls_config = crate::utils::ntp::tls::client_builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
         tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];

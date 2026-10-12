@@ -4,7 +4,6 @@ use redb_store::RedbStore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
 use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{CacheConfig, Config};
 use crate::utils::now_timestamp;
@@ -76,14 +75,7 @@ where
     }
 
     pub fn set(&self, key: &str, value: &T, ttl: u64) -> Result<()> {
-        let expiry = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or_else(|e| {
-                tracing::error!("System clock error in CacheWithExpire::set: {}", e);
-                0
-            })
-            + ttl;
+        let expiry = now_timestamp() + ttl;
         let expiring_val = ExpiringValue {
             value: value.clone(),
             expiry,
@@ -96,13 +88,7 @@ where
     }
 
     pub fn list(&self) -> Result<Vec<(String, T)>> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or_else(|e| {
-                tracing::error!("System clock error in CacheWithExpire::list: {}", e);
-                0
-            });
+        let now = now_timestamp();
         let entries = self.inner.list()?;
 
         Ok(entries

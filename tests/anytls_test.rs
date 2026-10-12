@@ -117,7 +117,6 @@ async fn test_anytls_jls_full_chain() {
 }
 
 #[tokio::test]
-#[ignore = "requires separate process per proxy due to global OUTBOUNDS_MAP"]
 async fn test_socks5_to_anytls_chain() {
     let _watchdog = Watchdog::new("test_socks5_to_anytls_chain", TEST_TIMEOUT);
     let test_fut = async {
@@ -144,8 +143,9 @@ async fn test_socks5_to_anytls_chain() {
                 }
             },
             "outbounds": {
+                "final_outbound": "direct_out",
                 "servers": {
-                    "default_server": {
+                    "direct_out": {
                         "type": "direct"
                     }
                 }
@@ -157,7 +157,7 @@ async fn test_socks5_to_anytls_chain() {
                         "type": "udp",
                         "address": "223.5.5.5",
                         "port": 53,
-                        "outbound": "default_server"
+                        "outbound": "direct_out"
                     }
                 }
             },
@@ -165,8 +165,10 @@ async fn test_socks5_to_anytls_chain() {
             "log": {"level": "debug"}
         });
 
-        context.start_proxy(server_config, "anytls_in").await;
-        println!("Server started");
+        // start_proxy picks its own port for the inbound.
+        let server_idx = context.start_proxy(server_config, "anytls_in").await;
+        let server_port = context.proxies[server_idx].port;
+        println!("Server started on {}", server_port);
 
         let client_config = serde_json::json!({
             "inbounds": {
@@ -177,8 +179,9 @@ async fn test_socks5_to_anytls_chain() {
                 }
             },
             "outbounds": {
+                "final_outbound": "anytls_out",
                 "servers": {
-                    "default_server": {
+                    "anytls_out": {
                         "type": "anytls",
                         "address": "127.0.0.1",
                         "port": server_port,
@@ -227,7 +230,6 @@ async fn test_socks5_to_anytls_chain() {
 }
 
 #[tokio::test]
-#[ignore = "requires separate process per proxy due to global OUTBOUNDS_MAP"]
 async fn test_anytls_insecure() {
     let _watchdog = Watchdog::new("test_anytls_insecure", TEST_TIMEOUT);
     let test_fut = async {
@@ -254,8 +256,9 @@ async fn test_anytls_insecure() {
                 }
             },
             "outbounds": {
+                "final_outbound": "direct_out",
                 "servers": {
-                    "default_server": {
+                    "direct_out": {
                         "type": "direct"
                     }
                 }
@@ -267,7 +270,7 @@ async fn test_anytls_insecure() {
                         "type": "udp",
                         "address": "223.5.5.5",
                         "port": 53,
-                        "outbound": "default_server"
+                        "outbound": "direct_out"
                     }
                 }
             },
@@ -275,8 +278,10 @@ async fn test_anytls_insecure() {
             "log": {"level": "debug"}
         });
 
-        context.start_proxy(server_config, "anytls_in").await;
-        println!("Server started");
+        // start_proxy picks its own port for the inbound.
+        let server_idx = context.start_proxy(server_config, "anytls_in").await;
+        let server_port = context.proxies[server_idx].port;
+        println!("Server started on {}", server_port);
 
         let client_config = serde_json::json!({
             "inbounds": {
@@ -287,8 +292,9 @@ async fn test_anytls_insecure() {
                 }
             },
             "outbounds": {
+                "final_outbound": "anytls_out",
                 "servers": {
-                    "default_server": {
+                    "anytls_out": {
                         "type": "anytls",
                         "address": "127.0.0.1",
                         "port": server_port,

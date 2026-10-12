@@ -105,7 +105,6 @@ async fn test_trojan_jls_full_chain() {
 }
 
 #[tokio::test]
-#[ignore = "requires separate process per proxy due to global OUTBOUNDS_MAP"]
 async fn test_socks5_to_trojan_chain() {
     let _watchdog = Watchdog::new("test_socks5_to_trojan_chain", TEST_TIMEOUT);
     let test_fut = async {
@@ -288,7 +287,6 @@ async fn test_socks5_to_trojan_chain() {
 }
 
 #[tokio::test]
-#[ignore = "requires separate process per proxy due to global OUTBOUNDS_MAP"]
 async fn test_trojan_udp_to_dns_outbound() {
     let _watchdog = Watchdog::new("test_trojan_udp_to_dns_outbound", TEST_TIMEOUT);
     let test_fut = async {
@@ -492,7 +490,7 @@ async fn test_trojan_udp_to_dns_outbound() {
 }
 
 #[tokio::test]
-#[ignore = "requires separate process per proxy due to global OUTBOUNDS_MAP"]
+#[ignore = "trojan has no QUIC transport yet (inbound and outbound only support tcp/ws)"]
 async fn test_socks5_to_trojan_quic_chain() {
     let _watchdog = Watchdog::new("test_socks5_to_trojan_quic_chain", TEST_TIMEOUT);
     let test_fut = async {

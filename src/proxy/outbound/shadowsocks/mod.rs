@@ -121,7 +121,7 @@ impl AnyOutbound for ShadowsocksOutbound {
         let ss_stream =
             ProxyClientStream::from_stream(ctx, stream, &cfg, (target.host(), target.port()));
 
-        Ok(Box::new(ShadowSocksStream(ss_stream)))
+        Ok(Box::new(ShadowSocksStream::new(ss_stream)))
     }
 
     async fn connect_packet(&self, _target: &TargetAddr) -> anyhow::Result<Arc<dyn AnyPacket>> {

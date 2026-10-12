@@ -933,6 +933,11 @@ mod tests {
             let mut vmess = builder.proxy_stream(stream).await.unwrap();
             vmess.write_all(b"x").await.unwrap();
             vmess.flush().await.unwrap();
+            // Keep the stream open until the server has written its response
+            // header, otherwise the server sees a broken pipe.
+            let mut echo = [0u8; 1];
+            vmess.read_exact(&mut echo).await.unwrap();
+            assert_eq!(&echo, b"x");
         };
 
         let server = async {
@@ -944,6 +949,8 @@ mod tests {
             let mut b = [0u8; 1];
             server_stream.read_exact(&mut b).await.unwrap();
             assert_eq!(&b, b"x");
+            server_stream.write_all(&b).await.unwrap();
+            server_stream.flush().await.unwrap();
         };
 
         tokio::join!(client, server);

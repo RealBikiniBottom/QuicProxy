@@ -56,6 +56,8 @@ pub fn jls_server_config(jls_username: &str, jls_password: &str) -> Value {
                 "port": 0,
                 "tls": {
                     "enable_jls": true,
+                    // JLS only authenticates clients whose SNI matches.
+                    "sni": "localhost",
                     "jls_username": jls_username,
                     "jls_password": jls_password
                 }

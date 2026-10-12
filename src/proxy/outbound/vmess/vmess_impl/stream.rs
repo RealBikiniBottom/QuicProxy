@@ -2,7 +2,6 @@ use std::fmt::Debug;
 use std::io;
 use std::pin::Pin;
 use std::task::Poll;
-use std::time::SystemTime;
 
 use aes_gcm::{Aes128Gcm, KeyInit};
 use bytes::{BufMut, BytesMut};
@@ -222,10 +221,7 @@ impl VmessStream {
             ..
         } = self;
 
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("check your system clock")
-            .as_secs();
+        let now = crate::utils::now_timestamp();
 
         let mut mbuf = BytesMut::new();
 

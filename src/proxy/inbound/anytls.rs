@@ -594,14 +594,30 @@ impl InboundSession {
         );
         tokio::spawn(
             async move {
+                // In non-connect mode the request carries a placeholder
+                // (usually 0.0.0.0:0) and every packet names its own
+                // destination. Route on the first real destination like the
+                // SOCKS5 inbound does; the placeholder would pick the wrong
+                // rule and bind the outbound socket for the wrong address.
+                let (target, first_packet) = if is_connect {
+                    (real_target, None)
+                } else {
+                    match udp.recv_from().await {
+                        Ok((_, target, payload)) => (target, Some(payload)),
+                        Err(e) => {
+                            debug!("Anytls inbound UoT closed before the first packet: {e}");
+                            return;
+                        }
+                    }
+                };
                 if let Err(e) = router
                     .dispatch_packet(
                         udp,
-                        &real_target,
+                        &target,
                         &client_addr,
                         &tag,
                         user,
-                        None,
+                        first_packet,
                         udp_timeout,
                         None,
                     )
@@ -718,7 +734,7 @@ impl AnytlsInbound {
             if let (Some(cert_path), Some(key_path)) = (&self.tls.cert, &self.tls.key) {
                 let certs = load_certs(cert_path)?;
                 let key = load_keys(key_path)?;
-                rustls::ServerConfig::builder()
+                crate::utils::ntp::tls::server_builder()
                     .with_no_client_auth()
                     .with_single_cert(certs, key)
                     .map_err(|e| new_io_other_error(format!("TLS config error: {}", e)))?
@@ -731,7 +747,7 @@ impl AnytlsInbound {
                 let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
                 let private_key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
                     .map_err(|e| new_io_other_error(format!("Invalid private key: {}", e)))?;
-                rustls::ServerConfig::builder()
+                crate::utils::ntp::tls::server_builder()
                     .with_no_client_auth()
                     .with_single_cert(cert_chain, private_key)
                     .map_err(|e| new_io_other_error(format!("TLS config error: {}", e)))?

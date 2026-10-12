@@ -84,6 +84,7 @@ pub struct Config {
     #[serde(default)]
     pub cache: HashMap<String, CacheConfig>,
     pub observe: Option<ObserveConfig>,
+    pub ntp: Option<NtpConfig>,
     #[serde(default = "default_log_config")]
     pub log: LogConfig,
     pub api: Option<ApiConfig>,
@@ -257,6 +258,7 @@ impl Default for Config {
             dns: DnsConfig::default(),
             cache: HashMap::new(),
             observe: None,
+            ntp: None,
             log: LogConfig::default(),
             api: None,
             subscription: None,
@@ -275,6 +277,32 @@ pub struct ObserveConfig {
 
 fn default_log_interval() -> u64 {
     30
+}
+
+/// When enabled, every wall-clock read in the core (protocol timestamps, TLS
+/// certificate validation, caches) uses the NTP-corrected time.
+#[derive(Debug, Deserialize, Clone)]
+pub struct NtpConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_ntp_address")]
+    pub address: String,
+    #[serde(default = "default_ntp_port")]
+    pub port: u16,
+    /// Re-sync interval such as `"30m"` or `"1h"`. Defaults to 30 minutes.
+    pub interval: Option<String>,
+    /// Outbound carrying the NTP queries. Defaults to the final outbound.
+    pub outbound: Option<String>,
+    /// DNS server resolving `address`. Defaults to the default DNS server.
+    pub dns: Option<String>,
+}
+
+fn default_ntp_address() -> String {
+    "time.apple.com".to_string()
+}
+
+fn default_ntp_port() -> u16 {
+    123
 }
 
 #[derive(Debug, Deserialize, Clone)]

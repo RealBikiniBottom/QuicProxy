@@ -36,16 +36,19 @@ async fn maybe_wrap_tls(
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(client_config));
+    let connector = TlsConnector::from(Arc::new(https_client_config(root_store)));
 
     let server_name = rustls::pki_types::ServerName::try_from(host)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .to_owned();
     let tls_stream = connector.connect(server_name, stream).await?;
     Ok(Box::new(tls_stream))
+}
+
+fn https_client_config(root_store: rustls::RootCertStore) -> rustls::ClientConfig {
+    crate::utils::ntp::tls::client_builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
 }
 
 async fn request_once_with_body(
@@ -333,5 +336,73 @@ pub async fn test_latency_via_outbound(
         Some(start.elapsed().as_micros() as u64)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::ntp::test_clock;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsAcceptor;
+
+    /// A localhost certificate that is only valid during 2040.
+    fn cert_valid_in_2040() -> (rustls::ServerConfig, rustls::RootCertStore) {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2040, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2041, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap();
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        (server_config, roots)
+    }
+
+    async fn https_handshake() -> std::io::Result<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (server_config, roots) = cert_valid_in_2040();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let server = async move {
+            let mut tls = TlsAcceptor::from(Arc::new(server_config))
+                .accept(server_io)
+                .await?;
+            tls.write_all(b"ok").await?;
+            tls.flush().await
+        };
+        let client = async move {
+            let connector = TlsConnector::from(Arc::new(https_client_config(roots)));
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let mut tls = connector.connect(name, client_io).await?;
+            let mut buf = [0u8; 2];
+            tls.read_exact(&mut buf).await?;
+            assert_eq!(&buf, b"ok");
+            Ok::<_, std::io::Error>(())
+        };
+
+        let (server, client) = tokio::join!(server, client);
+        client?;
+        server
+    }
+
+    #[tokio::test]
+    async fn https_rejects_certificate_outside_system_time() {
+        let err = https_handshake().await.unwrap_err();
+        assert!(err.to_string().contains("not valid yet"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn https_validates_certificate_with_ntp_time() {
+        let _clock = test_clock::set_now(UNIX_EPOCH + Duration::from_secs(2_222_000_000));
+        assert!(crate::utils::ntp::system_time() > SystemTime::now());
+        https_handshake().await.unwrap();
     }
 }

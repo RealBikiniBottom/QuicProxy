@@ -357,7 +357,7 @@ impl QuinnServer {
             generate_self_signed_cert()?
         };
 
-        let mut crypto = quinn::rustls::ServerConfig::builder()
+        let mut crypto = crate::utils::ntp::quic_tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(cert_chain, private_key)?;
 
@@ -523,7 +523,7 @@ impl QuinnClient {
     ) -> anyhow::Result<(Arc<ClientConfig>, String)> {
         let server_name = sni.unwrap_or_else(|| "apple.com".to_string());
         let mut client_crypto = if is_jls {
-            let mut config = quinn::rustls::ClientConfig::builder()
+            let mut config = crate::utils::ntp::quic_tls::client_builder()
                 .with_root_certificates(quinn::rustls::RootCertStore::empty())
                 .with_no_client_auth();
 
@@ -545,7 +545,7 @@ impl QuinnClient {
                 }
             }
 
-            let mut config = quinn::rustls::ClientConfig::builder()
+            let mut config = crate::utils::ntp::quic_tls::client_builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
 

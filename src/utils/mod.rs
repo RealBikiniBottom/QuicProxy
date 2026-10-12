@@ -5,7 +5,6 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub mod count_traffic;
@@ -15,6 +14,7 @@ pub mod interface;
 pub mod keyed_notify;
 pub mod logging;
 pub mod net_monitor;
+pub mod ntp;
 pub mod os;
 pub mod quic_wrap;
 pub mod shutdown;
@@ -49,14 +49,9 @@ pub fn now_millis() -> u64 {
     PROCESS_START.elapsed().as_millis() as u64
 }
 
+/// Unix seconds on the NTP-corrected clock (see [`ntp::system_time`]).
 pub fn now_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_else(|e| {
-            tracing::error!("Time went backwards: {}", e);
-            0
-        })
+    ntp::unix_time().as_secs()
 }
 
 pub struct PrefixedReadStream<S> {

@@ -297,6 +297,11 @@ mod tests {
 
     #[tokio::test]
     async fn unspecified_ipv6_listener_accepts_both_ip_families() {
+        // Hosts without IPv6 (some CI containers) cannot run this test.
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            eprintln!("skipping: IPv6 is unavailable on this host");
+            return;
+        }
         let listener = create_tcp_listener("[::]:0".parse().unwrap()).unwrap();
         let port = listener.local_addr().unwrap().port();
 

@@ -61,7 +61,9 @@ static SING_BOX_BINARY: LazyLock<PathBuf> = LazyLock::new(|| {
     let binary = output_dir.join("sing-box");
     let result = Command::new("go")
         .current_dir(&source)
-        .args(["build", "-trimpath", "-o"])
+        // Same tags as the other sing-box tests: they share this binary path,
+        // and this sing-box tree only builds with QUIC enabled.
+        .args(["build", "-trimpath", "-tags", "with_quic", "-o"])
         .arg(&binary)
         .arg("./cmd/sing-box")
         .output()

@@ -227,8 +227,10 @@ impl AnyInbound for ShadowQuicInbound {
                             {
                                 entry.1 = Some(user.username.clone());
                             }
-                            let has_users = users_store.load().iter().next().is_some();
-                            let mut is_authed = is_jls || !has_users;
+                            // The constructor rejects a non-JLS inbound without users, so an
+                            // empty list here means every user was removed at runtime and
+                            // must not turn the inbound into an open proxy.
+                            let mut is_authed = is_jls;
                             let mut services_started = false;
 
                             loop {

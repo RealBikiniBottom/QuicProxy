@@ -51,7 +51,7 @@ async fn setup_chain(udp_mod: &str) -> TestContext {
 /// Open a fresh SOCKS5 UDP association plus a local UDP socket.
 async fn new_session(ctx: &TestContext) -> (SocketAddr, UdpSocket, TcpStream) {
     let (relay_addr, tcp_stream) = ctx.create_socks5_udp_association().await;
-    let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_socket = common::bind_udp_loopback().await;
     (relay_addr, udp_socket, tcp_stream)
 }
 
@@ -222,7 +222,7 @@ async fn concurrent_sessions(udp_mod: &str) {
         handles.push(tokio::spawn(async move {
             let (relay_addr, _tcp) =
                 TestContext::create_socks5_udp_association_for_proxy(proxy_addr).await;
-            let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let udp_socket = common::bind_udp_loopback().await;
 
             // The first response on a fresh context can race transport setup;
             // only identical bytes are ever echoed on this socket, so a resend
@@ -278,7 +278,7 @@ async fn tcp_close_no_affect(udp_mod: &str) {
     // First session, then close the TCP control stream explicitly.
     {
         let (relay_addr, mut tcp_stream) = ctx.create_socks5_udp_association().await;
-        let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_socket = common::bind_udp_loopback().await;
         send_and_expect_echo(
             udp_mod,
             &ctx,
@@ -298,7 +298,7 @@ async fn tcp_close_no_affect(udp_mod: &str) {
     // Second session must still work end-to-end.
     {
         let (relay_addr, _tcp) = ctx.create_socks5_udp_association().await;
-        let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_socket = common::bind_udp_loopback().await;
         send_and_expect_echo(
             udp_mod,
             &ctx,
@@ -324,7 +324,10 @@ fn rate_mbps(bytes: u64, elapsed: Duration) -> f64 {
 /// overflows the first UDP hop, so its "rate" measures the kernel, not the
 /// chain), and the echoed bytes prove what was actually delivered round-trip.
 async fn throughput_burst(udp_mod: &str, total_bytes: u64) {
-    const BATCH: usize = 512; // datagrams in flight per batch (~600 KB)
+    // Datagrams in flight per batch (~75 KB). Relay sockets keep the OS default
+    // receive buffer (~200 KB on Linux, ~2 KB of accounting per datagram), so a
+    // larger batch measures kernel drops on that hop rather than the chain.
+    const BATCH: usize = 64;
 
     let ctx = setup_chain(udp_mod).await;
     let (relay_addr, udp_socket, _tcp) = new_session(&ctx).await;

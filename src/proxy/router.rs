@@ -715,11 +715,7 @@ impl Router {
         }
 
         if let Some((upload, download, start_time)) = out_packet.get_udp_stats() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let duration = now - start_time;
+            let duration = crate::utils::now_timestamp().saturating_sub(start_time);
             info!(
                 "UDP session Closed, upload: {}, download: {}, duration: {}s",
                 ByteSize(upload),

@@ -18,6 +18,17 @@ use tokio::sync::oneshot;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 
+/// Loopback UDP socket with buffers large enough for the throughput tests'
+/// bursts; the ~200 KB Linux default drops most of a 512-datagram batch.
+pub async fn bind_udp_loopback() -> UdpSocket {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let sock = socket2::SockRef::from(&socket);
+    let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
+    socket.set_nonblocking(true).unwrap();
+    UdpSocket::from_std(socket).unwrap()
+}
+
 pub struct ProxyInstance {
     pub addr: SocketAddr,
     pub port: u16,
@@ -83,6 +94,9 @@ pub struct TestContext {
     // Proxy bootstrap uses process-global registries, so test contexts in the
     // same integration-test binary must not run concurrently.
     _test_guard: OwnedMutexGuard<()>,
+    // Inbound tag, outbound servers and final outbound of every proxy started
+    // so far; see `share_routes_with_previous_proxies`.
+    started_routes: Vec<(String, serde_json::Value, Option<String>)>,
 }
 
 static TEST_CONTEXT_LOCK: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
@@ -135,7 +149,7 @@ impl TestContext {
 
         let (tx_udp, rx_udp) = oneshot::channel();
         let h_udp = tokio::spawn(async move {
-            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let socket = bind_udp_loopback().await;
             tx_udp.send(socket.local_addr().unwrap()).unwrap();
             let mut buf = [0u8; 2048];
             loop {
@@ -192,6 +206,7 @@ impl TestContext {
             default_timeout: Duration::from_secs(5),
             _log_guard: None,
             _test_guard: test_guard,
+            started_routes: Vec::new(),
         }
     }
 
@@ -255,6 +270,8 @@ impl TestContext {
         } else {
             panic!("Inbound '{}' not found in config", inbound_name);
         }
+
+        self.share_routes_with_previous_proxies(&mut config_json, inbound_name);
 
         let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
         write!(temp_file, "{}", config_json.to_string()).expect("Failed to write config");
@@ -334,6 +351,64 @@ impl TestContext {
 
         self.proxies.push(instance);
         self.proxies.len() - 1
+    }
+
+    /// All proxies in one process share the global outbound map and router, and
+    /// the router installed last serves every inbound. Without help, a chained
+    /// server's inbound would route through the client's outbound back into
+    /// itself. Re-declare earlier proxies' outbounds in this config and pin each
+    /// earlier inbound to its own final outbound with a rule.
+    fn share_routes_with_previous_proxies(
+        &mut self,
+        config_json: &mut serde_json::Value,
+        inbound_name: &str,
+    ) {
+        let outbounds = &mut config_json["outbounds"];
+        // Several fixtures spell the final outbound like the DNS section does.
+        if outbounds.get("final_outbound").is_none()
+            && let Some(tag) = outbounds
+                .as_object_mut()
+                .and_then(|o| o.remove("default_server"))
+        {
+            outbounds["final_outbound"] = tag;
+        }
+
+        let own_servers = outbounds["servers"].clone();
+        let own_final = outbounds["final_outbound"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| match own_servers.as_object() {
+                Some(servers) if servers.len() == 1 => servers.keys().next().cloned(),
+                _ => None,
+            });
+
+        let mut pinned_rules = Vec::new();
+        for (prev_inbound, prev_servers, prev_final) in &self.started_routes {
+            if let (Some(servers), Some(prev)) =
+                (outbounds["servers"].as_object_mut(), prev_servers.as_object())
+            {
+                for (tag, server) in prev {
+                    servers.entry(tag.clone()).or_insert_with(|| server.clone());
+                }
+            }
+            if let Some(prev_final) = prev_final {
+                pinned_rules.push(serde_json::json!({
+                    "inbounds": [prev_inbound],
+                    "outbound": prev_final,
+                }));
+            }
+        }
+
+        if !pinned_rules.is_empty() {
+            let router = &mut config_json["router"];
+            if let Some(existing) = router.get("rules").and_then(|r| r.as_array()) {
+                pinned_rules.extend(existing.iter().cloned());
+            }
+            router["rules"] = serde_json::Value::Array(pinned_rules);
+        }
+
+        self.started_routes
+            .push((inbound_name.to_string(), own_servers, own_final));
     }
 
     pub async fn start_proxy_with_config_file(&mut self, config_path: &Path, inbound_name: &str) {
