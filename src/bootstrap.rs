@@ -31,8 +31,8 @@ where
 
     InterfaceManager::init();
 
-    let mut shutdown_rx = match init_app(config).await {
-        Ok(shutdown_rx) => shutdown_rx,
+    let (mut shutdown_rx, mut inbound_failed_rx) = match init_app(config).await {
+        Ok(receivers) => receivers,
         Err(error) => {
             // Initialization can fail after some global components have already been installed.
             // Tear them down so a later Android start can retry in the same process.
@@ -65,6 +65,10 @@ where
             info!("Received API shutdown signal, shutting down...");
             Ok(())
         }
+        Some(e) = inbound_failed_rx.recv() => {
+            error!("{:#}, shutting down...", e);
+            Err(e)
+        }
     };
     info!("Stopping inbound listeners...");
 
@@ -93,7 +97,14 @@ pub async fn shutdown_app() {
     shutdown_cache();
 }
 
-pub async fn init_app(mut config: Config) -> Result<Option<tokio::sync::mpsc::Receiver<()>>> {
+/// Returns the API shutdown receiver (if the API is enabled) and the channel on which
+/// inbound listeners report fatal errors.
+pub async fn init_app(
+    mut config: Config,
+) -> Result<(
+    Option<tokio::sync::mpsc::Receiver<()>>,
+    tokio::sync::mpsc::UnboundedReceiver<anyhow::Error>,
+)> {
     init_cache(&config).context("Failed to init cache")?;
     debug!("init_cache");
 
@@ -120,13 +131,14 @@ pub async fn init_app(mut config: Config) -> Result<Option<tokio::sync::mpsc::Re
     init_router(&config).context("Failed to init router")?;
     debug!("init_router");
 
-    init_inbounds(&config).context("Failed to init inbounds")?;
+    let inbound_failed_rx = init_inbounds(&config).context("Failed to init inbounds")?;
     debug!("init_inbounds");
 
     start_outbound_tests();
     debug!("start_outbound_tests");
 
-    init_core_api(&mut config)
+    let shutdown_rx = init_core_api(&mut config)
         .await
-        .context("Failed to init API")
+        .context("Failed to init API")?;
+    Ok((shutdown_rx, inbound_failed_rx))
 }

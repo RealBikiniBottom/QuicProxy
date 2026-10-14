@@ -137,7 +137,7 @@ async fn async_main() -> Result<()> {
 
     if let Err(e) = bootstrap::run_with_signal(config, async {
         info!("Proxy started. Press Ctrl-C to stop.");
-        let _ = tokio::signal::ctrl_c().await;
+        wait_for_exit_signal().await;
         Ok(())
     })
     .await
@@ -147,6 +147,26 @@ async fn async_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolves on Ctrl-C, or on SIGTERM (`systemctl stop`, plain `kill`) where it exists,
+/// so both go through the graceful shutdown path.
+async fn wait_for_exit_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => info!("Received Ctrl-C"),
+                    _ = sigterm.recv() => info!("Received SIGTERM"),
+                }
+                return;
+            }
+            Err(e) => tracing::warn!("Failed to listen for SIGTERM: {e}"),
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn run_manage(args: Args) -> Result<()> {

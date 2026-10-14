@@ -30,6 +30,7 @@ use dashmap::DashMap;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::error;
 
 /// Encode everything except the RFC 3986 unreserved characters so a value can be
@@ -76,8 +77,12 @@ pub(crate) fn uri_host(host: &str) -> String {
     }
 }
 
-pub fn init_inbounds(cfg: &Config) -> anyhow::Result<()> {
+/// Starts every configured inbound. A listener that later stops with an error reports it
+/// on the returned channel, so the caller can shut down through the normal path instead
+/// of the process exiting on the spot.
+pub fn init_inbounds(cfg: &Config) -> anyhow::Result<mpsc::UnboundedReceiver<anyhow::Error>> {
     let observer = get_observer();
+    let (failed_tx, failed_rx) = mpsc::unbounded_channel();
     for (name, item) in cfg.inbounds.iter() {
         let protocol = item.protocol_type.clone().to_lowercase();
         let name_clone = name.clone();
@@ -137,20 +142,16 @@ pub fn init_inbounds(cfg: &Config) -> anyhow::Result<()> {
             }
         }
 
-        let name_for_log = name.clone();
+        let name = name.clone();
+        let failed_tx = failed_tx.clone();
         shutdown::spawn(async move {
             if let Err(e) = inbound.listen().await {
-                error!(
-                    "Inbound '{}' error: {:?}",
-                    name_for_log,
-                    anyhow::Error::from(e)
-                );
-                std::process::exit(1);
+                let _ = failed_tx.send(e.context(format!("Inbound '{name}' stopped")));
             }
         });
     }
 
-    Ok(())
+    Ok(failed_rx)
 }
 
 /// 设置系统代理（如果启用），返回代理Guard
