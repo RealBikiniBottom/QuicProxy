@@ -591,7 +591,7 @@ where
                     let mut piece = this.write_buf.split_off(2);
                     piece.put_slice(&buf[..consume]);
                     if overhead > 0 {
-                        piece.extend_from_slice(&vec![0u8; overhead]);
+                        piece.put_bytes(0, overhead);
                     }
                     if overhead > 0 {
                         let cipher = this.write_cipher.as_mut().unwrap();

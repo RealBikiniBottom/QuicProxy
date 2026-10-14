@@ -187,11 +187,9 @@ impl AnyPacket for Socks5InboundPacket {
         };
         drop(guard);
 
-        let mut header = vec![0x00, 0x00, 0x00];
-        header.extend_from_slice(&from.to_bytes());
-
-        let mut data = Vec::with_capacity(header.len() + buf.len());
-        data.extend_from_slice(&header);
+        let mut data = Vec::with_capacity(3 + from.encoded_len() + buf.len());
+        data.extend_from_slice(&[0x00, 0x00, 0x00]);
+        from.write_to(&mut data);
         data.extend_from_slice(&buf);
         self.socket
             .send_to(&data, client_addr)

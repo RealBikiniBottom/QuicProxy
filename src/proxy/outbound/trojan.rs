@@ -296,7 +296,8 @@ impl TrojanUdpSocket {
 #[async_trait]
 impl AnyPacket for TrojanUdpSocket {
     async fn send_to(&self, buf: Bytes, _from: &SourceAddr, target: &TargetAddr) -> Result<usize> {
-        let mut packet = target.to_bytes();
+        let mut packet = Vec::with_capacity(target.encoded_len() + 4 + buf.len());
+        target.write_to(&mut packet);
 
         packet.extend_from_slice(&(buf.len() as u16).to_be_bytes());
         packet.extend_from_slice(b"\r\n");

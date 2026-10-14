@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use http3::{H3Control, STATUS_AUTH_OK, authenticate};
+use smallvec::{SmallVec, smallvec};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -88,28 +89,28 @@ fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     Ok((value, len))
 }
 
-fn append_varint(out: &mut Vec<u8>, value: u64) {
+fn append_varint(out: &mut impl BufMut, value: u64) {
     match value {
-        0..=63 => out.push(value as u8),
+        0..=63 => out.put_u8(value as u8),
         64..=16383 => {
-            out.push(0x40 | ((value >> 8) as u8));
-            out.push(value as u8);
+            out.put_u8(0x40 | ((value >> 8) as u8));
+            out.put_u8(value as u8);
         }
         16384..=1_073_741_823 => {
-            out.push(0x80 | ((value >> 24) as u8));
-            out.push((value >> 16) as u8);
-            out.push((value >> 8) as u8);
-            out.push(value as u8);
+            out.put_u8(0x80 | ((value >> 24) as u8));
+            out.put_u8((value >> 16) as u8);
+            out.put_u8((value >> 8) as u8);
+            out.put_u8(value as u8);
         }
         _ => {
-            out.push(0xc0 | ((value >> 56) as u8));
-            out.push((value >> 48) as u8);
-            out.push((value >> 40) as u8);
-            out.push((value >> 32) as u8);
-            out.push((value >> 24) as u8);
-            out.push((value >> 16) as u8);
-            out.push((value >> 8) as u8);
-            out.push(value as u8);
+            out.put_u8(0xc0 | ((value >> 56) as u8));
+            out.put_u8((value >> 48) as u8);
+            out.put_u8((value >> 40) as u8);
+            out.put_u8((value >> 32) as u8);
+            out.put_u8((value >> 24) as u8);
+            out.put_u8((value >> 16) as u8);
+            out.put_u8((value >> 8) as u8);
+            out.put_u8(value as u8);
         }
     }
 }
@@ -123,6 +124,11 @@ fn encode_tcp_request(target: &TargetAddr) -> Vec<u8> {
     out.extend_from_slice(addr.as_bytes());
     append_varint(&mut out, 0);
     out
+}
+
+/// Bytes of a UDPMessage header (before payload) for `destination`.
+fn udp_header_size(destination: &str) -> usize {
+    8 + varint_len(destination.len() as u64) + destination.len()
 }
 
 /// A parsed UDP proxy datagram (Hysteria2 UDPMessage).
@@ -139,7 +145,7 @@ struct UdpMessage {
 impl UdpMessage {
     /// Bytes of the fixed+variable header (before payload).
     fn header_size(&self) -> usize {
-        8 + varint_len(self.destination.len() as u64) + self.destination.len()
+        udp_header_size(&self.destination)
     }
 
     /// Serialize into one QUIC datagram payload.
@@ -149,9 +155,7 @@ impl UdpMessage {
         out.put_u16(self.packet_id);
         out.put_u8(self.frag_id);
         out.put_u8(self.frag_count);
-        let mut head = Vec::new();
-        append_varint(&mut head, self.destination.len() as u64);
-        out.put_slice(&head);
+        append_varint(&mut out, self.destination.len() as u64);
         out.put_slice(self.destination.as_bytes());
         out.put_slice(&self.payload);
         out.freeze()
@@ -397,25 +401,18 @@ impl AnyPacket for Hy2UdpSession {
         };
 
         let destination = target.to_string();
-        let base = UdpMessage {
-            session_id: self.session_id,
-            packet_id: 0,
-            frag_id: 0,
-            frag_count: 1,
-            destination: destination.clone(),
-            payload: Bytes::new(),
-        };
-        let header_size = base.header_size();
+        let header_size = udp_header_size(&destination);
         let payload_len = buf.len();
 
         // Single datagram when it fits; otherwise fragment so every piece is
-        // within the peer's datagram budget.
-        let chunks: Vec<Bytes> = if buf.len() + header_size <= max_size {
-            vec![buf]
+        // within the peer's datagram budget. Almost every packet fits in one
+        // datagram, so keep the chunk list inline instead of on the heap.
+        let chunks: SmallVec<[Bytes; 2]> = if buf.len() + header_size <= max_size {
+            smallvec![buf]
         } else {
             let per_fragment = max_size.saturating_sub(header_size).max(1);
             let mut rest = buf;
-            let mut chunks = Vec::new();
+            let mut chunks = SmallVec::new();
             while !rest.is_empty() {
                 let take = rest.len().min(per_fragment);
                 chunks.push(rest.split_to(take));

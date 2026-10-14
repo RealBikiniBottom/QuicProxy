@@ -514,8 +514,7 @@ impl AsyncWrite for VmessStream {
                     let mut piece2 = this.write_buf.split_off(size_bytes);
                     piece2.put_slice(&buf[..consume_len]);
                     if let Some(ref mut cipher) = this.aead_write_cipher {
-                        piece2
-                            .extend_from_slice(vec![0u8; cipher.security.overhead_len()].as_ref());
+                        piece2.put_bytes(0, cipher.security.overhead_len());
                     }
 
                     let _cur_len = piece2.len();

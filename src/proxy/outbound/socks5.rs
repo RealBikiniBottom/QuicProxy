@@ -342,16 +342,15 @@ impl AnyPacket for Socks5UdpSocket {
             return Err(anyhow::anyhow!("Control stream closed"));
         }
 
-        let mut header = vec![0x00, 0x00, 0x00];
         if let TargetAddr::Domain(domain, _) = target {
             if domain.as_bytes().len() > 255 {
                 return Err(anyhow::anyhow!("Domain name too long"));
             }
         }
-        header.extend_from_slice(&target.to_bytes());
 
-        let mut data = Vec::with_capacity(header.len() + buf.len());
-        data.extend_from_slice(&header);
+        let mut data = Vec::with_capacity(3 + target.encoded_len() + buf.len());
+        data.extend_from_slice(&[0x00, 0x00, 0x00]);
+        target.write_to(&mut data);
         data.extend_from_slice(&buf);
         self.udp.send(&data).await.map_err(Into::into)
     }

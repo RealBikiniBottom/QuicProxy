@@ -30,7 +30,13 @@ pub const UDP_OVER_TCP_TARGET: &str = "sp.v2.udp-over-tcp.arpa";
 /// Encode TargetAddr in UoT data-packet AddrParser format (ATYP: 0x00=IPv4, 0x01=IPv6, 0x02=Domain).
 /// Note: UoT Request uses the regular SOCKS address format from `TargetAddr::to_bytes`.
 pub fn uot_encode_target(target: &TargetAddr) -> Vec<u8> {
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(target.encoded_len());
+    uot_write_target(target, &mut buf);
+    buf
+}
+
+/// Append the UoT data-packet address encoding of `target` to `buf`.
+fn uot_write_target(target: &TargetAddr, buf: &mut Vec<u8>) {
     match target {
         TargetAddr::Ip(std::net::SocketAddr::V4(addr)) => {
             buf.push(0x00);
@@ -49,7 +55,6 @@ pub fn uot_encode_target(target: &TargetAddr) -> Vec<u8> {
             buf.extend_from_slice(&port.to_be_bytes());
         }
     }
-    buf
 }
 
 /// Decode TargetAddr from UoT data-packet AddrParser format (ATYP: 0x00=IPv4, 0x01=IPv6, 0x02=Domain).
@@ -283,9 +288,11 @@ fn uot_target_len(data: &[u8]) -> Result<Option<usize>> {
 
 pub fn encode_uot_packet(payload: &[u8], target: Option<&TargetAddr>) -> Result<Bytes> {
     let payload_len = u16::try_from(payload.len()).context("UoT payload exceeds 65535 bytes")?;
-    let target = target.map(uot_encode_target).unwrap_or_default();
-    let mut packet = Vec::with_capacity(target.len() + 2 + payload.len());
-    packet.extend_from_slice(&target);
+    let target_len = target.map_or(0, TargetAddr::encoded_len);
+    let mut packet = Vec::with_capacity(target_len + 2 + payload.len());
+    if let Some(target) = target {
+        uot_write_target(target, &mut packet);
+    }
     packet.extend_from_slice(&payload_len.to_be_bytes());
     packet.extend_from_slice(payload);
     Ok(Bytes::from(packet))

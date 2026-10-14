@@ -41,7 +41,23 @@ impl TargetAddr {
 
     /// Convert the target address to bytes according to SOCKS5 / Trojan address format
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut packet = Vec::new();
+        let mut packet = Vec::with_capacity(self.encoded_len());
+        self.write_to(&mut packet);
+        packet
+    }
+
+    /// Length of the SOCKS5 / Trojan encoding produced by `write_to`.
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            TargetAddr::Ip(SocketAddr::V4(_)) => 1 + 4 + 2,
+            TargetAddr::Ip(SocketAddr::V6(_)) => 1 + 16 + 2,
+            TargetAddr::Domain(domain, _) => 1 + 1 + domain.len() + 2,
+        }
+    }
+
+    /// Append the SOCKS5 / Trojan address encoding to `packet`, so per-packet
+    /// callers can build the whole datagram in one allocation.
+    pub fn write_to(&self, packet: &mut Vec<u8>) {
         match self {
             TargetAddr::Ip(SocketAddr::V4(addr)) => {
                 packet.push(1); // IPv4
@@ -60,7 +76,6 @@ impl TargetAddr {
                 packet.extend_from_slice(&port.to_be_bytes());
             }
         }
-        packet
     }
 
     /// Read a TargetAddr from an async stream according to SOCKS5 / Trojan address format

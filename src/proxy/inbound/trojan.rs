@@ -44,7 +44,8 @@ impl AnyPacket for TrojanInboundPacket {
         from: &SourceAddr,
         _target: &TargetAddr,
     ) -> anyhow::Result<usize> {
-        let mut packet = from.to_bytes();
+        let mut packet = Vec::with_capacity(from.encoded_len() + 4 + buf.len());
+        from.write_to(&mut packet);
         packet.extend_from_slice(&(buf.len() as u16).to_be_bytes());
         packet.extend_from_slice(b"\r\n");
         packet.extend_from_slice(&buf);
