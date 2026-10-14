@@ -4,7 +4,8 @@ use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo};
 use crate::proxy::{SessionCloser, SourceAddr, TargetAddr};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use crate::utils::socket::udp_recv;
+use bytes::Bytes;
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -70,24 +71,16 @@ impl AnyPacket for DirectUdpOutbound {
     }
 
     async fn recv_from(&self) -> Result<PacketInfo> {
-        let mut buf = BytesMut::with_capacity(1024 * 2);
-        let (n, addr) = self.socket.recv_buf_from(&mut buf).await?;
-        buf.truncate(n);
-        Ok((self.reverse(addr)?, TargetAddr::dummy(), buf.freeze()))
+        let (data, addr) = udp_recv::recv_from(&self.socket).await?;
+        Ok((self.reverse(addr)?, TargetAddr::dummy(), data))
     }
 
     async fn recv_many(&self, packets: &mut Vec<PacketInfo>) -> anyhow::Result<()> {
         let first = self.recv_from().await?;
         packets.clear();
         packets.push(first);
-        loop {
-            let mut buf = BytesMut::with_capacity(1024 * 2);
-            if let Result::Ok((n, addr)) = self.socket.try_recv_buf_from(&mut buf) {
-                buf.truncate(n);
-                packets.push((self.reverse(addr)?, TargetAddr::dummy(), buf.freeze()));
-            } else {
-                break;
-            }
+        while let Ok((data, addr)) = udp_recv::try_recv_from(&self.socket) {
+            packets.push((self.reverse(addr)?, TargetAddr::dummy(), data));
         }
         Ok(())
     }

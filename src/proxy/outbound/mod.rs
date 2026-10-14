@@ -51,7 +51,7 @@ use crate::utils::new_io_timeout_error;
 use crate::utils::shutdown;
 use crate::utils::socket::socket_helpers::{new_tcp_stream, new_udp_socket};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 use super::SourceAddr;
 
@@ -456,14 +456,12 @@ impl AnyPacket for tokio::net::UdpSocket {
     }
 
     async fn recv_from(&self) -> anyhow::Result<PacketInfo> {
-        let mut buf = BytesMut::with_capacity(1024 * 2);
-        let (n, addr) = self.recv_buf_from(&mut buf).await?;
-        buf.truncate(n);
+        let (data, addr) = crate::utils::socket::udp_recv::recv_from(self).await?;
         let target = TargetAddr::Ip(std::net::SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
             0,
         ));
-        Ok((TargetAddr::Ip(addr), target, buf.freeze()))
+        Ok((TargetAddr::Ip(addr), target, data))
     }
 }
 

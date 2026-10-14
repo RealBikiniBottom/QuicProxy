@@ -247,3 +247,79 @@ async fn test_socks5_udp_concurrent_sessions() {
         .await
         .expect("test_socks5_udp_concurrent_sessions timed out");
 }
+
+#[tokio::test]
+async fn test_socks5_udp_large_datagrams_through_direct() {
+    let _watchdog = Watchdog::new(
+        "test_socks5_udp_large_datagrams_through_direct",
+        TEST_TIMEOUT,
+    );
+
+    let test_fut = async {
+        let mut context = TestContext::new().await;
+
+        // The shared mock echo server reads into a 2 KiB buffer, so this test
+        // runs its own echo server that can hold a full-size datagram.
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            while let Ok((len, from)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..len], from).await;
+            }
+        });
+
+        let config = serde_json::json!({
+            "inbounds": {
+                "socks5_in": {
+                    "type": "socks5",
+                    "address": "127.0.0.1",
+                    "port": 0,
+                    "timeout": 30
+                }
+            },
+            "dns": {
+                "default_server": "local_dns",
+                "servers": {
+                    "local_dns": {
+                        "type": "udp",
+                        "address": "8.8.8.8",
+                        "outbound": "direct_out",
+                        "port": 53,
+                    },
+                }
+            },
+            "outbounds": {
+                "default_server": "direct_out",
+                "servers": {
+                    "direct_out": {
+                        "type": "direct"
+                    }
+                }
+            },
+            "router": {
+                "default_mode": "proxy"
+            }
+        });
+
+        context.start_proxy(config, "socks5_in").await;
+
+        let (relay_addr, _stream) = context.create_socks5_udp_association().await;
+        let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+
+        for size in [100usize, 2_000, 2_100, 4_096, 16_000, 60_000] {
+            let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            context
+                .send_socks5_udp_packet(&udp_socket, relay_addr, echo_addr, &payload)
+                .await;
+            let echoed = context.recv_socks5_udp_packet(&udp_socket, &mut buf).await;
+            assert_eq!(echoed.len(), size, "datagram of {size} bytes was truncated");
+            assert_eq!(echoed, payload);
+        }
+    };
+
+    tokio::time::timeout(TEST_TIMEOUT, test_fut)
+        .await
+        .expect("test_socks5_udp_large_datagrams_through_direct timed out");
+}

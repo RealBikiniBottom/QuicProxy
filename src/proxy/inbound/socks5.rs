@@ -4,9 +4,10 @@ use crate::proxy::outbound::{AnyPacket, PacketInfo};
 use crate::proxy::router::{Router, get_router, start_udp_loop};
 use crate::proxy::{SourceAddr, TargetAddr};
 use crate::utils::new_io_timeout_error;
+use crate::utils::socket::udp_recv;
 use crate::utils::{format_duration, new_io_other_error, now};
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use serde::Deserialize;
 use std::io::Result;
 use std::net::SocketAddr;
@@ -198,10 +199,9 @@ impl AnyPacket for Socks5InboundPacket {
     }
 
     async fn recv_from(&self) -> anyhow::Result<PacketInfo> {
-        let mut buf = BytesMut::with_capacity(1024 * 2);
         loop {
-            buf.clear();
-            let (n, src) = self.socket.recv_buf_from(&mut buf).await?;
+            let (mut buf, src) = udp_recv::recv_from(&self.socket).await?;
+            let n = buf.len();
 
             if src.ip() != self.client_tcp_addr.ip() {
                 continue;
@@ -231,7 +231,7 @@ impl AnyPacket for Socks5InboundPacket {
                         continue;
                     }
                     let _ = buf.split_to(payload_start);
-                    return Ok((TargetAddr::Ip(src), target, buf.freeze()));
+                    return Ok((TargetAddr::Ip(src), target, buf));
                 }
                 Err(_) => continue,
             }

@@ -11,6 +11,7 @@ use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo};
 use crate::proxy::{SourceAddr, TargetAddr};
 
 use crate::utils::new_io_other_error;
+use crate::utils::socket::udp_recv;
 use std::time::Duration;
 
 pub struct Socks5Outbound {
@@ -324,7 +325,7 @@ impl Drop for Socks5UdpSocket {
     }
 }
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 #[async_trait]
 impl AnyPacket for Socks5UdpSocket {
@@ -356,12 +357,10 @@ impl AnyPacket for Socks5UdpSocket {
     }
 
     async fn recv_from(&self) -> anyhow::Result<PacketInfo> {
-        let mut buf = BytesMut::with_capacity(1024 * 2);
         let mut abort_rx = self.abort_rx.clone();
         loop {
-            buf.clear();
-            let n = tokio::select! {
-                res = self.udp.recv_buf(&mut buf) => res?,
+            let mut buf = tokio::select! {
+                res = udp_recv::recv(&self.udp) => res?,
                 _ = abort_rx.changed() => {
                     return Err(anyhow::anyhow!("Control stream closed"));
                 }
@@ -370,6 +369,7 @@ impl AnyPacket for Socks5UdpSocket {
                 }
             };
 
+            let n = buf.len();
             if n < 4 {
                 continue;
             }
@@ -383,7 +383,7 @@ impl AnyPacket for Socks5UdpSocket {
                     }
 
                     let _ = buf.split_to(header_len);
-                    return Ok((target, TargetAddr::dummy(), buf.freeze()));
+                    return Ok((target, TargetAddr::dummy(), buf));
                 }
                 Err(_) => continue,
             }
