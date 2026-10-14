@@ -2,9 +2,9 @@ use crate::config::OutboundConfig;
 use crate::dns::resolve_target;
 use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo};
 use crate::proxy::{SessionCloser, SourceAddr, TargetAddr};
+use crate::utils::socket::udp_recv;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use crate::utils::socket::udp_recv;
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::net::SocketAddr;
@@ -23,20 +23,19 @@ pub struct DirectOutbound {
 struct DirectUdpOutbound {
     socket: UdpSocket,
     dns: Option<String>,
-    ip_map: DashMap<String, String>,
+    /// Domain targets this session sent to, and the address each one resolved to.
+    resolved: DashMap<TargetAddr, SocketAddr>,
+    /// Reverse of `resolved`, so replies are reported as coming from the domain.
+    reverse: DashMap<SocketAddr, TargetAddr>,
     closer: Arc<SessionCloser>,
 }
 
 impl DirectUdpOutbound {
     pub fn reverse(&self, ip: SocketAddr) -> anyhow::Result<TargetAddr> {
-        let key = format!("socket:{}", ip.to_string());
-        match self.ip_map.get(&key) {
-            Some(res) => {
-                let cached_str = res.value();
-                TargetAddr::from_str(&cached_str)
-            }
-            None => Ok(TargetAddr::Ip(ip)),
-        }
+        Ok(match self.reverse.get(&ip) {
+            Some(target) => target.clone(),
+            None => TargetAddr::Ip(ip),
+        })
     }
 }
 
@@ -50,16 +49,15 @@ impl AnyPacket for DirectUdpOutbound {
         let ip = match target {
             TargetAddr::Ip(socket_addr) => *socket_addr,
             TargetAddr::Domain(_, _) => {
-                let key = format!("target:{}", target.to_string());
-
-                if let Some(cached) = self.ip_map.get(&key) {
-                    cached.value().parse::<SocketAddr>()?
-                } else {
-                    let addr = resolve_target(target, self.dns.as_deref()).await?;
-                    let rkey = format!("socket:{}", addr);
-                    self.ip_map.insert(key, addr.to_string());
-                    self.ip_map.insert(rkey, target.to_string());
-                    addr
+                let cached = self.resolved.get(target).map(|addr| *addr);
+                match cached {
+                    Some(addr) => addr,
+                    None => {
+                        let addr = resolve_target(target, self.dns.as_deref()).await?;
+                        self.resolved.insert(target.clone(), addr);
+                        self.reverse.insert(addr, target.clone());
+                        addr
+                    }
                 }
             }
         };
@@ -145,7 +143,8 @@ impl AnyOutbound for DirectOutbound {
         let inner = Arc::new(DirectUdpOutbound {
             socket,
             dns: self.dns.clone(),
-            ip_map: DashMap::new(),
+            resolved: DashMap::new(),
+            reverse: DashMap::new(),
             closer: Arc::new(SessionCloser::new()),
         });
         Ok(inner)

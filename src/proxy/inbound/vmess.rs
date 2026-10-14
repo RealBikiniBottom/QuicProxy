@@ -614,8 +614,7 @@ where
                     let new_written = written + n;
                     if new_written < total {
                         this.write_state = WriteState::FlushingData(consume, (new_written, total));
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
+                        continue;
                     }
                     this.write_buf.clear();
                     this.write_state = WriteState::BuildingData;
@@ -778,7 +777,11 @@ mod tests {
     /// Round-trip a payload through the client handshake + server accept, then
     /// echo it back through both sides' stream ciphers.
     async fn round_trip(uuid: &str, security: &str, payload: &[u8]) {
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        round_trip_with_pipe(uuid, security, payload, 64 * 1024).await;
+    }
+
+    async fn round_trip_with_pipe(uuid: &str, security: &str, payload: &[u8], pipe_size: usize) {
+        let (client_io, server_io) = tokio::io::duplex(pipe_size);
         let (client_rd, client_wr) = tokio::io::split(client_io);
         let (server_rd, server_wr) = tokio::io::split(server_io);
 
@@ -869,6 +872,16 @@ mod tests {
     #[tokio::test]
     async fn none_security_round_trip() {
         round_trip(UUID, "none", b"hello vmess").await;
+    }
+
+    #[tokio::test]
+    async fn round_trip_survives_partial_writes() {
+        // A 1000-byte pipe only takes part of each 16KB chunk per write, so both
+        // directions go through the partial-write path many times.
+        let payload: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+        for security in ["aes-128-gcm", "none"] {
+            round_trip_with_pipe(UUID, security, &payload, 1000).await;
+        }
     }
 
     #[tokio::test]

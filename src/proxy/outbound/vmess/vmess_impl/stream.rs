@@ -545,8 +545,7 @@ impl AsyncWrite for VmessStream {
                     if new_written < total {
                         this.write_state =
                             WriteState::FlushingData(consume_len, (new_written, total));
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
+                        continue;
                     }
 
                     this.write_buf.clear();

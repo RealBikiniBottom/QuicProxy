@@ -35,6 +35,9 @@ pub struct TrojanOutbound {
 
     password_hash: String,
     tag: String,
+    /// Built once so every connection shares the TLS session cache and skips reloading certificates.
+    tls_connector: TlsConnector,
+    server_name: rustls::pki_types::ServerName<'static>,
 }
 
 impl TrojanOutbound {
@@ -55,6 +58,9 @@ impl TrojanOutbound {
         let result = hasher.finalize();
         let password_hash = hex::encode(result);
 
+        let tls_connector = TlsConnector::from(Arc::new(Self::build_tls_client_config(&tls)?));
+        let server_name = Self::tls_server_name(&tls, &address)?;
+
         let trojan = Self {
             address,
             password,
@@ -66,6 +72,8 @@ impl TrojanOutbound {
             pool_size,
             password_hash,
             tag,
+            tls_connector,
+            server_name,
         };
 
         if trojan.pool_size > 0 {
@@ -94,20 +102,23 @@ impl TrojanOutbound {
         buf
     }
 
-    fn tls_server_name(&self) -> Result<rustls::pki_types::ServerName<'static>> {
-        let host = self.address.host();
-        let name = self.tls.sni.as_deref().unwrap_or(&host);
+    fn tls_server_name(
+        tls: &TlsConfig,
+        address: &TargetAddr,
+    ) -> Result<rustls::pki_types::ServerName<'static>> {
+        let host = address.host();
+        let name = tls.sni.as_deref().unwrap_or(&host);
         Ok(rustls::pki_types::ServerName::try_from(name)
             .map_err(|e| new_io_other_error(e))?
             .to_owned())
     }
 
-    fn build_tls_client_config(&self) -> Result<rustls::ClientConfig> {
+    fn build_tls_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        if !self.tls.insecure {
+        if !tls.insecure {
             let mut root_store = rustls::RootCertStore::empty();
-            if let Some(cert_path) = self.tls.cert.as_deref() {
+            if let Some(cert_path) = tls.cert.as_deref() {
                 for cert in load_certs(cert_path)? {
                     root_store.add(cert).map_err(|e| new_io_other_error(e))?;
                 }
@@ -118,7 +129,7 @@ impl TrojanOutbound {
             let mut config = crate::utils::ntp::tls::client_builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
-            configure_jls_client(&mut config, &self.tls);
+            configure_jls_client(&mut config, tls);
             Ok(config)
         } else {
             let config = crate::utils::ntp::tls::client_builder()
@@ -128,7 +139,7 @@ impl TrojanOutbound {
             config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(SkipServerVerification));
-            configure_jls_client(&mut config, &self.tls);
+            configure_jls_client(&mut config, tls);
             Ok(config)
         }
     }
@@ -137,12 +148,10 @@ impl TrojanOutbound {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let config = Arc::new(self.build_tls_client_config()?);
-        let connector = TlsConnector::from(config);
-        let domain = self.tls_server_name()?;
+        let domain = self.server_name.clone();
         let timeout_duration = self.connect_timeout();
 
-        let tls_stream = timeout(timeout_duration, connector.connect(domain, stream))
+        let tls_stream = timeout(timeout_duration, self.tls_connector.connect(domain, stream))
             .await
             .with_context(|| format!("Trojan TLS handshake timeout after {:?}", timeout_duration))?
             .context("TLS handshake failed")?;
