@@ -44,8 +44,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 const TCP_REQUEST_TYPE: u64 = 0x401;
-/// Bound on a single UDP proxy packet payload.
-const MAX_UDP_PAYLOAD: usize = 2048;
+/// Bound on a single UDP proxy packet payload: the largest UDP datagram.
+const MAX_UDP_PAYLOAD: usize = u16::MAX as usize;
 /// Max bytes for a destination address carried in a UDPMessage.
 const MAX_UDP_ADDRESS_LEN: u64 = 2048;
 /// Queue depth of raw datagrams waiting for one UDP session's worker.
@@ -160,6 +160,50 @@ impl UdpMessage {
         out.put_slice(&self.payload);
         out.freeze()
     }
+}
+
+/// Split one UDP payload into UDPMessages that each fit in `max_size`. Returns
+/// `None` when the payload would need more fragments than the u8 count allows.
+fn fragment_udp_payload(
+    session_id: u32,
+    packet_id: u16,
+    destination: String,
+    payload: Bytes,
+    max_size: usize,
+) -> Option<SmallVec<[UdpMessage; 2]>> {
+    let header_size = udp_header_size(&destination);
+
+    // Almost every packet fits in one datagram, so keep the list inline.
+    let chunks: SmallVec<[Bytes; 2]> = if payload.len() + header_size <= max_size {
+        smallvec![payload]
+    } else {
+        let per_fragment = max_size.saturating_sub(header_size).max(1);
+        let mut rest = payload;
+        let mut chunks = SmallVec::new();
+        while !rest.is_empty() {
+            let take = rest.len().min(per_fragment);
+            chunks.push(rest.split_to(take));
+        }
+        chunks
+    };
+    let frag_count = u8::try_from(chunks.len()).ok()?;
+
+    // Every fragment of one packet carries the same packet id; the receiver
+    // reassembles by it.
+    Some(
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, chunk)| UdpMessage {
+                session_id,
+                packet_id,
+                frag_id: index as u8,
+                frag_count,
+                destination: destination.clone(),
+                payload: chunk,
+            })
+            .collect(),
+    )
 }
 
 /// Decapsulate one datagram payload into its message fields.
@@ -393,45 +437,28 @@ impl AnyPacket for Hy2UdpSession {
         target: &TargetAddr,
     ) -> Result<usize> {
         if buf.len() > MAX_UDP_PAYLOAD {
-            bail!("UDP payload too large: {}", buf.len());
+            // Dropping matches UDP semantics; an error would end the whole session.
+            debug!("drop hy2 UDP payload of {} bytes: too large", buf.len());
+            return Ok(0);
         }
         let conn = &self.state.conn;
         let Some(max_size) = conn.max_datagram_size() else {
             bail!("hy2 peer does not support QUIC datagrams");
         };
 
-        let destination = target.to_string();
-        let header_size = udp_header_size(&destination);
         let payload_len = buf.len();
-
-        // Single datagram when it fits; otherwise fragment so every piece is
-        // within the peer's datagram budget. Almost every packet fits in one
-        // datagram, so keep the chunk list inline instead of on the heap.
-        let chunks: SmallVec<[Bytes; 2]> = if buf.len() + header_size <= max_size {
-            smallvec![buf]
-        } else {
-            let per_fragment = max_size.saturating_sub(header_size).max(1);
-            let mut rest = buf;
-            let mut chunks = SmallVec::new();
-            while !rest.is_empty() {
-                let take = rest.len().min(per_fragment);
-                chunks.push(rest.split_to(take));
-            }
-            chunks
+        let Some(messages) = fragment_udp_payload(
+            self.session_id,
+            rand_packet_id(),
+            target.to_string(),
+            buf,
+            max_size,
+        ) else {
+            debug!("drop hy2 UDP payload of {payload_len} bytes: needs more than 255 fragments");
+            return Ok(0);
         };
-        let frag_count = u8::try_from(chunks.len()).context("too many UDP fragments")?;
 
-        let mut packet_id = rand_packet_id();
-        for (index, chunk) in chunks.into_iter().enumerate() {
-            packet_id = packet_id.wrapping_add(1);
-            let message = UdpMessage {
-                session_id: self.session_id,
-                packet_id,
-                frag_id: index as u8,
-                frag_count,
-                destination: destination.clone(),
-                payload: chunk,
-            };
+        for message in messages {
             let packed = message.pack();
             match conn.send_datagram(packed) {
                 Ok(()) => {}
@@ -729,9 +756,8 @@ impl AsyncWrite for Hy2TcpStream {
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.pending_request.is_some() {
+        while let Some(request) = self.pending_request.take() {
             // Fuse the TCPRequest prefix with the first payload write.
-            let request = self.pending_request.take().unwrap();
             let mut write = Vec::with_capacity(request.len() + buf.len());
             write.extend_from_slice(&request);
             write.extend_from_slice(buf);
@@ -740,18 +766,18 @@ impl AsyncWrite for Hy2TcpStream {
                 .poll_write(cx, &write)
                 .map_err(io::Error::from)
             {
+                Poll::Ready(Ok(0)) => {
+                    self.pending_request = Some(request);
+                    return Poll::Ready(Ok(0));
+                }
+                Poll::Ready(Ok(n)) if n > request_len => {
+                    return Poll::Ready(Ok(n - request_len));
+                }
+                // Exactly the prefix went out: reporting Ok(0) here would read as
+                // WriteZero to callers, so go on to write the payload itself.
+                Poll::Ready(Ok(n)) if n == request_len => {}
                 Poll::Ready(Ok(n)) => {
-                    if n == 0 {
-                        self.pending_request = Some(request);
-                        return Poll::Ready(Ok(0));
-                    }
-                    if n >= request_len {
-                        return Poll::Ready(Ok(n - request_len));
-                    }
-                    // Partial write of the request prefix only.
                     self.pending_request = Some(request[n..].to_vec());
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
                 }
                 Poll::Ready(Err(e)) => {
                     self.pending_request = Some(request);
@@ -1156,6 +1182,43 @@ mod tests {
                 assert_eq!(&data[..], b"aaabbbccc");
             }
         }
+    }
+
+    #[test]
+    fn large_udp_payload_fragments_reassemble_on_receiver() {
+        let payload: Bytes = (0..5_000u32)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>()
+            .into();
+        let max_size = 1_200;
+        let messages = fragment_udp_payload(
+            9,
+            0x4242,
+            "1.2.3.4:5678".to_string(),
+            payload.clone(),
+            max_size,
+        )
+        .unwrap();
+        assert!(messages.len() > 1);
+
+        let mut defrag: hashbrown::HashMap<u16, Fragments> = hashbrown::HashMap::new();
+        let mut reassembled = None;
+        for message in messages {
+            let packed = message.pack();
+            assert!(packed.len() <= max_size);
+            if let Some(done) = process_udp_datagram(packed, &mut defrag).unwrap() {
+                reassembled = Some(done);
+            }
+        }
+        let (destination, data) = reassembled.expect("fragments never reassembled");
+        assert_eq!(destination, "1.2.3.4:5678");
+        assert_eq!(data, payload);
+    }
+
+    #[test]
+    fn udp_payload_needing_too_many_fragments_is_rejected() {
+        let payload = Bytes::from(vec![0u8; 300]);
+        assert!(fragment_udp_payload(1, 1, "1.2.3.4:5".to_string(), payload, 1).is_none());
     }
 
     #[test]
