@@ -1,4 +1,5 @@
 use crate::proxy::TargetAddr;
+use crate::utils::read_ahead;
 use anyhow::{Context as _, Result, bail};
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -176,6 +177,43 @@ pub async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(Command
     Ok((cmd, stream_id, Bytes::from(data)))
 }
 
+/// Reads frames off a session through one read-ahead buffer, so a frame costs one
+/// buffered read instead of four small ones, and the payload is cut out without copying.
+/// Cancel safe: a frame is consumed only once it is fully buffered.
+pub struct FrameReader<S> {
+    stream: S,
+    buf: BytesMut,
+}
+
+impl<S: AsyncRead + Unpin> FrameReader<S> {
+    pub fn new(stream: S) -> Self {
+        Self {
+            stream,
+            buf: BytesMut::new(),
+        }
+    }
+
+    pub async fn read_frame(&mut self) -> Result<(Command, u32, Bytes)> {
+        read_ahead::fill(&mut self.stream, &mut self.buf, FRAME_HEADER_SIZE, false)
+            .await
+            .context("read frame header")?;
+        let cmd = Command::try_from(self.buf[0])?;
+        let stream_id = u32::from_be_bytes(self.buf[1..5].try_into().unwrap());
+        let data_len = u16::from_be_bytes(self.buf[5..7].try_into().unwrap()) as usize;
+
+        read_ahead::fill(
+            &mut self.stream,
+            &mut self.buf,
+            FRAME_HEADER_SIZE + data_len,
+            false,
+        )
+        .await
+        .context("read frame payload")?;
+        self.buf.advance(FRAME_HEADER_SIZE);
+        Ok((cmd, stream_id, self.buf.split_to(data_len).freeze()))
+    }
+}
+
 pub fn append_frame(dst: &mut Vec<u8>, cmd: Command, stream_id: u32, data: &[u8]) -> Result<()> {
     let data_len = u16::try_from(data.len()).context("anytls frame payload exceeds 65535 bytes")?;
     dst.reserve(FRAME_HEADER_SIZE + data.len());
@@ -322,6 +360,33 @@ pub fn decode_uot_packet(data: Bytes, is_connect: bool) -> Result<(Option<Target
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn frame_reader_matches_read_frame_on_split_input() {
+        let mut wire = Vec::new();
+        append_frame(&mut wire, Command::Settings, 0, b"v=2\n").unwrap();
+        append_frame(&mut wire, Command::Syn, 1, b"").unwrap();
+        append_frame(&mut wire, Command::Psh, 1, &[5u8; 5000]).unwrap();
+
+        // 5-byte pipe: every header and payload arrives in pieces.
+        let (mut client, server) = tokio::io::duplex(5);
+        let writer = tokio::spawn(async move { client.write_all(&wire).await });
+        let mut frames = FrameReader::new(server);
+
+        assert_eq!(
+            frames.read_frame().await.unwrap(),
+            (Command::Settings, 0, Bytes::from_static(b"v=2\n"))
+        );
+        assert_eq!(
+            frames.read_frame().await.unwrap(),
+            (Command::Syn, 1, Bytes::new())
+        );
+        let (cmd, id, data) = frames.read_frame().await.unwrap();
+        assert_eq!((cmd, id, &data[..]), (Command::Psh, 1, &[5u8; 5000][..]));
+
+        writer.await.unwrap().unwrap();
+        assert!(frames.read_frame().await.is_err());
+    }
 
     #[test]
     fn rejects_unknown_command_without_panicking() {

@@ -322,8 +322,10 @@ impl InboundSession {
 
         debug!("Anytls inbound auth success from {}", peer_addr);
 
-        // 2. Read cmdSettings
-        let (cmd, _stream_id, settings_data) = read_frame(&mut tls_read).await?;
+        // 2. Read cmdSettings. The client may pipeline its first SYN/PSH right behind it,
+        // so the same reader (and its buffer) carries on into the read loop.
+        let mut frames = FrameReader::new(tls_read);
+        let (cmd, _stream_id, settings_data) = frames.read_frame().await?;
         if cmd != Command::Settings {
             // Protocol violation: send cmdAlert and close
             let alert = format!("expected cmdSettings, got cmd={:?}", cmd);
@@ -373,16 +375,19 @@ impl InboundSession {
         });
 
         // Run read loop (blocking)
-        let result = session.read_loop(tls_read).await;
+        let result = session.read_loop(frames).await;
         session.closer.close();
         session.streams.clear();
         result
     }
 
-    async fn read_loop(&self, mut tls: impl AsyncRead + Unpin + Send) -> Result<()> {
+    async fn read_loop(
+        &self,
+        mut frames: FrameReader<impl AsyncRead + Unpin + Send>,
+    ) -> Result<()> {
         loop {
             let (cmd, stream_id, data) = match tokio::select! {
-                frame = read_frame(&mut tls) => frame,
+                frame = frames.read_frame() => frame,
                 _ = self.closer.wait() => return Ok(()),
             } {
                 Ok(f) => f,

@@ -20,8 +20,9 @@ use crate::proxy::{
     outbound::{AnyOutbound, AnyPacket, AnyStream, LazyHandshakeStream, PacketInfo},
 };
 use crate::utils::new_io_other_error;
-use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use crate::utils::read_ahead;
+use bytes::{Buf, Bytes, BytesMut};
+use tokio::io::AsyncWriteExt;
 
 pub struct TrojanOutbound {
     pub address: TargetAddr,
@@ -287,8 +288,47 @@ impl AnyOutbound for TrojanOutbound {
     }
 }
 
+/// Reads Trojan UDP packets (`addr | u16 length | CRLF | payload`) through one read-ahead
+/// buffer, so a packet costs one buffered read instead of six small ones and the payload is
+/// cut out without copying. Cancel safe: a packet is consumed only once it is fully buffered.
+pub(crate) struct UdpPacketReader<R> {
+    rx: R,
+    buf: BytesMut,
+}
+
+impl<R: AsyncRead + Unpin> UdpPacketReader<R> {
+    pub(crate) fn new(rx: R) -> Self {
+        Self {
+            rx,
+            buf: BytesMut::new(),
+        }
+    }
+
+    pub(crate) async fn read_packet(&mut self) -> Result<(TargetAddr, Bytes)> {
+        loop {
+            let mut need = self.buf.len() + 1;
+            if let Some((addr, addr_len)) = TargetAddr::decode(&self.buf)? {
+                let header_len = addr_len + 4;
+                if self.buf.len() >= header_len {
+                    if &self.buf[addr_len + 2..header_len] != b"\r\n" {
+                        bail!("Invalid CRLF in Trojan UDP packet")
+                    }
+                    let len =
+                        u16::from_be_bytes([self.buf[addr_len], self.buf[addr_len + 1]]) as usize;
+                    if self.buf.len() >= header_len + len {
+                        self.buf.advance(header_len);
+                        return Ok((addr, self.buf.split_to(len).freeze()));
+                    }
+                    need = header_len + len;
+                }
+            }
+            read_ahead::fill(&mut self.rx, &mut self.buf, need, false).await?;
+        }
+    }
+}
+
 struct TrojanUdpSocket {
-    rx: Mutex<tokio::io::ReadHalf<AnyStream>>,
+    rx: Mutex<UdpPacketReader<tokio::io::ReadHalf<AnyStream>>>,
     tx: Mutex<tokio::io::WriteHalf<AnyStream>>,
 }
 
@@ -296,7 +336,7 @@ impl TrojanUdpSocket {
     fn new(stream: AnyStream) -> Self {
         let (rx, tx) = tokio::io::split(stream);
         Self {
-            rx: Mutex::new(rx),
+            rx: Mutex::new(UdpPacketReader::new(rx)),
             tx: Mutex::new(tx),
         }
     }
@@ -320,24 +360,57 @@ impl AnyPacket for TrojanUdpSocket {
     }
 
     async fn recv_from(&self) -> Result<PacketInfo> {
-        let mut rx = self.rx.lock().await;
-
         // A reply datagram carries the source address of the responding peer.
-        let source = TargetAddr::read_from(&mut *rx).await?;
+        let (source, payload) = self.rx.lock().await.read_packet().await?;
+        Ok((source, TargetAddr::dummy(), payload))
+    }
+}
 
-        let length = rx.read_u16().await?;
-        let mut crlf = [0u8; 2];
-        rx.read_exact(&mut crlf).await?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        if &crlf != b"\r\n" {
-            bail!("Invalid CRLF in Trojan UDP packet")
+    #[tokio::test]
+    async fn udp_reader_handles_split_and_coalesced_packets() {
+        let mut wire = Vec::new();
+        let first = TargetAddr::Domain("example.com".to_string(), 53);
+        let second = TargetAddr::from_str("[2001:db8::1]:443").unwrap();
+        for (addr, payload) in [(&first, &b"hello"[..]), (&second, &[7u8; 3000][..])] {
+            addr.write_to(&mut wire);
+            wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            wire.extend_from_slice(b"\r\n");
+            wire.extend_from_slice(payload);
         }
 
-        let mut payload = vec![0u8; length as usize];
-        rx.read_exact(&mut payload).await?;
+        // Feed the bytes 7 at a time so headers and payloads arrive split up.
+        let (mut client, server) = tokio::io::duplex(7);
+        let writer = tokio::spawn(async move { client.write_all(&wire).await });
+        let mut reader = UdpPacketReader::new(server);
 
-        let dummy_target = TargetAddr::dummy();
+        let (addr, payload) = reader.read_packet().await.unwrap();
+        assert_eq!(addr, first);
+        assert_eq!(&payload[..], b"hello");
+        let (addr, payload) = reader.read_packet().await.unwrap();
+        assert_eq!(addr, second);
+        assert_eq!(&payload[..], &[7u8; 3000][..]);
 
-        Ok((source, dummy_target, Bytes::from(payload)))
+        writer.await.unwrap().unwrap();
+        assert!(
+            reader.read_packet().await.is_err(),
+            "EOF after the last packet"
+        );
+    }
+
+    #[test]
+    fn decode_needs_the_whole_address() {
+        let mut encoded = Vec::new();
+        TargetAddr::Domain("example.com".to_string(), 80).write_to(&mut encoded);
+        for end in 0..encoded.len() {
+            assert!(TargetAddr::decode(&encoded[..end]).unwrap().is_none());
+        }
+        let (addr, used) = TargetAddr::decode(&encoded).unwrap().unwrap();
+        assert_eq!(addr, TargetAddr::Domain("example.com".to_string(), 80));
+        assert_eq!(used, encoded.len());
+        assert!(TargetAddr::decode(&[9]).is_err());
     }
 }

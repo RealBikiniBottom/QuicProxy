@@ -17,6 +17,7 @@ pub mod net_monitor;
 pub mod ntp;
 pub mod os;
 pub mod quic_wrap;
+pub mod read_ahead;
 pub mod shutdown;
 pub mod socket;
 pub mod system;

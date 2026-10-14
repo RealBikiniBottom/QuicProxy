@@ -1,6 +1,7 @@
 use crate::config::{AuthUser, InboundConfig};
 use crate::proxy::TlsConfig;
 use crate::proxy::observe::{UserAccount, credential_hash, get_observer};
+use crate::proxy::outbound::trojan::UdpPacketReader;
 use crate::proxy::outbound::{AnyPacket, AnyStream, PacketInfo};
 use crate::proxy::router::{Router, get_router};
 use crate::proxy::{SourceAddr, TargetAddr, inbound};
@@ -20,7 +21,7 @@ use tokio_rustls::{TlsAcceptor, rustls};
 use tracing::{Instrument, error, field, info, info_span};
 
 struct TrojanInboundPacket {
-    rx: Mutex<tokio::io::ReadHalf<AnyStream>>,
+    rx: Mutex<UdpPacketReader<tokio::io::ReadHalf<AnyStream>>>,
     tx: Mutex<tokio::io::WriteHalf<AnyStream>>,
     client_addr: TargetAddr,
 }
@@ -29,7 +30,7 @@ impl TrojanInboundPacket {
     fn new(stream: AnyStream, client_addr: TargetAddr) -> Self {
         let (rx, tx) = tokio::io::split(stream);
         Self {
-            rx: Mutex::new(rx),
+            rx: Mutex::new(UdpPacketReader::new(rx)),
             tx: Mutex::new(tx),
             client_addr,
         }
@@ -58,22 +59,8 @@ impl AnyPacket for TrojanInboundPacket {
     }
 
     async fn recv_from(&self) -> anyhow::Result<PacketInfo> {
-        let mut rx = self.rx.lock().await;
-
-        let target = TargetAddr::read_from(&mut *rx).await?;
-
-        let length = rx.read_u16().await?;
-        let mut crlf = [0u8; 2];
-        rx.read_exact(&mut crlf).await?;
-
-        if &crlf != b"\r\n" {
-            return Err(anyhow::anyhow!("Invalid CRLF in Trojan UDP packet"));
-        }
-
-        let mut payload = vec![0u8; length as usize];
-        rx.read_exact(&mut payload).await?;
-
-        Ok((self.client_addr.clone(), target, Bytes::from(payload)))
+        let (target, payload) = self.rx.lock().await.read_packet().await?;
+        Ok((self.client_addr.clone(), target, payload))
     }
 }
 

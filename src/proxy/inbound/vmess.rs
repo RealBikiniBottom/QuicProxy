@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::utils::read_ahead;
 use aes_gcm::{Aes128Gcm, KeyInit};
 use anyhow::{Context as _, bail};
 use arc_swap::ArcSwap;
@@ -369,7 +370,10 @@ pub struct VmessServerStream<S> {
     resp_body_iv: Vec<u8>,
 
     read_state: ReadState,
+    /// Bytes read ahead from `stream`; frames are cut from the front.
     read_buf: BytesMut,
+    /// Decrypted payload of the current chunk, handed out by `poll_read`.
+    chunk: BytesMut,
     write_state: WriteState,
     write_buf: BytesMut,
 }
@@ -431,6 +435,7 @@ impl<S> VmessServerStream<S> {
             resp_body_iv,
             read_state: ReadState::WaitingLength,
             read_buf: BytesMut::new(),
+            chunk: BytesMut::new(),
             write_state: WriteState::BuildingData,
             write_buf: BytesMut::new(),
         }
@@ -496,18 +501,17 @@ where
             let this = &mut *self;
             match this.read_state {
                 ReadState::WaitingLength => {
-                    if !ready!(poll_read_exact(
+                    if !ready!(read_ahead::poll_fill(
                         &mut this.stream,
                         cx,
-                        2,
                         &mut this.read_buf,
+                        2,
                         true
                     ))? {
                         this.read_state = ReadState::Closed;
                         return Poll::Ready(Ok(()));
                     }
-                    let len = u16::from_be_bytes(this.read_buf.split().as_ref().try_into().unwrap())
-                        as usize;
+                    let len = this.read_buf.get_u16() as usize;
                     if len > MAX_CHUNK_SIZE {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -517,13 +521,14 @@ where
                     this.read_state = ReadState::WaitingData(len);
                 }
                 ReadState::WaitingData(size) => {
-                    ready!(poll_read_exact(
+                    ready!(read_ahead::poll_fill(
                         &mut this.stream,
                         cx,
-                        size,
                         &mut this.read_buf,
+                        size,
                         false
                     ))?;
+                    let mut chunk = this.read_buf.split_to(size);
                     let overhead = this
                         .read_cipher
                         .as_ref()
@@ -537,20 +542,21 @@ where
                             )));
                         }
                         let cipher = this.read_cipher.as_mut().unwrap();
-                        cipher.decrypt_inplace(&mut this.read_buf).map_err(|e| {
+                        cipher.decrypt_inplace(&mut chunk).map_err(|e| {
                             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                         })?;
                         let data_len = size - overhead;
-                        this.read_buf.truncate(data_len);
+                        chunk.truncate(data_len);
                         this.read_state = ReadState::FlushingData(data_len);
                     } else {
                         this.read_state = ReadState::FlushingData(size);
                     }
+                    this.chunk = chunk;
                 }
                 ReadState::FlushingData(size) => {
                     let to_read = std::cmp::min(buf.remaining(), size);
-                    let payload = this.read_buf.split_to(to_read);
-                    buf.put_slice(&payload);
+                    buf.put_slice(&this.chunk[..to_read]);
+                    this.chunk.advance(to_read);
                     if to_read < size {
                         this.read_state = ReadState::FlushingData(size - to_read);
                     } else {
@@ -683,44 +689,6 @@ where
         let target = stream.dst.clone();
         Ok((self.client_addr.clone(), target, Bytes::from(buf)))
     }
-}
-
-fn poll_read_exact<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    cx: &mut Context<'_>,
-    count: usize,
-    buf: &mut BytesMut,
-    allow_eof: bool,
-) -> Poll<io::Result<bool>> {
-    while buf.len() < count {
-        let filled = buf.len();
-        buf.resize(count, 0);
-        let mut read_buf = ReadBuf::new(&mut buf[filled..]);
-        match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
-            Poll::Ready(Ok(())) => {
-                let read = read_buf.filled().len();
-                buf.truncate(filled + read);
-                if read == 0 {
-                    if allow_eof && filled == 0 {
-                        return Poll::Ready(Ok(false));
-                    }
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "unexpected EOF in VMess frame",
-                    )));
-                }
-            }
-            Poll::Ready(Err(e)) => {
-                buf.truncate(filled);
-                return Poll::Ready(Err(e));
-            }
-            Poll::Pending => {
-                buf.truncate(filled);
-                return Poll::Pending;
-            }
-        }
-    }
-    Poll::Ready(Ok(true))
 }
 
 fn aes_gcm_encrypt(

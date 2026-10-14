@@ -1,7 +1,7 @@
 use anyhow::Context;
 use anyhow::bail;
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -28,6 +28,7 @@ use crate::utils::new_io_other_error;
 use crate::utils::now;
 use crate::utils::now_millis;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
+use crate::utils::read_ahead;
 
 use super::SourceAddr;
 
@@ -195,6 +196,8 @@ impl ShadowUdpReceiver {
         let remote_src = remote_src.clone();
         debug!("accept_uni for udp session: {}", context_id);
         tokio::spawn(async move {
+            // Packets are `u16 length | payload`; read ahead and cut them out without copying.
+            let mut buf = BytesMut::new();
             loop {
                 tokio::select! {
                     _ = closer_clone.wait() => {
@@ -202,14 +205,11 @@ impl ShadowUdpReceiver {
                     }
 
                     res = async {
-                        let mut len_buf = [0u8; 2];
-                        unistream.read_exact(&mut len_buf).await?;
-                        let len = u16::from_be_bytes(len_buf);
-
-                        let mut payload = vec![0u8; len as usize];
-                        unistream.read_exact(&mut payload).await?;
-
-                        Ok::<Bytes, anyhow::Error>(Bytes::from(payload))
+                        read_ahead::fill(&mut unistream, &mut buf, 2, false).await?;
+                        let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                        read_ahead::fill(&mut unistream, &mut buf, 2 + len, false).await?;
+                        buf.advance(2);
+                        Ok::<Bytes, anyhow::Error>(buf.split_to(len).freeze())
                     } => {
                         match res {
                             Ok(data) => {

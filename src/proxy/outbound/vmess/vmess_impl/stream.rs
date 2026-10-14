@@ -3,8 +3,9 @@ use std::io;
 use std::pin::Pin;
 use std::task::Poll;
 
+use crate::utils::read_ahead;
 use aes_gcm::{Aes128Gcm, KeyInit};
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
 use futures::ready;
 
@@ -43,7 +44,10 @@ pub struct VmessStream {
     read_state: ReadState,
     #[allow(dead_code)]
     read_pos: usize,
+    /// Bytes read ahead from `stream`; frames are cut from the front.
     read_buf: BytesMut,
+    /// Decrypted payload of the current chunk, handed out by `poll_read`.
+    chunk: BytesMut,
 
     write_state: WriteState,
     write_buf: BytesMut,
@@ -191,6 +195,7 @@ impl VmessStream {
             read_state: ReadState::AeadWaitingHeaderSize,
             read_pos: 0,
             read_buf: BytesMut::new(),
+            chunk: BytesMut::new(),
 
             write_state: WriteState::BuildingData,
             write_buf: BytesMut::new(),
@@ -294,14 +299,14 @@ impl AsyncRead for VmessStream {
                     let resp_v = this.resp_v;
 
                     if !this.is_aead {
-                        ready!(poll_read_exact(
+                        ready!(read_ahead::poll_fill(
                             &mut this.stream,
                             cx,
-                            4,
                             &mut this.read_buf,
-                            false,
+                            4,
+                            false
                         ))?;
-                        let mut buf = this.read_buf.split().freeze().to_vec();
+                        let mut buf = this.read_buf.split_to(4).to_vec();
                         aes_cfb_decrypt(&resp_body_key, &resp_body_iv, &mut buf)
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                         if buf[0] != resp_v {
@@ -320,12 +325,12 @@ impl AsyncRead for VmessStream {
 
                         this.read_state = ReadState::StreamWaitingLength;
                     } else {
-                        ready!(poll_read_exact(
+                        ready!(read_ahead::poll_fill(
                             &mut this.stream,
                             cx,
-                            18,
                             &mut this.read_buf,
-                            false,
+                            18,
+                            false
                         ))?;
 
                         let aead_response_header_length_encryption_key = &kdf::vmess_kdf_1_one_shot(
@@ -340,7 +345,7 @@ impl AsyncRead for VmessStream {
                         let decrypted_response_header_len = aes_gcm_decrypt(
                             aead_response_header_length_encryption_key,
                             aead_response_header_length_encryption_iv,
-                            this.read_buf.split().as_ref(),
+                            &this.read_buf.split_to(18),
                             None,
                         )
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -361,12 +366,12 @@ impl AsyncRead for VmessStream {
 
                 ReadState::AeadWaitingHeader(header_size) => {
                     let this = &mut *self;
-                    ready!(poll_read_exact(
+                    ready!(read_ahead::poll_fill(
                         &mut this.stream,
                         cx,
-                        header_size + 16,
                         &mut this.read_buf,
-                        false,
+                        header_size + 16,
+                        false
                     ))?;
 
                     let resp_body_key = this.resp_body_key.clone();
@@ -384,7 +389,7 @@ impl AsyncRead for VmessStream {
                     let buf = aes_gcm_decrypt(
                         aead_response_header_payload_encryption_key,
                         aead_response_header_payload_encryption_iv,
-                        this.read_buf.split().as_ref(),
+                        &this.read_buf.split_to(header_size + 16),
                         None,
                     )
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -415,18 +420,17 @@ impl AsyncRead for VmessStream {
 
                 ReadState::StreamWaitingLength => {
                     let this = &mut *self;
-                    if !ready!(poll_read_exact(
+                    if !ready!(read_ahead::poll_fill(
                         &mut this.stream,
                         cx,
-                        2,
                         &mut this.read_buf,
-                        true,
+                        2,
+                        true
                     ))? {
                         this.read_state = ReadState::Closed;
                         return Poll::Ready(Ok(()));
                     }
-                    let len = u16::from_be_bytes(this.read_buf.split().as_ref().try_into().unwrap())
-                        as usize;
+                    let len = this.read_buf.get_u16() as usize;
 
                     if len > MAX_CHUNK_SIZE {
                         return Poll::Ready(Err(io::Error::new(
@@ -440,14 +444,15 @@ impl AsyncRead for VmessStream {
 
                 ReadState::StreamWaitingData(size) => {
                     let this = &mut *self;
-                    ready!(poll_read_exact(
+                    ready!(read_ahead::poll_fill(
                         &mut this.stream,
                         cx,
-                        size,
                         &mut this.read_buf,
-                        false,
+                        size,
+                        false
                     ))?;
 
+                    let mut chunk = this.read_buf.split_to(size);
                     match this.aead_read_cipher {
                         Some(ref mut cipher) => {
                             if size < cipher.security.overhead_len() {
@@ -457,22 +462,23 @@ impl AsyncRead for VmessStream {
                                 )));
                             }
                             cipher
-                                .decrypt_inplace(&mut this.read_buf)
+                                .decrypt_inplace(&mut chunk)
                                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                             let data_len = size - cipher.security.overhead_len();
-                            this.read_buf.truncate(data_len);
+                            chunk.truncate(data_len);
                             this.read_state = ReadState::StreamFlushingData(data_len);
                         }
                         _ => {
                             this.read_state = ReadState::StreamFlushingData(size);
                         }
                     }
+                    this.chunk = chunk;
                 }
 
                 ReadState::StreamFlushingData(size) => {
                     let to_read = std::cmp::min(buf.remaining(), size);
-                    let payload = self.read_buf.split_to(to_read);
-                    buf.put_slice(&payload);
+                    buf.put_slice(&self.chunk[..to_read]);
+                    self.chunk.advance(to_read);
                     if to_read < size {
                         self.read_state = ReadState::StreamFlushingData(size - to_read);
                     } else {
@@ -570,46 +576,6 @@ impl AsyncWrite for VmessStream {
     ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.stream).poll_shutdown(cx)
     }
-}
-
-fn poll_read_exact<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    cx: &mut std::task::Context<'_>,
-    count: usize,
-    buf: &mut BytesMut,
-    allow_eof: bool,
-) -> Poll<io::Result<bool>> {
-    while buf.len() < count {
-        let filled = buf.len();
-        buf.resize(count, 0);
-
-        let mut read_buf = ReadBuf::new(&mut buf[filled..]);
-        match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
-            Poll::Ready(Ok(())) => {
-                let read = read_buf.filled().len();
-                buf.truncate(filled + read);
-                if read == 0 {
-                    if allow_eof && filled == 0 {
-                        return Poll::Ready(Ok(false));
-                    }
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "unexpected EOF in VMess frame",
-                    )));
-                }
-            }
-            Poll::Ready(Err(error)) => {
-                buf.truncate(filled);
-                return Poll::Ready(Err(error));
-            }
-            Poll::Pending => {
-                buf.truncate(filled);
-                return Poll::Pending;
-            }
-        }
-    }
-
-    Poll::Ready(Ok(true))
 }
 
 fn aes_gcm_decrypt(
@@ -772,7 +738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_read_exact_handles_fragmentation_and_clean_eof() {
+    async fn poll_fill_handles_fragmentation_and_clean_eof() {
         let (mut reader, mut writer) = tokio::io::duplex(1);
         let writer_task = tokio::spawn(async move {
             for byte in b"vmess" {
@@ -783,33 +749,36 @@ mod tests {
         });
 
         let mut buf = BytesMut::new();
-        let complete =
-            futures::future::poll_fn(|cx| poll_read_exact(&mut reader, cx, 5, &mut buf, false))
-                .await
-                .unwrap();
+        let complete = futures::future::poll_fn(|cx| {
+            read_ahead::poll_fill(&mut reader, cx, &mut buf, 5, false)
+        })
+        .await
+        .unwrap();
         assert!(complete);
         assert_eq!(&buf[..], b"vmess");
 
         buf.clear();
-        let complete =
-            futures::future::poll_fn(|cx| poll_read_exact(&mut reader, cx, 2, &mut buf, true))
-                .await
-                .unwrap();
+        let complete = futures::future::poll_fn(|cx| {
+            read_ahead::poll_fill(&mut reader, cx, &mut buf, 2, true)
+        })
+        .await
+        .unwrap();
         assert!(!complete, "EOF at a frame boundary should be clean");
         writer_task.await.unwrap();
     }
 
     #[tokio::test]
-    async fn poll_read_exact_rejects_truncated_frames() {
+    async fn poll_fill_rejects_truncated_frames() {
         let (mut reader, mut writer) = tokio::io::duplex(1);
         writer.write_all(&[0x12]).await.unwrap();
         writer.shutdown().await.unwrap();
 
         let mut buf = BytesMut::new();
-        let error =
-            futures::future::poll_fn(|cx| poll_read_exact(&mut reader, cx, 2, &mut buf, true))
-                .await
-                .unwrap_err();
+        let error = futures::future::poll_fn(|cx| {
+            read_ahead::poll_fill(&mut reader, cx, &mut buf, 2, true)
+        })
+        .await
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 

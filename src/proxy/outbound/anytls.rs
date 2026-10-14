@@ -309,10 +309,11 @@ impl Session {
 
     // ── Loops ─────────────────────────────────────────────────────────────
 
-    async fn read_loop(&self, mut tls: impl AsyncRead + Unpin + Send) -> Result<()> {
+    async fn read_loop(&self, tls: impl AsyncRead + Unpin + Send) -> Result<()> {
+        let mut frames = FrameReader::new(tls);
         loop {
             let (cmd, stream_id, data) = match tokio::select! {
-                frame = read_frame(&mut tls) => frame,
+                frame = frames.read_frame() => frame,
                 _ = self.closer.wait() => return Ok(()),
             } {
                 Ok(frame) => frame,

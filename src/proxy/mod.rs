@@ -116,6 +116,56 @@ impl TargetAddr {
         }
     }
 
+    /// Decodes an address in the same layout as [`Self::read_from`] from the front of `buf`.
+    /// Returns the address and how many bytes it took, or `None` if `buf` ends too early.
+    pub fn decode(buf: &[u8]) -> anyhow::Result<Option<(Self, usize)>> {
+        let Some(&atyp) = buf.first() else {
+            return Ok(None);
+        };
+        let port_at = |at: usize| u16::from_be_bytes([buf[at], buf[at + 1]]);
+        match atyp {
+            1 => {
+                if buf.len() < 7 {
+                    return Ok(None);
+                }
+                let ip = Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
+                Ok(Some((
+                    TargetAddr::Ip(SocketAddr::new(ip.into(), port_at(5))),
+                    7,
+                )))
+            }
+            3 => {
+                let Some(&len) = buf.get(1) else {
+                    return Ok(None);
+                };
+                let end = 2 + len as usize + 2;
+                if buf.len() < end {
+                    return Ok(None);
+                }
+                let domain = std::str::from_utf8(&buf[2..end - 2])
+                    .map_err(|e| new_io_other_error(format!("Invalid domain: {}", e)))?;
+                let port = port_at(end - 2);
+                let addr = match domain.parse::<IpAddr>() {
+                    Ok(ip) => TargetAddr::Ip(SocketAddr::new(ip, port)),
+                    Err(_) => TargetAddr::Domain(domain.to_string(), port),
+                };
+                Ok(Some((addr, end)))
+            }
+            4 => {
+                if buf.len() < 19 {
+                    return Ok(None);
+                }
+                let ip: [u8; 16] = buf[1..17].try_into().unwrap();
+                let ip = std::net::Ipv6Addr::from(ip);
+                Ok(Some((
+                    TargetAddr::Ip(SocketAddr::new(ip.into(), port_at(17))),
+                    19,
+                )))
+            }
+            _ => bail!("Invalid ATYP: {}", atyp),
+        }
+    }
+
     pub fn dummy() -> Self {
         TargetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
     }

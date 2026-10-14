@@ -8,7 +8,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, LazyLock, Once};
+use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::time::Duration;
 use tracing::warn;
 
@@ -23,6 +23,9 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const FLUSH_INTERVAL: Duration = Duration::from_secs(500);
 
 static FLUSHER: Once = Once::new();
+/// Held while flushing, so no flush keeps a database alive (and its file locked) after
+/// `shutdown_redb` has removed it.
+static FLUSH_LOCK: Mutex<()> = Mutex::new(());
 
 /// A database plus whether it has non-durable commits that still need an fsync.
 struct SharedDb {
@@ -85,6 +88,11 @@ fn start_flusher() {
 }
 
 fn flush_all() {
+    let _guard = FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    flush_cached();
+}
+
+fn flush_cached() {
     let dbs: Vec<_> = REDB_CACHE
         .iter()
         .map(|entry| entry.value().clone())
@@ -103,8 +111,16 @@ pub struct RedbStore {
 /// Persist pending cache writes and close every database. The last handle to
 /// each database flushes it on drop, which also releases its file lock.
 pub fn shutdown_redb() {
-    flush_all();
+    let _guard = FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    flush_cached();
     REDB_CACHE.clear();
+}
+
+/// Drop the shared handle for `path`, waiting out any flush that still holds it.
+#[cfg(test)]
+fn forget_cached(path: &Path) {
+    let _guard = FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    REDB_CACHE.remove(&resolve_db_path(&path.to_string_lossy()));
 }
 
 impl RedbStore {
@@ -329,7 +345,7 @@ mod tests {
         store.db.flush().unwrap();
         assert!(!store.db.dirty.load(Ordering::Acquire));
 
-        REDB_CACHE.remove(&resolve_db_path(&path.to_string_lossy()));
+        forget_cached(&path);
         drop(store);
         assert_eq!(read_back(&path, "k").as_deref(), Some("v"));
     }
@@ -337,7 +353,7 @@ mod tests {
     /// Simulates a crash: the database is never closed, and only what is on
     /// disk at that moment survives (read from a copy of the file).
     fn crash_and_read(store: RedbStore, path: &Path, key: &str) -> Option<String> {
-        REDB_CACHE.remove(&resolve_db_path(&path.to_string_lossy()));
+        forget_cached(path);
         std::mem::forget(store);
         let copy = path.with_extension("crashed");
         std::fs::copy(path, &copy).unwrap();
@@ -370,7 +386,9 @@ mod tests {
         store.set_entry(TABLE, "b", &"2".to_string()).unwrap();
         store.delete_entry::<String>(TABLE, "a").unwrap();
 
-        flush_all();
+        // Flush only this database: `flush_all` would also flush the databases of tests
+        // running in parallel, including the one that checks unflushed writes are lost.
+        store.db.flush().unwrap();
 
         assert_eq!(crash_and_read(store, &path, "b").as_deref(), Some("2"));
         assert_eq!(read_back(&path.with_extension("crashed"), "a"), None);
