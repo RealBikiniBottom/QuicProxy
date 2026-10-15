@@ -1,6 +1,5 @@
 use anyhow::{Context as _, bail};
 use arc_swap::ArcSwap;
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
@@ -347,14 +346,17 @@ impl QuinnServer {
         let (cert_chain, private_key) = if is_jls {
             // JLS encrypts the handshake with a PSK, so the certificate only
             // satisfies rustls' structure and a self-signed one is fine.
-            generate_self_signed_cert()?
+            crate::utils::tls::self_signed_localhost()?
         } else if let (Some(cp), Some(kp)) = (cert_path, key_path) {
-            (load_certs(cp)?, load_keys(kp)?)
+            (
+                crate::utils::tls::load_certs(cp)?,
+                crate::utils::tls::load_key(kp)?,
+            )
         } else {
             tracing::info!(
                 "No TLS cert configured for QUIC, generating default self-signed certificate"
             );
-            generate_self_signed_cert()?
+            crate::utils::tls::self_signed_localhost()?
         };
 
         let mut crypto = crate::utils::ntp::quic_tls::server_builder()
@@ -459,34 +461,6 @@ impl Drop for QuinnServer {
     }
 }
 
-fn generate_self_signed_cert() -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>
-{
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .map_err(|e| new_io_other_error(format!("Failed to generate cert: {}", e)))?;
-    let cert_der = cert.cert.der().to_vec();
-    let key_der = cert.signing_key.serialize_der();
-    let cert_chain = vec![CertificateDer::from(cert_der)];
-    let private_key = PrivateKeyDer::try_from(key_der)
-        .map_err(|e| new_io_other_error(format!("Invalid private key: {}", e)))?;
-    Ok((cert_chain, private_key))
-}
-
-// Helpers for certs
-fn load_certs(path: &str) -> io::Result<Vec<quinn::rustls::pki_types::CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
-        .map(|result| result.map(|c| c.into_owned()))
-        .collect()
-}
-
-fn load_keys(path: &str) -> io::Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)?;
-    key.ok_or(new_io_other_error("No private key found"))
-}
-
 #[derive(Clone)]
 pub struct QuinnClient {
     endpoint: quinn::Endpoint,
@@ -535,7 +509,7 @@ impl QuinnClient {
             if verify_peer {
                 root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                 if let Some(cert_path) = ca_cert_path {
-                    for cert in load_certs(cert_path)
+                    for cert in crate::utils::tls::load_certs(cert_path)
                         .with_context(|| format!("Failed to load CA cert from {}", cert_path))?
                     {
                         root_store

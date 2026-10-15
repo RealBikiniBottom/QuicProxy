@@ -1,7 +1,5 @@
 use std::{
     collections::HashMap,
-    fs::File,
-    io::BufReader,
     pin::Pin,
     sync::{
         Arc, Mutex as SyncMutex,
@@ -16,7 +14,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use rand::RngExt;
-use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -619,7 +616,7 @@ impl AnytlsClient {
         hasher.update(password.as_bytes());
         let password_hash: [u8; 32] = hasher.finalize().into();
 
-        let tls_client_config = Self::build_tls_client_config(tls)?;
+        let tls_client_config = crate::utils::tls::client_config(tls)?;
 
         let host = address.host();
         let sni = tls.sni.as_deref().unwrap_or(&host);
@@ -641,35 +638,6 @@ impl AnytlsClient {
             session_seq: AtomicU64::new(0),
             padding_scheme: Arc::new(Mutex::new(PaddingScheme::get_default())),
         })
-    }
-
-    fn build_tls_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        if !tls.insecure {
-            let mut root_store = rustls::RootCertStore::empty();
-            if let Some(cert_path) = tls.cert.as_deref() {
-                for cert in load_certs(cert_path)? {
-                    root_store.add(cert).map_err(|e| new_io_other_error(e))?;
-                }
-            } else {
-                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            }
-            let mut config = crate::utils::ntp::tls::client_builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-            crate::proxy::configure_jls_client(&mut config, tls);
-            Ok(config)
-        } else {
-            let mut config = crate::utils::ntp::tls::client_builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth();
-            config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(SkipServerVerification));
-            crate::proxy::configure_jls_client(&mut config, tls);
-            Ok(config)
-        }
     }
 
     async fn get_session(&self) -> Result<Arc<Session>> {
@@ -1138,61 +1106,6 @@ impl Drop for AnytlsProxyStream {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file =
-        File::open(path).with_context(|| format!("Failed to open certificate file: {}", path))?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
-        .map(|r| {
-            r.map(|c| c.into_owned())
-                .context("Failed to parse PEM certificate")
-        })
-        .collect()
-}
-
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ED25519,
-        ]
-    }
-}
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
@@ -1911,7 +1824,7 @@ mod tests {
             .with_no_client_auth();
         config
             .dangerous()
-            .set_certificate_verifier(Arc::new(SkipServerVerification));
+            .set_certificate_verifier(Arc::new(crate::utils::tls::SkipServerVerification));
         Arc::new(config)
     }
 

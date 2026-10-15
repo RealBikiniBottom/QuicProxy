@@ -12,14 +12,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use inbound::AnyInbound;
-use std::fs::File;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{Mutex, mpsc};
-use tokio_rustls::{TlsAcceptor, rustls};
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::PollSender;
 use tracing::{Instrument, debug, error, field, info, info_span, warn};
 
@@ -733,32 +731,7 @@ impl AnytlsInbound {
     async fn listen_tcp(&self) -> Result<()> {
         let listener = super::create_tcp_listener(self.address)?;
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let mut server_config =
-            if let (Some(cert_path), Some(key_path)) = (&self.tls.cert, &self.tls.key) {
-                let certs = load_certs(cert_path)?;
-                let key = load_keys(key_path)?;
-                crate::utils::ntp::tls::server_builder()
-                    .with_no_client_auth()
-                    .with_single_cert(certs, key)
-                    .map_err(|e| new_io_other_error(format!("TLS config error: {}", e)))?
-            } else {
-                info!("Anytls inbound: no TLS cert configured, generating self-signed certificate");
-                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                    .map_err(|e| new_io_other_error(format!("Failed to generate cert: {}", e)))?;
-                let cert_der = cert.cert.der().to_vec();
-                let key_der = cert.signing_key.serialize_der();
-                let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
-                let private_key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
-                    .map_err(|e| new_io_other_error(format!("Invalid private key: {}", e)))?;
-                crate::utils::ntp::tls::server_builder()
-                    .with_no_client_auth()
-                    .with_single_cert(cert_chain, private_key)
-                    .map_err(|e| new_io_other_error(format!("TLS config error: {}", e)))?
-            };
-
-        crate::proxy::configure_jls_server(&mut server_config, &self.tls);
+        let server_config = crate::utils::tls::server_config(&self.tls, "Anytls")?;
 
         let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
@@ -893,21 +866,6 @@ impl AnyInbound for AnytlsInbound {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-fn load_certs(path: &str) -> std::io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
-        .map(|r| r.map(|c| c.into_owned()))
-        .collect()
-}
-
-fn load_keys(path: &str) -> std::io::Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)?;
-    key.ok_or_else(|| new_io_other_error("No private key found"))
-}
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 

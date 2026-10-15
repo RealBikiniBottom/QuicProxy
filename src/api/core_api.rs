@@ -173,7 +173,7 @@ async fn get_observe(State(state): State<CoreApiState>) -> Result<impl IntoRespo
 }
 
 async fn get_mode(State(state): State<CoreApiState>) -> Result<impl IntoResponse, StatusCode> {
-    let mode = state.router.get_mode().await;
+    let mode = state.router.get_mode();
     Ok(Json(serde_json::json!({ "mode": mode })))
 }
 
@@ -186,7 +186,7 @@ async fn put_mode(
     State(state): State<CoreApiState>,
     Json(payload): Json<ModeUpdate>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    state.router.set_mode(payload.mode).await;
+    state.router.set_mode(payload.mode);
     Ok(StatusCode::OK)
 }
 

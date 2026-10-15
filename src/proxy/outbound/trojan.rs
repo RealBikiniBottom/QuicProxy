@@ -1,12 +1,9 @@
 use anyhow::{Context, Result, bail};
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
 use async_trait::async_trait;
-use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha224};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
@@ -16,7 +13,7 @@ use crate::config::{OutboundConfig, TransportConfig};
 use crate::proxy::outbound::pool::PoolOutbound;
 use crate::proxy::outbound::transport::wrap_transport_stream;
 use crate::proxy::{
-    SourceAddr, TargetAddr, TlsConfig, configure_jls_client,
+    SourceAddr, TargetAddr, TlsConfig,
     outbound::{AnyOutbound, AnyPacket, AnyStream, LazyHandshakeStream, PacketInfo},
 };
 use crate::utils::new_io_other_error;
@@ -59,7 +56,7 @@ impl TrojanOutbound {
         let result = hasher.finalize();
         let password_hash = hex::encode(result);
 
-        let tls_connector = TlsConnector::from(Arc::new(Self::build_tls_client_config(&tls)?));
+        let tls_connector = TlsConnector::from(Arc::new(crate::utils::tls::client_config(&tls)?));
         let server_name = Self::tls_server_name(&tls, &address)?;
 
         let trojan = Self {
@@ -114,37 +111,6 @@ impl TrojanOutbound {
             .to_owned())
     }
 
-    fn build_tls_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        if !tls.insecure {
-            let mut root_store = rustls::RootCertStore::empty();
-            if let Some(cert_path) = tls.cert.as_deref() {
-                for cert in load_certs(cert_path)? {
-                    root_store.add(cert).map_err(|e| new_io_other_error(e))?;
-                }
-            } else {
-                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            }
-
-            let mut config = crate::utils::ntp::tls::client_builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-            configure_jls_client(&mut config, tls);
-            Ok(config)
-        } else {
-            let config = crate::utils::ntp::tls::client_builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth();
-            let mut config = config;
-            config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(SkipServerVerification));
-            configure_jls_client(&mut config, tls);
-            Ok(config)
-        }
-    }
-
     async fn connect_tls<S>(&self, stream: S) -> Result<tokio_rustls::client::TlsStream<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -167,64 +133,6 @@ impl TrojanOutbound {
         let stream = self.connect_stream_base().await?;
         let handshake = self.generate_handshake(target, is_udp);
         Ok(Box::new(LazyHandshakeStream::new(stream, handshake)))
-    }
-}
-
-fn load_certs(path: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    let file =
-        File::open(path).with_context(|| format!("Failed to open certificate file: {}", path))?;
-
-    let mut reader = BufReader::new(file);
-
-    rustls_pemfile::certs(&mut reader)
-        .map(|result| {
-            result
-                .map(|c| c.into_owned())
-                .context("Failed to parse PEM certificate")
-        })
-        .collect()
-}
-
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ED25519,
-        ]
     }
 }
 

@@ -1,9 +1,8 @@
-use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo};
-use crate::proxy::{SourceAddr, TargetAddr};
+use crate::proxy::TargetAddr;
+use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream};
 use crate::utils::new_io_other_error;
 use anyhow::Result;
 use async_trait::async_trait;
-use bytes::Bytes;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,25 +21,6 @@ pub struct PoolOutbound {
     tx: mpsc::Sender<AnyStream>,
     rx: Arc<Mutex<mpsc::Receiver<AnyStream>>>,
     is_filling: Arc<AtomicBool>,
-}
-
-struct _PoolUdpOutbound {
-    inner: Arc<dyn AnyPacket>,
-}
-
-#[async_trait]
-impl AnyPacket for _PoolUdpOutbound {
-    async fn send_to(&self, buf: Bytes, from: &SourceAddr, target: &TargetAddr) -> Result<usize> {
-        self.inner.send_to(buf, from, target).await
-    }
-
-    async fn recv_from(&self) -> Result<PacketInfo> {
-        self.inner.recv_from().await
-    }
-
-    fn closer(&self) -> Option<Arc<crate::proxy::SessionCloser>> {
-        self.inner.closer()
-    }
 }
 
 impl PoolOutbound {

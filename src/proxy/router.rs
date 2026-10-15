@@ -10,10 +10,11 @@ use bytes::Bytes;
 use bytesize::ByteSize;
 use dashmap::DashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::select;
-use tokio::sync::{Notify, RwLock, mpsc};
+use tokio::sync::{Notify, mpsc};
 use tokio::time::sleep;
 use tracing::{Instrument, Span, debug, error, field, info, info_span, trace};
 
@@ -59,8 +60,25 @@ pub mod geoip_db;
 pub mod observe;
 pub mod rule;
 
+fn mode_to_u8(mode: RouterMode) -> u8 {
+    match mode {
+        RouterMode::Rule => 0,
+        RouterMode::Proxy => 1,
+        RouterMode::Direct => 2,
+    }
+}
+
+fn mode_from_u8(value: u8) -> RouterMode {
+    match value {
+        0 => RouterMode::Rule,
+        1 => RouterMode::Proxy,
+        _ => RouterMode::Direct,
+    }
+}
+
 pub struct Router {
-    mode: Arc<RwLock<RouterMode>>,
+    /// The current [`RouterMode`], read on every connection, so kept lock-free.
+    mode: AtomicU8,
     default_outbound: Arc<dyn AnyOutbound>,
     rules: Vec<Rule>,
 }
@@ -189,18 +207,18 @@ impl Router {
         }
 
         Ok(Self {
-            mode: Arc::new(RwLock::new(mode)),
+            mode: AtomicU8::new(mode_to_u8(mode)),
             default_outbound: get_default_outbound()?,
             rules,
         })
     }
 
-    pub async fn get_mode(&self) -> RouterMode {
-        *self.mode.read().await
+    pub fn get_mode(&self) -> RouterMode {
+        mode_from_u8(self.mode.load(Ordering::Relaxed))
     }
 
-    pub async fn set_mode(&self, mode: RouterMode) {
-        *self.mode.write().await = mode;
+    pub fn set_mode(&self, mode: RouterMode) {
+        self.mode.store(mode_to_u8(mode), Ordering::Relaxed);
     }
 
     fn wrap_streams_with_observer(
@@ -451,7 +469,7 @@ impl Router {
         payload: Option<&[u8]>,
     ) -> (Arc<dyn AnyOutbound>, TargetAddr, Option<usize>, bool) {
         let start_time = now();
-        let mode = self.get_mode().await;
+        let mode = self.get_mode();
 
         let mut match_result: Option<(
             usize,

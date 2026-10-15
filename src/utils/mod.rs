@@ -7,7 +7,6 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-pub mod count_traffic;
 pub mod elevate;
 pub mod http_outbound;
 pub mod interface;
@@ -23,6 +22,7 @@ pub mod socket;
 pub mod system;
 pub mod system_proxy;
 pub mod time;
+pub mod tls;
 
 pub fn format_duration(duration: Duration) -> String {
     return format!("{:.2?}", duration);
