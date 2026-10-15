@@ -191,6 +191,7 @@ impl NtpClient {
     }
 
     async fn run(self) {
+        let mut retry_delay = None;
         loop {
             let wait = match self.query_offset().await {
                 Ok(offset_nanos) => {
@@ -201,11 +202,17 @@ impl NtpClient {
                         self.server,
                         offset_nanos as f64 / 1_000_000.0
                     );
+                    retry_delay = None;
                     self.interval
                 }
                 Err(e) => {
-                    warn!("NTP sync with {} failed: {:#}", self.server, e);
-                    RETRY_DELAY.min(self.interval)
+                    let delay = next_retry_delay(retry_delay, self.interval);
+                    retry_delay = Some(delay);
+                    warn!(
+                        "NTP sync with {} failed, retrying in {:?}: {:#}",
+                        self.server, delay, e
+                    );
+                    delay
                 }
             };
             tokio::time::sleep(wait).await;
@@ -242,6 +249,11 @@ impl NtpClient {
 
         result
     }
+}
+
+fn next_retry_delay(prev: Option<Duration>, interval: Duration) -> Duration {
+    prev.map_or(RETRY_DELAY, |prev| prev.saturating_mul(2))
+        .min(interval)
 }
 
 fn build_request(transmit: SystemTime) -> [u8; NTP_PACKET_LEN] {
@@ -324,6 +336,36 @@ fn from_ntp_timestamp(timestamp: u64) -> i128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_delay_starts_at_retry_delay() {
+        assert_eq!(next_retry_delay(None, DEFAULT_INTERVAL), RETRY_DELAY);
+    }
+
+    #[test]
+    fn retry_delay_doubles() {
+        let second = next_retry_delay(Some(RETRY_DELAY), DEFAULT_INTERVAL);
+        assert_eq!(second, Duration::from_secs(60));
+        let third = next_retry_delay(Some(second), DEFAULT_INTERVAL);
+        assert_eq!(third, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn retry_delay_is_capped_at_interval() {
+        let interval = Duration::from_secs(100);
+        assert_eq!(
+            next_retry_delay(Some(Duration::from_secs(60)), interval),
+            interval
+        );
+        assert_eq!(next_retry_delay(Some(interval), interval), interval);
+        assert_eq!(next_retry_delay(Some(Duration::MAX), interval), interval);
+    }
+
+    #[test]
+    fn retry_delay_uses_interval_when_shorter_than_retry_delay() {
+        let interval = Duration::from_secs(10);
+        assert_eq!(next_retry_delay(None, interval), interval);
+    }
 
     #[test]
     fn now_timestamp_follows_ntp_clock() {
