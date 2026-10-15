@@ -1,4 +1,4 @@
-use crate::cache::{Cache, CacheWithExpire};
+use crate::cache::Cache;
 use crate::config::{Config, DnsServerConfig};
 use crate::proxy::observe::get_observer;
 use crate::proxy::outbound::{AnyOutbound, get_default_outbound, get_outbound_by_tag};
@@ -21,12 +21,15 @@ use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
+mod cache;
 mod doh;
+pub use cache::DnsCache;
+use cache::Flight;
 use doh::DohClient;
 
 static DNS_MAP: LazyLock<DashMap<String, Arc<dyn AnyDNS>>> = LazyLock::new(DashMap::new);
 static BLOCK_DDR: AtomicBool = AtomicBool::new(false);
-pub type DnsByteCache = Option<CacheWithExpire<Vec<u8>>>;
+pub type DnsByteCache = Option<DnsCache>;
 
 pub fn init_dns(cfg: &Config) -> Result<()> {
     ensure!(!cfg.dns.servers.is_empty(), "dns servers can not be empty");
@@ -382,6 +385,40 @@ fn cap_record_ttls(packet: &mut Packet<'_>, remaining_ttl: u32) {
     }
 }
 
+/// The cached response for `cache_key`, re-addressed to query `query_id` and with its TTLs
+/// capped to the time left.
+fn cached_response(
+    cache: &DnsCache,
+    cache_key: &str,
+    query_id: u16,
+    domain: &str,
+    qtype: QTYPE,
+) -> Result<Option<Packet<'static>>> {
+    let Some((cached, expiry)) = cache.get(cache_key) else {
+        return Ok(None);
+    };
+    let remaining = Duration::from_secs(expiry.saturating_sub(now_timestamp()));
+    info!(
+        "hit dns byte cache({}) for {}({:?})",
+        format_duration(remaining),
+        domain,
+        qtype,
+    );
+    let mut response = response_with_id(&cached, query_id)?;
+    cap_record_ttls(
+        &mut response,
+        remaining.as_secs().min(u32::MAX as u64) as u32,
+    );
+    Ok(Some(response))
+}
+
+/// Parses a stored or shared response and gives it the id of the query it answers.
+fn response_with_id(response: &[u8], query_id: u16) -> Result<Packet<'static>> {
+    let mut response = parse_owned_packet(response, "cached response")?;
+    response.set_id(query_id);
+    Ok(response)
+}
+
 #[async_trait::async_trait]
 pub trait AnyDNS: Send + Sync + 'static {
     fn tag(&self) -> &str;
@@ -536,42 +573,92 @@ pub trait AnyDNS: Send + Sync + 'static {
 
         let cache_key = format!("{}:{}:{:?}", outbound.tag(), domain, qtype);
 
-        if let Some(byte_cache) = self.byte_cache() {
-            if let Ok(Some((cached_bytes, remaining_ttl))) = byte_cache.get(&cache_key) {
-                let remaining = Duration::from_secs(remaining_ttl.saturating_sub(now_timestamp()));
-                info!(
-                    "hit dns byte cache({}) for {}({:?})",
-                    format_duration(remaining),
-                    domain,
-                    qtype,
-                );
-                let mut response = cached_bytes;
-                let query_id = packet.id();
-                response[0] = (query_id >> 8) as u8;
-                response[1] = query_id as u8;
-                let mut response = parse_owned_packet(&response, "cached response")?;
-                cap_record_ttls(
-                    &mut response,
-                    remaining.as_secs().min(u32::MAX as u64) as u32,
-                );
-                return Ok(response);
-            }
+        let Some(byte_cache) = self.byte_cache() else {
+            return self
+                .exchange_and_store(packet, outbound, &domain, qtype, &cache_key)
+                .await;
+        };
+
+        if let Some(response) =
+            cached_response(byte_cache, &cache_key, packet.id(), &domain, qtype)?
+        {
+            return Ok(response);
         }
 
+        // Concurrent misses for the same question wait for one upstream query.
+        let leader = match byte_cache.join(&cache_key) {
+            Flight::Leader(leader) => leader,
+            Flight::Follower(rx) => {
+                match cache::follow(rx).await {
+                    Some(Ok(response)) => {
+                        debug!("shared in-flight dns query for {}({:?})", domain, qtype);
+                        return response_with_id(&response, packet.id());
+                    }
+                    Some(Err(e)) => bail!("{e}"),
+                    // The leader gave up without a result: it found the response cached
+                    // after all, or its query was cancelled.
+                    None => {
+                        if let Some(response) =
+                            cached_response(byte_cache, &cache_key, packet.id(), &domain, qtype)?
+                        {
+                            return Ok(response);
+                        }
+                        return self
+                            .exchange_and_store(packet, outbound, &domain, qtype, &cache_key)
+                            .await;
+                    }
+                }
+            }
+        };
+        // Another query may have filled the cache between our miss and taking the lead.
+        // Dropping `leader` sends any followers back to the cache.
+        if let Some(response) =
+            cached_response(byte_cache, &cache_key, packet.id(), &domain, qtype)?
+        {
+            return Ok(response);
+        }
+
+        let result = self
+            .exchange_and_store(packet, outbound, &domain, qtype, &cache_key)
+            .await;
+        if leader.has_followers() {
+            let outcome = match &result {
+                Ok(response) => response
+                    .build_bytes_vec()
+                    .map(Arc::from)
+                    .map_err(|e| format!("Failed to build DNS response: {e}").into()),
+                Err(e) => Err(format!("{e:#}").into()),
+            };
+            leader.finish(outcome);
+        }
+        result
+    }
+
+    /// Queries upstream, then applies the TTL limits and stores the response.
+    async fn exchange_and_store(
+        &self,
+        packet: &Packet<'_>,
+        outbound: Arc<dyn AnyOutbound>,
+        domain: &str,
+        qtype: QTYPE,
+        cache_key: &str,
+    ) -> Result<Packet<'static>> {
         let mut resp_packet = self.exchange_without_cache(packet, outbound).await?;
 
         let min_ttl = self.min_ttl();
         let max_ttl = self.max_ttl();
 
         let min_effective_ttl = apply_ttl_to_response(&mut resp_packet, min_ttl, max_ttl);
-        persist_realip_domains(&resp_packet, &domain);
+        persist_realip_domains(&resp_packet, domain);
 
         if let Some(cache_ttl) = min_effective_ttl.filter(|ttl| *ttl > 0) {
             if let Some(byte_cache) = self.byte_cache() {
                 let response_bytes = resp_packet
                     .build_bytes_vec()
                     .map_err(|e| anyhow!("Failed to build DNS response for cache: {e}"))?;
-                let _ = byte_cache.set(&cache_key, &response_bytes, cache_ttl as u64);
+                if let Err(e) = byte_cache.set(cache_key, &response_bytes, cache_ttl as u64) {
+                    debug!("failed to persist dns response for {domain}: {e:#}");
+                }
                 info!(
                     "cached dns response for {}({:?}), ttl: {}s",
                     domain, qtype, cache_ttl
@@ -663,7 +750,7 @@ impl UdpDns {
 
         let byte_cache = match cfg.cache.as_ref() {
             Some(c) => Some(
-                CacheWithExpire::new_with_tag(c, format!("{}_bytes", tag))
+                DnsCache::new_with_tag(c, &tag)
                     .map_err(|e| anyhow!("dns '{}' failed to init byte cache: {:?}", tag, e))?,
             ),
             None => None,
@@ -781,7 +868,7 @@ impl HttpsDns {
 
         let byte_cache = match cfg.cache.as_ref() {
             Some(c) => Some(
-                CacheWithExpire::new_with_tag(c, format!("{}_bytes", tag))
+                DnsCache::new_with_tag(c, &tag)
                     .map_err(|e| anyhow!("dns '{}' failed to init byte cache: {:?}", tag, e))?,
             ),
             None => None,

@@ -178,6 +178,46 @@ impl RedbStore {
         self.db.commit_cache_write(write_txn)
     }
 
+    /// Stores `value` as is, for callers with their own binary encoding.
+    pub fn set_raw(&self, table_name: &str, key: &str, value: &[u8]) -> Result<()> {
+        let write_txn = self.db.begin_cache_write()?;
+        {
+            let def = TableDefinition::<&str, &[u8]>::new(table_name);
+            let mut table = write_txn.open_table(def)?;
+            table.insert(key, value)?;
+        }
+        self.db.commit_cache_write(write_txn)
+    }
+
+    pub fn get_raw(&self, table_name: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let read_txn = self.db.db.begin_read()?;
+        let def = TableDefinition::<&str, &[u8]>::new(table_name);
+        let table = match read_txn.open_table(def) {
+            Ok(t) => t,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(table.get(key)?.map(|guard| guard.value().to_vec()))
+    }
+
+    pub fn delete_raw(&self, table_name: &str, key: &str) -> Result<()> {
+        let write_txn = self.db.begin_cache_write()?;
+        {
+            let def = TableDefinition::<&str, &[u8]>::new(table_name);
+            let mut table = write_txn.open_table(def)?;
+            table.remove(key)?;
+        }
+        self.db.commit_cache_write(write_txn)
+    }
+
+    /// Removes a whole table, e.g. one left behind by an older storage format.
+    pub fn delete_table(&self, table_name: &str) -> Result<bool> {
+        let write_txn = self.db.begin_cache_write()?;
+        let existed = write_txn.delete_table(TableDefinition::<&str, &[u8]>::new(table_name))?;
+        self.db.commit_cache_write(write_txn)?;
+        Ok(existed)
+    }
+
     pub fn get_entry<T: DeserializeOwned>(&self, table_name: &str, key: &str) -> Result<Option<T>> {
         let read_txn = self.db.db.begin_read()?;
         let def = TableDefinition::<&str, &[u8]>::new(table_name);

@@ -103,6 +103,56 @@ where
     }
 }
 
+/// A cache table whose values are stored as raw bytes, without the JSON encoding of
+/// [`Cache`]. For byte blobs, where JSON would write every byte as a decimal number.
+pub struct RawCache {
+    db: RedbStore,
+    table_name: Box<str>,
+}
+
+impl RawCache {
+    pub fn new(path: String, table_name: String, memory_size_mb: usize) -> Result<Self> {
+        Ok(Self {
+            db: RedbStore::with_cache_size(path, memory_size_mb)?,
+            table_name: table_name.into_boxed_str(),
+        })
+    }
+
+    pub fn new_with_tag(tag: &str, table_name: String) -> Result<Self> {
+        let (path, memory_size_mb) = cache_location(tag)?;
+        Self::new(path, table_name, memory_size_mb)
+    }
+
+    pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.db.get_raw(&self.table_name, key)
+    }
+
+    pub fn set(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.db.set_raw(&self.table_name, key, value)
+    }
+
+    pub fn delete(&self, key: &str) -> Result<()> {
+        self.db.delete_raw(&self.table_name, key)
+    }
+
+    /// Drops another table in the same database, e.g. one in an older format.
+    pub fn delete_table(&self, table_name: &str) -> Result<bool> {
+        self.db.delete_table(table_name)
+    }
+}
+
+/// The database path and page cache size configured for cache `tag`.
+fn cache_location(tag: &str) -> Result<(String, usize)> {
+    let config = CACHE_MAP
+        .get(tag)
+        .map(|item| item.value().clone())
+        .ok_or_else(|| anyhow::anyhow!("can not find cache config for tag: {tag}"))?;
+    let path = config
+        .path
+        .ok_or_else(|| anyhow::anyhow!("cache '{tag}' must configure `path`"))?;
+    Ok((path, config.memory_size_mb))
+}
+
 pub struct Cache<T> {
     db: RedbStore,
     table_name_for_disk_db: Box<str>,
@@ -122,15 +172,8 @@ where
     }
 
     pub fn new_with_tag(tag: &str, table_name: String) -> Result<Self> {
-        let config = CACHE_MAP
-            .get(tag)
-            .map(|item| item.value().clone())
-            .ok_or_else(|| anyhow::anyhow!("can not find cache config for tag: {tag}"))?;
-        let path = config
-            .path
-            .ok_or_else(|| anyhow::anyhow!("cache '{tag}' must configure `path`"))?;
-
-        Self::new(path, table_name, config.memory_size_mb)
+        let (path, memory_size_mb) = cache_location(tag)?;
+        Self::new(path, table_name, memory_size_mb)
     }
 
     pub fn get(&self, key: &str) -> Result<Option<T>> {
@@ -153,7 +196,8 @@ where
     where
         F: Fn(&mut T, T),
     {
-        self.db.merge_entries(&self.table_name_for_disk_db, items, merge)
+        self.db
+            .merge_entries(&self.table_name_for_disk_db, items, merge)
     }
 
     pub fn drain(&self) -> Result<Vec<(String, T)>> {

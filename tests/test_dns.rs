@@ -824,3 +824,103 @@ async fn test_fakeipdns_anydns_reverse_trait() {
     .await
     .expect("test timed out");
 }
+
+// ========================
+// DNS response cache
+// ========================
+
+/// A UDP DNS server that answers every A query with 1.2.3.4 after a short delay and
+/// counts the queries it receives.
+async fn spawn_counting_dns_server() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use simple_dns::rdata::{A, RData};
+    use simple_dns::{CLASS, Packet, ResourceRecord};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = socket.local_addr().unwrap();
+    let queries = Arc::new(AtomicUsize::new(0));
+    let counter = queries.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let query = Packet::parse(&buf[..n]).unwrap().into_reply();
+            let socket = socket.clone();
+            let mut reply = query.clone();
+            let name = reply.questions[0].qname.clone();
+            reply.answers.push(ResourceRecord::new(
+                name,
+                CLASS::IN,
+                300,
+                RData::A(A {
+                    address: u32::from(Ipv4Addr::new(1, 2, 3, 4)),
+                }),
+            ));
+            let bytes = reply.build_bytes_vec().unwrap();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ = socket.send_to(&bytes, peer).await;
+            });
+        }
+    });
+    (addr, queries)
+}
+
+#[tokio::test]
+async fn test_dns_cache_shares_concurrent_misses_and_serves_hits() {
+    use quicproxy::proxy::TargetAddr;
+    use simple_dns::{QTYPE, TYPE};
+    use std::sync::atomic::Ordering;
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_tag = "dns_response_cache";
+        setup_cache_for_tag(&temp_dir, cache_tag);
+        let (server, queries) = spawn_counting_dns_server().await;
+
+        let outbound_config: OutboundConfig =
+            serde_json::from_value(serde_json::json!({ "type": "direct" })).unwrap();
+        let outbound = DirectOutbound::new("test_direct".to_string(), &outbound_config).unwrap();
+        let dns = UdpDns {
+            tag: "cached_udp".to_string(),
+            address: TargetAddr::Ip(server),
+            min_ttl: None,
+            max_ttl: None,
+            outbound: outbound.clone(),
+            byte_cache: Some(DnsCache::new_with_tag(cache_tag, "cached_udp").unwrap()),
+            reject_ipv6: false,
+        };
+
+        let a = QTYPE::TYPE(TYPE::A);
+        let lookups = (0..8).map(|_| dns.lookup_with_type("example.com", a, &outbound));
+        for ips in futures::future::join_all(lookups).await {
+            assert_eq!(ips.unwrap(), vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+        }
+        assert_eq!(
+            queries.load(Ordering::SeqCst),
+            1,
+            "concurrent misses share one query"
+        );
+
+        let ips = dns
+            .lookup_with_type("example.com", a, &outbound)
+            .await
+            .unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+        assert_eq!(queries.load(Ordering::SeqCst), 1, "served from cache");
+
+        dns.lookup_with_type("other.example", a, &outbound)
+            .await
+            .unwrap();
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    })
+    .await
+    .expect("test timed out");
+}
