@@ -151,7 +151,21 @@ impl InterfaceManager {
         });
     }
 
+    /// Entry point for platforms whose OS reports default-network changes
+    /// itself (iOS/Android). Always broadcasts: switching between two Wi-Fi
+    /// networks can keep the interface index while every old socket dies.
+    pub fn notify_network_changed() {
+        Self::refresh_iface();
+        Self::notify_change();
+    }
+
     pub fn update_iface() {
+        if Self::refresh_iface() {
+            Self::notify_change();
+        }
+    }
+
+    fn refresh_iface() -> bool {
         if let Some(iface) = Self::select_iface() {
             let mut writer = DEFAULT_INTERFACE.write().unwrap_or_else(|e| {
                 tracing::error!("DEFAULT_INTERFACE RwLock poisoned: {:?}", e);
@@ -165,19 +179,19 @@ impl InterfaceManager {
 
             if changed {
                 info!("Selected iface: {}", iface.display_name(),);
-                *writer = Some(iface.clone());
-                Self::notify_change();
             }
+            *writer = Some(iface);
+            changed
         } else {
             let mut writer = DEFAULT_INTERFACE.write().unwrap_or_else(|e| {
                 tracing::error!("DEFAULT_INTERFACE RwLock poisoned: {:?}", e);
                 e.into_inner()
             });
-            if writer.is_some() {
+            let lost = writer.take().is_some();
+            if lost {
                 error!("Selected iface lost.");
-                *writer = None;
-                Self::notify_change();
             }
+            lost
         }
     }
 
@@ -243,4 +257,26 @@ pub fn resolve_iface(name: &str, addr: Option<Ipv4Addr>) -> anyhow::Result<Arc<n
     }
 
     bail!("TUN interface not found by name={} or ipv4={}", name, a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_network_changed_broadcasts_even_if_iface_is_unchanged() {
+        let tx = NETWORK_CHANGE_TX
+            .write()
+            .unwrap()
+            .get_or_insert_with(|| broadcast::channel(8).0)
+            .clone();
+        let mut rx = tx.subscribe();
+
+        InterfaceManager::notify_network_changed();
+        InterfaceManager::notify_network_changed();
+
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+    }
 }

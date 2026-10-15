@@ -17,7 +17,8 @@ use rand::RngExt;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
-    sync::{Mutex, mpsc::error::TryRecvError},
+    sync::{Mutex, broadcast::error::RecvError, mpsc::error::TryRecvError},
+    task::JoinHandle,
 };
 use tokio_rustls::{TlsConnector, rustls};
 use tokio_util::sync::PollSender;
@@ -30,7 +31,7 @@ use crate::{
         anytls_proto::*,
         outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo, select_outbound_interface},
     },
-    utils::{new_io_other_error, new_io_timeout_error},
+    utils::{interface::InterfaceManager, new_io_other_error, new_io_timeout_error},
 };
 
 // ─── Protocol Constants ───────────────────────────────────────────────────────
@@ -596,7 +597,7 @@ pub struct AnytlsClient {
     dns_server_name: Option<String>,
     disable_mux: bool,
 
-    current_session: Mutex<Option<Arc<Session>>>,
+    current_session: Arc<Mutex<Option<Arc<Session>>>>,
     create_session_lock: Mutex<()>,
     session_seq: AtomicU64,
     padding_scheme: Arc<Mutex<PaddingScheme>>,
@@ -633,7 +634,7 @@ impl AnytlsClient {
             bind_interface,
             dns_server_name,
             disable_mux,
-            current_session: Mutex::new(None),
+            current_session: Arc::new(Mutex::new(None)),
             create_session_lock: Mutex::new(()),
             session_seq: AtomicU64::new(0),
             padding_scheme: Arc::new(Mutex::new(PaddingScheme::get_default())),
@@ -814,6 +815,7 @@ impl AnyPacket for AnytlsUdpSocket {
 pub struct AnytlsOutbound {
     tag: String,
     client: AnytlsClient,
+    iface_reset_task: Option<JoinHandle<()>>,
     connect_timeout: Duration,
     dns_server_name: Option<String>,
     bind_interface: Option<String>,
@@ -841,13 +843,43 @@ impl AnytlsOutbound {
             cfg.disable_mux,
         )?;
 
+        let current_session = client.current_session.clone();
+        let iface_reset_task = InterfaceManager::subscribe().map(|mut rx| {
+            let tag = tag.clone();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(()) => {
+                            if let Some(session) = current_session.lock().await.take() {
+                                info!("[{}] reset anytls session because iface changed", tag);
+                                session.finish();
+                            }
+                        }
+                        Err(RecvError::Lagged(n)) => {
+                            debug!("[{}] iface change watcher lagged by {} events", tag, n);
+                        }
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+            })
+        });
+
         Ok(Arc::new(Self {
             tag,
             client,
+            iface_reset_task,
             connect_timeout,
             dns_server_name: cfg.dns.clone(),
             bind_interface: cfg.bind_interface.clone(),
         }))
+    }
+}
+
+impl Drop for AnytlsOutbound {
+    fn drop(&mut self) {
+        if let Some(handle) = self.iface_reset_task.take() {
+            handle.abort();
+        }
     }
 }
 

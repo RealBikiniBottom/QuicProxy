@@ -47,10 +47,17 @@ const SQ_CONN_STATS_REQUEST: [u8; 10] = [0xFF, 0, 0, 0, 0, 0, 0, 0, 1, 0x00];
 
 const CONN_UNHEALTHY_CLOSE_CODE: u32 = 1;
 const CONN_UNHEALTHY_REASON: &[u8] = b"connection unhealthy";
+const NETWORK_CHANGED_REASON: &[u8] = b"network changed";
 
 /// Serialized `TargetAddr::dummy()`, sent as the placeholder target in the UDP
 /// session handshake (cmd 0x03/0x04).
 static DUMMY_TARGET_BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| TargetAddr::dummy().to_bytes());
+
+type CachedClient = (
+    Arc<quinn::Connection>,
+    Arc<QuinnClient>,
+    Arc<PerConnectionState>,
+);
 
 pub struct ShadowQuicOutbound {
     tag: String,
@@ -74,17 +81,9 @@ pub struct ShadowQuicOutbound {
     zero_rtt: bool,
     enable_jls: bool,
 
-    cached_client: Arc<
-        Mutex<
-            Option<(
-                Arc<quinn::Connection>,
-                Arc<QuinnClient>,
-                Arc<PerConnectionState>,
-            )>,
-        >,
-    >,
+    cached_client: Arc<Mutex<Option<CachedClient>>>,
 
-    /// Background task clearing `cached_client` whenever the network
+    /// Background task closing and clearing `cached_client` whenever the network
     /// interface changes. Aborted on drop so it cannot keep the cached QUIC
     /// connection (and its endpoint/socket) alive after this outbound goes
     /// away.
@@ -136,7 +135,7 @@ impl ShadowQuicOutbound {
         let zero_rtt = tls.zero_rtt;
         let enable_jls = tls.enable_jls;
 
-        let cached_client = Arc::new(Mutex::new(None));
+        let cached_client: Arc<Mutex<Option<CachedClient>>> = Arc::new(Mutex::new(None));
         let iface_reset_task = InterfaceManager::subscribe().map(|mut rx| {
             let cache = cached_client.clone();
             let tag = tag.clone();
@@ -145,8 +144,12 @@ impl ShadowQuicOutbound {
                     match rx.recv().await {
                         Ok(()) => {
                             let mut lock = cache.lock().await;
-                            if lock.take().is_some() {
+                            if let Some((conn, _, _)) = lock.take() {
                                 info!("[{}] reset shadowquic outbound because iface changed", tag);
+                                conn.close(
+                                    CONN_UNHEALTHY_CLOSE_CODE.into(),
+                                    NETWORK_CHANGED_REASON,
+                                );
                             }
                         }
                         // Lagged means we missed change events, not that the

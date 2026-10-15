@@ -35,6 +35,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinSet;
 use tracing::debug;
@@ -193,6 +194,41 @@ pub fn report_outbound_unhealthy(outbound: &Arc<dyn AnyOutbound>) {
     });
 }
 
+const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_secs(3);
+
+/// Waits for a network change, then until no further change arrives for
+/// `quiet`, so a burst of events counts once. Returns false once the channel
+/// is closed with nothing pending.
+async fn next_settled_change(rx: &mut broadcast::Receiver<()>, quiet: Duration) -> bool {
+    match rx.recv().await {
+        Ok(()) | Err(RecvError::Lagged(_)) => {}
+        Err(RecvError::Closed) => return false,
+    }
+    loop {
+        match tokio::time::timeout(quiet, rx.recv()).await {
+            Ok(Ok(())) | Ok(Err(RecvError::Lagged(_))) => {}
+            Ok(Err(RecvError::Closed)) | Err(_) => return true,
+        }
+    }
+}
+
+async fn retest_on_network_change(
+    mut rx: broadcast::Receiver<()>,
+    selectors: Vec<Arc<dyn AnyOutbound>>,
+) {
+    while next_settled_change(&mut rx, NETWORK_CHANGE_DEBOUNCE).await {
+        info!(
+            "network changed, re-testing {} selector(s)",
+            selectors.len()
+        );
+        for outbound in &selectors {
+            if let Some(selector) = outbound.as_selector() {
+                selector.check_all().await;
+            }
+        }
+    }
+}
+
 /// 在后台执行所有 selector 的首次测速，再进入周期测速，不阻塞应用启动。
 pub fn start_outbound_tests() {
     let selectors: Vec<_> = OUTBOUNDS_MAP
@@ -201,6 +237,12 @@ pub fn start_outbound_tests() {
         .filter(|entry| entry.value().as_selector().is_some())
         .map(|entry| entry.value().clone())
         .collect();
+
+    if !selectors.is_empty()
+        && let Some(rx) = InterfaceManager::subscribe()
+    {
+        shutdown::spawn(retest_on_network_change(rx, selectors.clone()));
+    }
 
     shutdown::spawn(async move {
         let mut initial_tests = JoinSet::new();
@@ -614,6 +656,43 @@ impl AnyPacket for UdpHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn burst_of_network_changes_settles_once() {
+        let (tx, mut rx) = broadcast::channel(8);
+        tx.send(()).unwrap();
+        tokio::spawn({
+            let tx = tx.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                tx.send(()).unwrap();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                tx.send(()).unwrap();
+            }
+        });
+
+        let start = tokio::time::Instant::now();
+        assert!(next_settled_change(&mut rx, NETWORK_CHANGE_DEBOUNCE).await);
+        assert_eq!(start.elapsed(), Duration::from_secs(6));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn separate_network_changes_settle_separately() {
+        let (tx, mut rx) = broadcast::channel(8);
+        tx.send(()).unwrap();
+        assert!(next_settled_change(&mut rx, NETWORK_CHANGE_DEBOUNCE).await);
+
+        tx.send(()).unwrap();
+        assert!(next_settled_change(&mut rx, NETWORK_CHANGE_DEBOUNCE).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_channel_stops_waiting() {
+        let (tx, mut rx) = broadcast::channel::<()>(8);
+        drop(tx);
+        assert!(!next_settled_change(&mut rx, NETWORK_CHANGE_DEBOUNCE).await);
+    }
 
     #[test]
     fn get_outbound_by_tag_returns_error_for_unknown_tag() {
