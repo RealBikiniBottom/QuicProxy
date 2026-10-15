@@ -347,23 +347,13 @@ mod connection_reuse_test {
     }
 
     #[tokio::test]
-    async fn test_shadowquic_stream_survives_idle_timeout() {
+    async fn test_shadowquic_reconnects_after_idle_timeout() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut ctx = TestContext::new().await;
-
-        let mut server_cfg = server_config("user", "testpassword");
-        server_cfg["inbounds"]["sq_in"]["idle_timeout"] = serde_json::json!(3);
-
-        let proxy_b_idx = ctx.start_proxy(server_cfg, "sq_in").await;
-        let proxy_b_port = ctx.proxies[proxy_b_idx].port;
-
-        let mut client_cfg = client_config("user", "testpassword", proxy_b_port, None);
-        client_cfg["outbounds"]["servers"]["sq_out"]["idle_timeout"] = serde_json::json!(3);
-        ctx.start_proxy(client_cfg, "socks_in").await;
-
-        let proxy_addr = ctx.last_proxy().addr;
-        let test_fut = async {
+        async fn socks5_connect(
+            proxy_addr: std::net::SocketAddr,
+            target: std::net::SocketAddr,
+        ) -> tokio::net::TcpStream {
             let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
 
             stream.write_all(&[5, 1, 0]).await.unwrap();
@@ -372,12 +362,12 @@ mod connection_reuse_test {
             assert_eq!(method, [5, 0]);
 
             let mut req = vec![5, 1, 0, 1];
-            let ip_octets = match ctx.mock_server_tcp_addr.ip() {
+            let ip_octets = match target.ip() {
                 std::net::IpAddr::V4(ip) => ip.octets(),
                 _ => panic!("IPv6 not supported in this test"),
             };
             req.extend_from_slice(&ip_octets);
-            req.extend_from_slice(&ctx.mock_server_tcp_addr.port().to_be_bytes());
+            req.extend_from_slice(&target.port().to_be_bytes());
             stream.write_all(&req).await.unwrap();
 
             let mut resp_head = [0u8; 4];
@@ -403,21 +393,44 @@ mod connection_reuse_test {
                 other => panic!("Unexpected address type: {}", other),
             }
 
-            stream.write_all(b"ping-1").await.unwrap();
+            stream
+        }
+
+        async fn echo(stream: &mut tokio::net::TcpStream, payload: &[u8]) {
+            stream.write_all(payload).await.unwrap();
             let mut buf = [0u8; 128];
             let n = stream.read(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], b"ping-1");
+            assert_eq!(&buf[..n], payload);
+        }
+
+        let mut ctx = TestContext::new().await;
+
+        let mut server_cfg = server_config("user", "testpassword");
+        server_cfg["inbounds"]["sq_in"]["idle_timeout"] = serde_json::json!(3);
+
+        let proxy_b_idx = ctx.start_proxy(server_cfg, "sq_in").await;
+        let proxy_b_port = ctx.proxies[proxy_b_idx].port;
+
+        let mut client_cfg = client_config("user", "testpassword", proxy_b_port, None);
+        client_cfg["outbounds"]["servers"]["sq_out"]["idle_timeout"] = serde_json::json!(3);
+        ctx.start_proxy(client_cfg, "socks_in").await;
+
+        let proxy_addr = ctx.last_proxy().addr;
+        let target = ctx.mock_server_tcp_addr;
+        let test_fut = async {
+            let mut first = socks5_connect(proxy_addr, target).await;
+            echo(&mut first, b"ping-1").await;
 
             tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(first);
 
-            stream.write_all(b"ping-2").await.unwrap();
-            let n = stream.read(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], b"ping-2");
+            let mut second = socks5_connect(proxy_addr, target).await;
+            echo(&mut second, b"ping-2").await;
         };
 
         tokio::time::timeout(Duration::from_secs(20), test_fut)
             .await
-            .expect("Idle-timeout survival test timed out after 20s");
+            .expect("Reconnect-after-idle-timeout test timed out after 20s");
     }
 
     #[tokio::test]

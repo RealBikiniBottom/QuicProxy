@@ -50,10 +50,9 @@ const MAX_WAITING_DATAGRAM_CONTEXTS: usize = 1024;
 /// mid-flight, which would otherwise close the whole QUIC connection.
 pub const UDP_CONTEXT_ID_RECONNECT_MARGIN: u32 = 256;
 
-/// No packet received from the peer for this long means the path is suspect,
-/// even if the connection is idle: keep-alive is enabled on the client (at most
-/// every 5s), so a healthy path keeps producing ACKs and a single lost
-/// keep-alive cannot trigger a probe.
+/// No packet received from the peer for this long means the path is suspect.
+/// Clients send no keep-alives (they would keep the mobile radio awake), so a
+/// connection reused after this much idle time is probed first.
 const LIVENESS_IDLE: Duration = Duration::from_secs(10);
 
 /// When traffic is flowing (we keep sending) but nothing comes back, the path is

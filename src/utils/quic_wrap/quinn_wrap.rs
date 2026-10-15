@@ -48,18 +48,6 @@ const ACCEPT_CONNECTION_QUEUE_CAPACITY: usize = 200;
 /// actually-opened stream -- so it can be generous.
 const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 1000;
 
-/// Keep-alive period for client connections, derived from the idle timeout so
-/// that quinn itself notices a black-holed path (UDP QoS) instead of leaving an
-/// unusable connection cached until the next request times out. Without it an
-/// idle connection never sends anything, so a silently dropped path is only
-/// detected when the application writes to it.
-fn keep_alive_interval(idle_timeout: Duration) -> Option<Duration> {
-    if idle_timeout.is_zero() {
-        return None;
-    }
-    Some((idle_timeout / 3).clamp(Duration::from_secs(2), Duration::from_secs(5)))
-}
-
 fn make_transport_config(
     idle_timeout: Duration,
     congestion_controller: Option<&str>,
@@ -541,7 +529,7 @@ impl QuinnClient {
         let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
             .context("Failed to build QUIC client TLS config")?;
         let mut client_config = ClientConfig::new(Arc::new(quic_client_config));
-        let mut transport_config = make_transport_config(
+        let transport_config = make_transport_config(
             idle_timeout,
             congestion_controller.as_deref(),
             enable_gso,
@@ -549,8 +537,6 @@ impl QuinnClient {
             initial_mtu,
             min_mtu,
         );
-        transport_config.keep_alive_interval(keep_alive_interval(idle_timeout));
-
         client_config.transport_config(Arc::new(transport_config));
 
         Ok((Arc::new(client_config), server_name))
