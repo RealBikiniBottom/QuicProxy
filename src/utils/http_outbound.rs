@@ -1,5 +1,5 @@
 use anyhow::Context;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -33,17 +33,19 @@ async fn maybe_wrap_tls(
         return Ok(stream);
     }
 
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let connector = TlsConnector::from(Arc::new(https_client_config(root_store)));
-
     let server_name = rustls::pki_types::ServerName::try_from(host)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .to_owned();
-    let tls_stream = connector.connect(server_name, stream).await?;
+    let tls_stream = HTTPS_CONNECTOR.connect(server_name, stream).await?;
     Ok(Box::new(tls_stream))
 }
+
+/// Shared by every request, so the root store is built once and TLS sessions can resume.
+static HTTPS_CONNECTOR: LazyLock<TlsConnector> = LazyLock::new(|| {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    TlsConnector::from(Arc::new(https_client_config(root_store)))
+});
 
 fn https_client_config(root_store: rustls::RootCertStore) -> rustls::ClientConfig {
     crate::utils::ntp::tls::client_builder()
