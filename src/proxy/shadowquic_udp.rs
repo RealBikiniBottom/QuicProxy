@@ -53,11 +53,11 @@ pub const UDP_CONTEXT_ID_RECONNECT_MARGIN: u32 = 256;
 /// No packet received from the peer for this long means the path is suspect.
 /// Clients send no keep-alives (they would keep the mobile radio awake), so a
 /// connection reused after this much idle time is probed first.
-const LIVENESS_IDLE: Duration = Duration::from_secs(10);
+const LIVENESS_IDLE: Duration = Duration::from_secs(30);
 
 /// When traffic is flowing (we keep sending) but nothing comes back, the path is
 /// suspect much sooner than [LIVENESS_IDLE].
-const LIVENESS_SILENCE: Duration = Duration::from_secs(1);
+const LIVENESS_SILENCE: Duration = Duration::from_secs(30);
 
 /// Tracks whether a cached QUIC connection still receives anything from the
 /// peer. `Connection::open_bi` succeeds on a black-holed path, so stream
