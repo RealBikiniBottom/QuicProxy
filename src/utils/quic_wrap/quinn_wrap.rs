@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use quinn::{
     ClientConfig, MtuDiscoveryConfig, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
 };
@@ -22,6 +23,10 @@ use crate::utils::new_io_other_error;
 use crate::utils::socket::socket_helpers::try_create_dualstack_udpsocket;
 
 use super::{QuicBistream, QuicConnection, QuicUnistream};
+
+/// Resolves to whether the server accepted 0-RTT; `false` also when the
+/// connection failed before the handshake finished.
+pub type ZeroRttOutcome = Shared<BoxFuture<'static, bool>>;
 
 // 300Mbps has a bandwidth-delay product of about 3.75MB at 100ms RTT. These
 // windows leave enough headroom for that workload while keeping each QUIC
@@ -365,10 +370,10 @@ impl QuinnServer {
                 .into_iter()
                 .map(|s| s.into_bytes())
                 .collect();
-            crypto.max_early_data_size = if zero_rtt { u32::MAX } else { 0 };
-            crypto.send_half_rtt_data = zero_rtt;
             crypto.jls_config = jls_config.into();
         }
+        crypto.max_early_data_size = if zero_rtt { u32::MAX } else { 0 };
+        crypto.send_half_rtt_data = zero_rtt;
 
         let transport_config = Arc::new(make_transport_config(
             idle_timeout,
@@ -542,6 +547,10 @@ impl QuinnClient {
         Ok((Arc::new(client_config), server_name))
     }
 
+    pub fn rebind(&self, socket: std::net::UdpSocket) -> io::Result<()> {
+        self.endpoint.rebind(socket)
+    }
+
     /// Create a client on a fresh UDP socket from a config previously built by
     /// [`QuinnClient::build_client_config`].
     pub fn from_config(
@@ -603,12 +612,23 @@ impl QuinnClient {
     }
 
     pub async fn connect(&self, remote_addr: SocketAddr) -> anyhow::Result<Arc<quinn::Connection>> {
+        Ok(self.connect_with_0rtt(remote_addr).await?.0)
+    }
+
+    /// Returns the outcome of 0-RTT when the connection was opened with early
+    /// data, `None` when it is already a fully established 1-RTT connection.
+    pub async fn connect_with_0rtt(
+        &self,
+        remote_addr: SocketAddr,
+    ) -> anyhow::Result<(Arc<quinn::Connection>, Option<ZeroRttOutcome>)> {
         let conn = self.endpoint.connect(remote_addr, &self.sni)?;
-        let raw_conn = if self.zero_rtt {
+        let (raw_conn, outcome) = if self.zero_rtt {
             match conn.into_0rtt() {
                 Ok((x, accepted)) => {
+                    let outcome = accepted.boxed().shared();
                     let conn_clone = x.clone();
                     let is_jls_clone = self.is_jls;
+                    let accepted = outcome.clone();
                     tokio::spawn(async move {
                         info!("zero rtt accepted: {}", accepted.await);
                         if is_jls_clone && conn_clone.is_jls() == Some(false) {
@@ -617,18 +637,18 @@ impl QuinnClient {
                         }
                     });
                     trace!("trying 0-rtt quic connection");
-                    x
+                    (x, Some(outcome))
                 }
                 Err(e) => {
                     let x = e.await?;
                     info!("1-rtt quic connection established");
-                    x
+                    (x, None)
                 }
             }
         } else {
             let x = conn.await?;
             info!("1-rtt quic connection established");
-            x
+            (x, None)
         };
 
         if self.is_jls && raw_conn.is_jls() == Some(false) {
@@ -636,7 +656,7 @@ impl QuinnClient {
             bail!("JLS hijacked or wrong pwd/iv");
         }
 
-        Ok(Arc::new(raw_conn))
+        Ok((Arc::new(raw_conn), outcome))
     }
 }
 
@@ -679,5 +699,91 @@ impl quinn::rustls::client::danger::ServerCertVerifier for SkipServerVerificatio
             quinn::rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
             quinn::rustls::SignatureScheme::ED25519,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn resumed_connection_accepts_0rtt(is_jls: bool) -> bool {
+        let users = [AuthUser {
+            username: "user".to_string(),
+            password: "password".to_string(),
+        }];
+        let mut server = QuinnServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_secs(30),
+            None,
+            None,
+            None,
+            Some("localhost".to_string()),
+            None,
+            true,
+            &users,
+            is_jls,
+            false,
+            false,
+            1200,
+            1200,
+        )
+        .unwrap();
+        let server_addr = server.endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok(conn) = server.accept().await {
+                tokio::spawn(async move { conn.closed().await });
+            }
+        });
+
+        let (config, sni) = QuinnClient::build_client_config(
+            Duration::from_secs(30),
+            false,
+            true,
+            None,
+            Some("localhost".to_string()),
+            None,
+            None,
+            "user".to_string(),
+            "password".to_string(),
+            is_jls,
+            false,
+            false,
+            1200,
+            1200,
+        )
+        .unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let client = QuinnClient::from_config(socket, config, sni, true, is_jls).unwrap();
+
+        let first = client.endpoint.connect(server_addr, &client.sni).unwrap();
+        assert!(
+            first.into_0rtt().is_err(),
+            "a fresh client has no session ticket"
+        );
+        let first = client
+            .endpoint
+            .connect(server_addr, &client.sni)
+            .unwrap()
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        first.close(0u32.into(), b"");
+
+        let resumed = client.endpoint.connect(server_addr, &client.sni).unwrap();
+        let (_conn, accepted) = resumed
+            .into_0rtt()
+            .unwrap_or_else(|_| panic!("no session ticket to resume (jls={is_jls})"));
+        accepted.await
+    }
+
+    #[tokio::test]
+    async fn resumed_connection_accepts_0rtt_without_jls() {
+        assert!(resumed_connection_accepts_0rtt(false).await);
+    }
+
+    #[tokio::test]
+    async fn resumed_connection_accepts_0rtt_with_jls() {
+        assert!(resumed_connection_accepts_0rtt(true).await);
     }
 }

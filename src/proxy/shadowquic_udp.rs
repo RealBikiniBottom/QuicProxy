@@ -27,7 +27,7 @@ use crate::utils::keyed_notify::KeyedNotify;
 use crate::utils::new_io_other_error;
 use crate::utils::now;
 use crate::utils::now_millis;
-use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
+use crate::utils::quic_wrap::quinn_wrap::{QuinnBistream, ZeroRttOutcome};
 use crate::utils::read_ahead;
 
 use super::SourceAddr;
@@ -121,6 +121,7 @@ pub struct PerConnectionState {
     pub udp_recv_map: UdpRecvMap,
     pub udp_recv_map_notify: Arc<KeyedNotify>,
     pub waiting_datagram_buffer: WaitingDatagramBuffer,
+    pub zero_rtt: Option<ZeroRttOutcome>,
 }
 
 impl PerConnectionState {
@@ -132,7 +133,23 @@ impl PerConnectionState {
             udp_recv_map,
             udp_recv_map_notify: Arc::new(KeyedNotify::new()),
             waiting_datagram_buffer: Arc::new(DashMap::new()),
+            zero_rtt: None,
         }
+    }
+
+    /// The 0-RTT outcome while it is still unknown or turned out rejected;
+    /// `None` once the connection is known to be fully usable.
+    pub fn unsettled_zero_rtt(&self) -> Option<ZeroRttOutcome> {
+        self.zero_rtt
+            .as_ref()
+            .filter(|outcome| outcome.peek() != Some(&true))
+            .cloned()
+    }
+
+    pub fn zero_rtt_rejected(&self) -> bool {
+        self.zero_rtt
+            .as_ref()
+            .is_some_and(|outcome| outcome.peek() == Some(&false))
     }
 }
 

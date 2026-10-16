@@ -56,7 +56,8 @@ pub struct ShadowQuicInbound {
 
 impl ShadowQuicInbound {
     pub fn new(tag: String, cfg: &InboundConfig, users: Vec<AuthUser>) -> anyhow::Result<Self> {
-        let tls = TlsConfig::from_inbound(cfg)?;
+        let mut tls = TlsConfig::from_inbound(cfg)?;
+        tls.zero_rtt = cfg.tls.as_ref().and_then(|t| t.zero_rtt).unwrap_or(true);
 
         if !tls.enable && !tls.enable_jls {
             anyhow::bail!("ShadowQuic inbound requires TLS to be enabled");

@@ -5,15 +5,19 @@ use crate::proxy::shadowquic_udp::{
 };
 use crate::utils::interface::InterfaceManager;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
-use crate::utils::quic_wrap::quinn_wrap::QuinnClient;
+use crate::utils::quic_wrap::quinn_wrap::{QuinnClient, ZeroRttOutcome};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
+use futures::future::{BoxFuture, FutureExt};
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
+use std::task::{Poll, ready};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
@@ -23,10 +27,11 @@ use tracing::{debug, info, warn};
 use crate::config::OutboundConfig;
 use crate::proxy::outbound::{
     AnyOutbound, AnyStream, LazyHandshakeStream, UdpMode, get_outbound_by_tag,
-    report_outbound_unhealthy,
+    report_outbound_unhealthy, select_outbound_interface,
 };
 use crate::proxy::{TargetAddr, TlsConfig};
 
+use crate::utils::socket::socket_helpers::new_udp_socket;
 use crate::utils::{format_duration, new_io_other_error};
 
 use super::AnyPacket;
@@ -48,6 +53,8 @@ const SQ_CONN_STATS_REQUEST: [u8; 10] = [0xFF, 0, 0, 0, 0, 0, 0, 0, 1, 0x00];
 const CONN_UNHEALTHY_CLOSE_CODE: u32 = 1;
 const CONN_UNHEALTHY_REASON: &[u8] = b"connection unhealthy";
 const NETWORK_CHANGED_REASON: &[u8] = b"network changed";
+const ZERO_RTT_REJECTED_REASON: &[u8] = b"0-rtt rejected";
+const ZERO_RTT_REPLAY_LIMIT: usize = 64 * 1024;
 
 /// Serialized `TargetAddr::dummy()`, sent as the placeholder target in the UDP
 /// session handshake (cmd 0x03/0x04).
@@ -83,18 +90,55 @@ pub struct ShadowQuicOutbound {
 
     cached_client: Arc<Mutex<Option<CachedClient>>>,
 
-    /// Background task closing and clearing `cached_client` whenever the network
+    /// Background task migrating `cached_client` to a fresh socket whenever the network
     /// interface changes. Aborted on drop so it cannot keep the cached QUIC
     /// connection (and its endpoint/socket) alive after this outbound goes
     /// away.
     iface_reset_task: Option<JoinHandle<()>>,
 }
 
+async fn migrate_cached_conn(
+    cache: &Mutex<Option<CachedClient>>,
+    tag: &str,
+    bind_interface: Option<&str>,
+) {
+    let mut lock = cache.lock().await;
+    let Some((conn, client, _)) = lock.as_ref() else {
+        return;
+    };
+
+    let remote = conn.remote_address();
+    let iface = select_outbound_interface(bind_interface, Some(remote));
+    let rebound = match new_udp_socket(None, iface, Some(remote), None).await {
+        Ok(socket) => socket.into_std().and_then(|socket| client.rebind(socket)),
+        Err(e) => Err(e),
+    };
+
+    match rebound {
+        Ok(()) => info!(
+            "[{}] migrated quic connection {} to the new network",
+            tag,
+            conn.stable_id()
+        ),
+        Err(e) => {
+            warn!(
+                "[{}] failed to migrate quic connection {}, resetting it: {}",
+                tag,
+                conn.stable_id(),
+                e
+            );
+            conn.close(CONN_UNHEALTHY_CLOSE_CODE.into(), NETWORK_CHANGED_REASON);
+            *lock = None;
+        }
+    }
+}
+
 impl ShadowQuicOutbound {
     pub fn new(tag: String, cfg: &OutboundConfig) -> Result<Arc<dyn AnyOutbound>> {
         let connect_timeout = cfg.connect_timeout();
 
-        let tls = TlsConfig::from_outbound(cfg)?;
+        let mut tls = TlsConfig::from_outbound(cfg)?;
+        tls.zero_rtt = cfg.tls.as_ref().and_then(|t| t.zero_rtt).unwrap_or(true);
 
         let udp_mod = match cfg.udp_mode_or("stream") {
             "datagram" => UdpMode::OverDatagram,
@@ -139,18 +183,12 @@ impl ShadowQuicOutbound {
         let iface_reset_task = InterfaceManager::subscribe().map(|mut rx| {
             let cache = cached_client.clone();
             let tag = tag.clone();
+            let bind_interface = cfg.bind_interface.clone();
             tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
                         Ok(()) => {
-                            let mut lock = cache.lock().await;
-                            if let Some((conn, _, _)) = lock.take() {
-                                info!("[{}] reset shadowquic outbound because iface changed", tag);
-                                conn.close(
-                                    CONN_UNHEALTHY_CLOSE_CODE.into(),
-                                    NETWORK_CHANGED_REASON,
-                                );
-                            }
+                            migrate_cached_conn(&cache, &tag, bind_interface.as_deref()).await;
                         }
                         // Lagged means we missed change events, not that the
                         // channel died: reset on the next one instead of
@@ -269,6 +307,13 @@ impl ShadowQuicOutbound {
     ) -> anyhow::Result<(Arc<quinn::Connection>, Arc<PerConnectionState>)> {
         let mut lock = self.cached_client.lock().await;
 
+        if let Some((ref conn, _, ref state)) = *lock
+            && state.zero_rtt_rejected()
+        {
+            conn.close(CONN_UNHEALTHY_CLOSE_CODE.into(), ZERO_RTT_REJECTED_REASON);
+            *lock = None;
+        }
+
         if let Some((ref conn, _, ref state)) = *lock {
             if conn.close_reason().is_none() {
                 if self.is_healthy(conn, state).await {
@@ -305,6 +350,9 @@ impl ShadowQuicOutbound {
                     conn.stable_id(),
                     conn.remote_address()
                 );
+                if let Some(outcome) = state.zero_rtt.clone() {
+                    self.evict_on_zero_rtt_rejection(&conn, outcome);
+                }
                 let result = (conn.clone(), state.clone());
                 *lock = Some((conn, client, state));
                 Ok(result)
@@ -315,6 +363,27 @@ impl ShadowQuicOutbound {
                 Err(e)
             }
         }
+    }
+
+    fn evict_on_zero_rtt_rejection(&self, conn: &Arc<quinn::Connection>, outcome: ZeroRttOutcome) {
+        let cache = self.cached_client.clone();
+        let conn = conn.clone();
+        let tag = self.tag.clone();
+        tokio::spawn(async move {
+            if outcome.await {
+                return;
+            }
+            warn!(
+                "[{}] server rejected 0-RTT on quic connection {}, replaying on a new one",
+                tag,
+                conn.stable_id()
+            );
+            conn.close(CONN_UNHEALTHY_CLOSE_CODE.into(), ZERO_RTT_REJECTED_REASON);
+            let mut lock = cache.lock().await;
+            if matches!(&*lock, Some((cached, _, _)) if cached.stable_id() == conn.stable_id()) {
+                *lock = None;
+            }
+        });
     }
 
     async fn establish_connection(
@@ -346,26 +415,29 @@ impl ShadowQuicOutbound {
             })?,
         );
 
-        let conn = tokio::time::timeout(self.connect_timeout, client.connect(remote_addr))
-            .await
-            .map_err(|_| {
-                new_io_other_error(format!(
-                    "ShadowQuic connect timeout after {:?} to {}",
-                    self.connect_timeout, remote_addr
-                ))
-            })?
-            .map_err(|e| {
-                new_io_other_error(format!(
-                    "ShadowQuic connect failed to {}: {:?}",
-                    remote_addr, e
-                ))
-            })?;
+        let (conn, zero_rtt) =
+            tokio::time::timeout(self.connect_timeout, client.connect_with_0rtt(remote_addr))
+                .await
+                .map_err(|_| {
+                    new_io_other_error(format!(
+                        "ShadowQuic connect timeout after {:?} to {}",
+                        self.connect_timeout, remote_addr
+                    ))
+                })?
+                .map_err(|e| {
+                    new_io_other_error(format!(
+                        "ShadowQuic connect failed to {}: {:?}",
+                        remote_addr, e
+                    ))
+                })?;
 
         if let Some(auth_hash) = self.auth_hash {
             self.send_auth(&conn, auth_hash).await?;
         }
 
-        let state = Arc::new(PerConnectionState::new());
+        let mut state = PerConnectionState::new();
+        state.zero_rtt = zero_rtt;
+        let state = Arc::new(state);
 
         match self.udp_mod {
             UdpMode::OverStream => start_unistream_listener(
@@ -522,6 +594,34 @@ impl ShadowQuicOutbound {
         )
     }
 
+    /// UDP session setup registers per-connection state on the server, so it is
+    /// not worth replaying: it waits for the 0-RTT outcome instead and retries
+    /// on a new connection when early data was rejected.
+    async fn open_udp_bistream_settled(
+        &self,
+    ) -> anyhow::Result<(
+        Arc<quinn::Connection>,
+        quinn::SendStream,
+        quinn::RecvStream,
+        Arc<PerConnectionState>,
+    )> {
+        for _ in 0..2 {
+            let opened = self.open_udp_bistream_with_capacity().await?;
+            let accepted = match opened.3.unsettled_zero_rtt() {
+                Some(outcome) => outcome.await,
+                None => true,
+            };
+            if accepted {
+                return Ok(opened);
+            }
+        }
+
+        anyhow::bail!(
+            "[{}] server kept rejecting 0-RTT for the UDP session",
+            self.tag()
+        )
+    }
+
     pub async fn open_unistream_with_retry(
         &self,
     ) -> anyhow::Result<(
@@ -624,7 +724,7 @@ impl AnyOutbound for ShadowQuicOutbound {
     }
 
     async fn connect_stream_base(&self) -> anyhow::Result<AnyStream> {
-        let (conn, send, recv, _state) = self.open_bistream_with_retry().await?;
+        let (conn, send, recv, state) = self.open_bistream_with_retry().await?;
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             let stats = conn.stats();
@@ -638,7 +738,11 @@ impl AnyOutbound for ShadowQuicOutbound {
             );
         }
 
-        Ok(Box::new(QuinnBistream::new(send, recv)))
+        let stream: AnyStream = Box::new(QuinnBistream::new(send, recv));
+        Ok(match state.unsettled_zero_rtt() {
+            Some(outcome) => Box::new(ZeroRttStream::new(stream, outcome, self.tag.clone())),
+            None => stream,
+        })
     }
 
     async fn connect_stream_with(
@@ -658,7 +762,7 @@ impl AnyOutbound for ShadowQuicOutbound {
     }
 
     async fn connect_packet(&self, target: &TargetAddr) -> anyhow::Result<Arc<dyn AnyPacket>> {
-        let (conn, mut send, recv, state) = self.open_udp_bistream_with_capacity().await?;
+        let (conn, mut send, recv, state) = self.open_udp_bistream_settled().await?;
 
         let is_over_unistream = matches!(self.udp_mod, UdpMode::OverStream);
         let mut packet = Vec::with_capacity(1 + DUMMY_TARGET_BYTES.len());
@@ -700,5 +804,221 @@ impl Drop for ShadowQuicOutbound {
         if let Some(handle) = self.iface_reset_task.take() {
             handle.abort();
         }
+    }
+}
+
+enum ZeroRttPhase {
+    Early,
+    Replaying(BoxFuture<'static, io::Result<AnyStream>>),
+    Settled,
+}
+
+/// A stream opened while the server has not yet answered 0-RTT. It keeps what
+/// was written so that, if early data is rejected, the same bytes can be sent
+/// again on a new connection without the caller noticing.
+struct ZeroRttStream {
+    inner: AnyStream,
+    outcome: ZeroRttOutcome,
+    sent: Vec<u8>,
+    shutdown: bool,
+    tag: String,
+    phase: ZeroRttPhase,
+}
+
+impl ZeroRttStream {
+    fn new(inner: AnyStream, outcome: ZeroRttOutcome, tag: String) -> Self {
+        Self {
+            inner,
+            outcome,
+            sent: Vec::new(),
+            shutdown: false,
+            tag,
+            phase: ZeroRttPhase::Early,
+        }
+    }
+
+    fn resolve(&mut self, accepted: bool) {
+        let sent = std::mem::take(&mut self.sent);
+        if accepted {
+            self.phase = ZeroRttPhase::Settled;
+            return;
+        }
+
+        let tag = self.tag.clone();
+        let shutdown = self.shutdown;
+        self.phase = ZeroRttPhase::Replaying(
+            async move {
+                debug!("[{}] replaying {} bytes rejected as 0-RTT", tag, sent.len());
+                let outbound = get_outbound_by_tag(&tag).map_err(io::Error::other)?;
+                let mut stream = outbound
+                    .connect_stream_base()
+                    .await
+                    .map_err(io::Error::other)?;
+                stream.write_all(&sent).await?;
+                if shutdown {
+                    stream.shutdown().await?;
+                } else {
+                    stream.flush().await?;
+                }
+                Ok(stream)
+            }
+            .boxed(),
+        );
+    }
+
+    /// Ready once the stream left the early phase for good: either 0-RTT was
+    /// accepted or the replay on a new connection finished.
+    fn poll_settled(&mut self, cx: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            match &mut self.phase {
+                ZeroRttPhase::Settled => return Poll::Ready(Ok(())),
+                ZeroRttPhase::Early => {
+                    let accepted = ready!(self.outcome.poll_unpin(cx));
+                    self.resolve(accepted);
+                }
+                ZeroRttPhase::Replaying(replay) => {
+                    let stream = ready!(replay.as_mut().poll(cx));
+                    self.phase = ZeroRttPhase::Settled;
+                    self.inner = stream?;
+                }
+            }
+        }
+    }
+
+    /// Polls the outcome during the early phase. `Ready` means the phase is
+    /// over and the caller should go through `poll_settled`.
+    fn poll_early(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        if !matches!(self.phase, ZeroRttPhase::Early) {
+            return Poll::Ready(());
+        }
+        let accepted = ready!(self.outcome.poll_unpin(cx));
+        self.resolve(accepted);
+        Poll::Ready(())
+    }
+}
+
+impl AsyncRead for ZeroRttStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.poll_early(cx).is_pending() {
+            return match Pin::new(&mut this.inner).poll_read(cx, buf) {
+                Poll::Ready(Err(_)) => Poll::Pending,
+                other => other,
+            };
+        }
+        ready!(this.poll_settled(cx))?;
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ZeroRttStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.poll_early(cx).is_pending() {
+            if this.sent.len() + buf.len() > ZERO_RTT_REPLAY_LIMIT {
+                return Poll::Pending;
+            }
+            return match Pin::new(&mut this.inner).poll_write(cx, buf) {
+                Poll::Ready(Ok(n)) => {
+                    this.sent.extend_from_slice(&buf[..n]);
+                    Poll::Ready(Ok(n))
+                }
+                Poll::Ready(Err(_)) => Poll::Pending,
+                Poll::Pending => Poll::Pending,
+            };
+        }
+        ready!(this.poll_settled(cx))?;
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.poll_early(cx).is_pending() {
+            return match Pin::new(&mut this.inner).poll_flush(cx) {
+                Poll::Ready(Err(_)) => Poll::Pending,
+                other => other,
+            };
+        }
+        ready!(this.poll_settled(cx))?;
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.poll_early(cx).is_pending() {
+            return match Pin::new(&mut this.inner).poll_shutdown(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.shutdown = true;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(_)) => Poll::Pending,
+                Poll::Pending => Poll::Pending,
+            };
+        }
+        ready!(this.poll_settled(cx))?;
+        if this.shutdown {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod zero_rtt_stream_tests {
+    use super::*;
+
+    fn stream_with_outcome() -> (
+        ZeroRttStream,
+        tokio::io::DuplexStream,
+        tokio::sync::oneshot::Sender<bool>,
+    ) {
+        let (local, remote) = tokio::io::duplex(4 * ZERO_RTT_REPLAY_LIMIT);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let outcome = async move { rx.await.unwrap_or(false) }.boxed().shared();
+        let stream = ZeroRttStream::new(Box::new(local), outcome, "test".to_string());
+        (stream, remote, tx)
+    }
+
+    #[tokio::test]
+    async fn early_writes_are_kept_until_accepted() {
+        let (mut stream, mut remote, tx) = stream_with_outcome();
+
+        stream.write_all(b"hello").await.unwrap();
+        assert_eq!(stream.sent, b"hello");
+
+        tx.send(true).unwrap();
+        stream.write_all(b" world").await.unwrap();
+        assert!(stream.sent.is_empty());
+        assert!(matches!(stream.phase, ZeroRttPhase::Settled));
+
+        let mut buf = [0u8; 11];
+        remote.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn writes_beyond_the_replay_limit_wait_for_the_outcome() {
+        let (mut stream, _remote, tx) = stream_with_outcome();
+        let big = vec![7u8; ZERO_RTT_REPLAY_LIMIT + 1];
+
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(100), stream.write_all(&big)).await;
+        assert!(blocked.is_err());
+        assert!(stream.sent.is_empty());
+
+        tx.send(true).unwrap();
+        stream.write_all(&big).await.unwrap();
+        assert!(stream.sent.is_empty());
     }
 }

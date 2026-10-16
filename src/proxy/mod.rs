@@ -306,7 +306,7 @@ impl TlsConfig {
         Ok(Self {
             enable: tls.map(|t| t.enable).unwrap_or(true),
             insecure: false,
-            zero_rtt: false,
+            zero_rtt: tls.and_then(|t| t.zero_rtt).unwrap_or(false),
             sni: tls.and_then(|t| t.server_name.clone()),
             cert,
             key,
@@ -338,7 +338,7 @@ impl TlsConfig {
         Ok(Self {
             enable: tls.map(|t| t.enable).unwrap_or(true),
             insecure,
-            zero_rtt: false,
+            zero_rtt: tls.and_then(|t| t.zero_rtt).unwrap_or(false),
             sni,
             cert,
             key: None,

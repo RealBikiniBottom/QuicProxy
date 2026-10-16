@@ -369,6 +369,7 @@ pub struct InboundTlsConfig {
     pub cert: Option<String>,
     pub key: Option<String>,
     pub alpn: Option<Vec<String>>,
+    pub zero_rtt: Option<bool>,
 
     #[serde(default = "default_false")]
     pub enable_jls: bool,
@@ -385,6 +386,7 @@ pub struct OutboundTlsConfig {
     pub server_name: Option<String>,
     pub ca: Option<String>,
     pub alpn: Option<Vec<String>>,
+    pub zero_rtt: Option<bool>,
 
     #[serde(default = "default_false")]
     pub enable_jls: bool,
