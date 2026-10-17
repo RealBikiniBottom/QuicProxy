@@ -53,6 +53,14 @@ const ACCEPT_CONNECTION_QUEUE_CAPACITY: usize = 200;
 /// actually-opened stream -- so it can be generous.
 const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 1000;
 
+/// Session tickets the server remembers for 0-RTT resumption. rustls only
+/// accepts early data with its stateful store, and every handshake stores two
+/// tickets, so the rustls default (256) is used up by the last 128 connections
+/// of all users together. On a busy server a client's ticket was evicted
+/// before it reconnected, 0-RTT was rejected and the request was replayed on
+/// yet another connection.
+const SERVER_SESSION_CACHE_SIZE: usize = 16 * 1024;
+
 fn make_transport_config(
     idle_timeout: Duration,
     congestion_controller: Option<&str>,
@@ -374,6 +382,8 @@ impl QuinnServer {
         }
         crypto.max_early_data_size = if zero_rtt { u32::MAX } else { 0 };
         crypto.send_half_rtt_data = zero_rtt;
+        crypto.session_storage =
+            quinn::rustls::server::ServerSessionMemoryCache::new(SERVER_SESSION_CACHE_SIZE);
 
         let transport_config = Arc::new(make_transport_config(
             idle_timeout,
@@ -415,14 +425,28 @@ impl QuinnServer {
             while let Some(incoming) = accept_endpoint.accept().await {
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    match incoming.await {
-                        Ok(connection) => {
-                            let _ = tx.send(Arc::new(connection)).await;
-                        }
+                    let connecting = match incoming.accept() {
+                        Ok(connecting) => connecting,
                         Err(e) => {
                             debug!("incoming handshake failed: {}", e);
+                            return;
                         }
-                    }
+                    };
+                    // Hand the connection out before the client's Finished
+                    // arrives, so streams sent as 0-RTT data are served now
+                    // instead of one round trip later. JLS authentication
+                    // already ran on the ClientHello inside `accept`.
+                    let connection = match connecting.into_0rtt() {
+                        Ok((connection, _)) => connection,
+                        Err(connecting) => match connecting.await {
+                            Ok(connection) => connection,
+                            Err(e) => {
+                                debug!("incoming handshake failed: {}", e);
+                                return;
+                            }
+                        },
+                    };
+                    let _ = tx.send(Arc::new(connection)).await;
                 });
             }
             info!("quic server endpoint quit");
