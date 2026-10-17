@@ -87,6 +87,9 @@ pub struct ShadowQuicOutbound {
     sni: String,
     zero_rtt: bool,
     enable_jls: bool,
+    /// Probe a reused connection whose receive counters went quiet before
+    /// handing it out. Off by default.
+    liveness_probe: bool,
 
     cached_client: Arc<Mutex<Option<CachedClient>>>,
 
@@ -211,6 +214,7 @@ impl ShadowQuicOutbound {
             sni,
             zero_rtt,
             enable_jls,
+            liveness_probe: cfg.liveness_probe,
             cached_client,
             iface_reset_task,
             dns_server_name: cfg.dns.clone(),
@@ -255,10 +259,10 @@ impl ShadowQuicOutbound {
     }
 
     /// True when the connection can still carry traffic. Reused connections are
-    /// only probed when their receive counters went quiet, so the common case
-    /// pays nothing.
+    /// only probed when `liveness_probe` is enabled and their receive counters
+    /// went quiet, so the common case pays nothing.
     async fn is_healthy(&self, conn: &quinn::Connection, state: &PerConnectionState) -> bool {
-        if !state.liveness.needs_probe(conn) {
+        if !self.liveness_probe || !state.liveness.needs_probe(conn) {
             return true;
         }
 

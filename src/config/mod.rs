@@ -614,6 +614,10 @@ pub struct OutboundConfig {
     /// 禁用多路复用：每个代理连接独占一条 TLS 连接（Session）
     #[serde(default = "default_false")]
     pub disable_mux: bool,
+
+    /// ShadowQuic：复用空闲/无回包的连接前先发一次往返探测，默认关闭
+    #[serde(default = "default_false")]
+    pub liveness_probe: bool,
 }
 
 impl OutboundConfig {

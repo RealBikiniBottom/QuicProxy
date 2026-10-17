@@ -2260,6 +2260,7 @@ mod tests {
             }),
             transport: None,
             disable_mux: false,
+            liveness_probe: false,
         };
 
         let outbound = AnytlsOutbound::new("test_anytls_out".to_string(), &cfg)
@@ -2357,6 +2358,7 @@ mod tests {
             }),
             transport: None,
             disable_mux: false,
+            liveness_probe: false,
         };
 
         let outbound = AnytlsOutbound::new("test_anytls_out".to_string(), &cfg)
