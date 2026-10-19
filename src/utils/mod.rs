@@ -23,6 +23,8 @@ pub mod system;
 pub mod system_proxy;
 pub mod time;
 pub mod tls;
+#[cfg(windows)]
+pub mod windows_shutdown;
 
 pub fn format_duration(duration: Duration) -> String {
     return format!("{:.2?}", duration);

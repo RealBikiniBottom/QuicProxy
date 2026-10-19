@@ -135,13 +135,17 @@ async fn async_main() -> Result<()> {
         info!("Running without elevated privileges");
     }
 
-    if let Err(e) = bootstrap::run_with_signal(config, async {
+    let result = bootstrap::run_with_signal(config, async {
         info!("Proxy started. Press Ctrl-C to stop.");
         wait_for_exit_signal().await;
         Ok(())
     })
-    .await
-    {
+    .await;
+    // Cleanup has run; a close/logoff/shutdown handler holding the process can return.
+    #[cfg(windows)]
+    quicproxy::utils::windows_shutdown::notify_cleanup_done();
+
+    if let Err(e) = result {
         eprintln!("Application error: {:#}", e);
         process::exit(1);
     }
@@ -149,8 +153,15 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
+/// Resolves on Ctrl-C, console close, logoff or system shutdown.
+#[cfg(windows)]
+async fn wait_for_exit_signal() {
+    quicproxy::utils::windows_shutdown::wait_for_exit_signal().await;
+}
+
 /// Resolves on Ctrl-C, or on SIGTERM (`systemctl stop`, plain `kill`) where it exists,
 /// so both go through the graceful shutdown path.
+#[cfg(not(windows))]
 async fn wait_for_exit_signal() {
     #[cfg(unix)]
     {
