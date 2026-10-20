@@ -116,7 +116,7 @@ impl AnyInbound for Socks5Inbound {
                             .instrument(span)
                             .await
                         {
-                            error!("Routing stream error: {:?}", e);
+                            error!("Routing stream error: {:#}", e);
                         }
                     }
                     Ok(Some(Socks5Handler::Packet(udp_socket, client_addr, tcp_socket))) => {

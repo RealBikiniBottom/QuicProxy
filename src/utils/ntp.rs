@@ -4,7 +4,8 @@ use crate::proxy::outbound::{AnyOutbound, get_default_outbound, get_outbound_by_
 use crate::proxy::{SourceAddr, TargetAddr};
 use crate::utils::shutdown;
 use crate::utils::time::parse_duration;
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Result, anyhow, ensure};
+use crate::utils::error::Context;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub mod elevate;
+pub mod error;
 pub mod http_outbound;
 pub mod interface;
 pub mod keyed_notify;

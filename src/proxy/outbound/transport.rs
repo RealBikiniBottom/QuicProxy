@@ -10,7 +10,8 @@ use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+use crate::utils::error::Context;
 use bytes::{Buf, BytesMut};
 use futures::{Sink, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};

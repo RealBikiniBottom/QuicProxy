@@ -3,7 +3,8 @@
 //! 使用 `tower-http` 提供成熟的静态资源服务，并为 SPA 应用保留
 //! `index.html` fallback 能力。
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
+use crate::utils::error::Context;
 use axum::{Router, routing::get_service};
 use std::path::{Path, PathBuf};
 use tower_http::services::{ServeDir, ServeFile};

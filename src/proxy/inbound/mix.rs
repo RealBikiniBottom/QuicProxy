@@ -4,7 +4,8 @@ use crate::proxy::inbound::http::{self, StreamHandler};
 use crate::proxy::inbound::socks5::{self, Socks5Handler};
 use crate::proxy::router::get_router;
 use crate::utils::{format_duration, now};
-use anyhow::{Context, bail};
+use anyhow::bail;
+use crate::utils::error::Context;
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -175,7 +176,7 @@ impl AnyInbound for MixInbound {
                 .await;
 
                 if let Err(e) = result {
-                    error!("Mix handler error: {:?}", e);
+                    error!("Mix handler error: {:#}", e);
                 }
             });
         }

@@ -9,7 +9,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
+use crate::utils::error::Context as _;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;

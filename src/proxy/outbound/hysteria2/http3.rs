@@ -20,7 +20,8 @@
 //! sufficient for both directions.
 
 use crate::proxy::outbound::hysteria2::qpack;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+use crate::utils::error::Context;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 

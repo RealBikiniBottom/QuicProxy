@@ -4,7 +4,8 @@
 //! 1. 核心模式（默认）：`quicproxy -c config.json` — 运行代理核心
 //! 2. 管理模式：`quicproxy --manage --port 8080` — 管理服务器，可启停核心
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use quicproxy::utils::error::Context;
 use axum::{Router, response::Json, routing::get};
 use clap::Parser;
 use quicproxy::bootstrap;

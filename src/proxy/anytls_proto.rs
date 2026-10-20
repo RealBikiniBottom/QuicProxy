@@ -1,6 +1,7 @@
 use crate::proxy::TargetAddr;
 use crate::utils::read_ahead;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
+use crate::utils::error::Context as _;
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 

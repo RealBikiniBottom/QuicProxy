@@ -12,7 +12,8 @@ pub mod transport;
 pub mod trojan;
 pub mod vmess;
 
-use anyhow::{Context, bail};
+use anyhow::bail;
+use crate::utils::error::Context;
 use anytls::AnytlsOutbound;
 use async_trait::async_trait;
 use dashmap::DashMap;

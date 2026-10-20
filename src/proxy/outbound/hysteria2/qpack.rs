@@ -13,7 +13,8 @@
 //!   dynamic table at capacity zero unless the client advertises
 //!   SETTINGS_QPACK_MAX_TABLE_CAPACITY, which this client does not.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+use crate::utils::error::Context;
 
 /// HPACK (RFC 7541 Appendix B) Huffman table: `(code, bit length)` per
 /// symbol. Row 256 is EOS.

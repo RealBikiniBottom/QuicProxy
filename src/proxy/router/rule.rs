@@ -7,7 +7,8 @@ use crate::config::{NetworkType, RouterMode, RuleConfig};
 use crate::dns::{AnyDNS, get_dns_by_tag};
 use crate::proxy::TargetAddr;
 use crate::proxy::outbound::{AnyOutbound, get_outbound_by_tag};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
+use crate::utils::error::Context;
 
 use super::geoip::Geoip;
 use super::geoip::get_geoip_by_tag;

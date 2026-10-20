@@ -193,7 +193,7 @@ pub fn init_logging(
                 true,
                 true,
                 None,
-                &crate::config::BacktraceMode::On,
+                &crate::config::BacktraceMode::Off,
             ),
             LogConfig::Detailed {
                 enable,
@@ -316,6 +316,8 @@ pub fn init_logging(
         .with(stdout_layer)
         .try_init()
         .ok();
+
+    crate::utils::error::install_panic_hook();
 
     // Store the real handles in OnceLock; return dummy handles so that
     // callers can forget them safely without affecting the held guards.

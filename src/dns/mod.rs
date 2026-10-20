@@ -4,7 +4,8 @@ use crate::proxy::observe::get_observer;
 use crate::proxy::outbound::{AnyOutbound, get_default_outbound, get_outbound_by_tag};
 use crate::proxy::{SourceAddr, TargetAddr};
 use crate::utils::{format_duration, now_timestamp};
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
+use crate::utils::error::Context;
 use bytes::Bytes;
 use dashmap::DashMap;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
@@ -1122,7 +1123,7 @@ impl FakeIPDNS {
             }
             Ok(None) => None,
             Err(e) => {
-                error!("{:?}", e);
+                error!("{:#}", e);
                 None
             }
         }

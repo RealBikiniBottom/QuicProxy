@@ -7,7 +7,8 @@ pub mod shadowquic_udp;
 
 use crate::config::{InboundConfig, OutboundConfig};
 use crate::utils::new_io_other_error;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+use crate::utils::error::Context;
 use serde::Serialize;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

@@ -8,7 +8,7 @@ use crate::utils::now;
 use crate::utils::now_timestamp;
 use crate::utils::shutdown;
 use crate::utils::time::parse_duration;
-use anyhow::Context;
+use crate::utils::error::Context;
 use anyhow::Result;
 use anyhow::bail;
 use arc_swap::ArcSwapOption;

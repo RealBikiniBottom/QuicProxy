@@ -287,7 +287,7 @@ async fn handle_connection<S>(
                         .dispatch_stream(Box::new(stream), &target, tag.as_ref(), user)
                         .await
                     {
-                        error!("Routing stream error: {:?}", e);
+                        error!("Routing stream error: {:#}", e);
                     }
                 }
                 .instrument(span)
@@ -321,7 +321,7 @@ async fn handle_connection<S>(
                         )
                         .await
                     {
-                        error!("Routing udp error: {:?}", e);
+                        error!("Routing udp error: {:#}", e);
                     }
                 }
                 .instrument(span)

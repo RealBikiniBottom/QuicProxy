@@ -15,7 +15,8 @@ use crate::{
     api::init_core_api,
     dns::{init_dns, shutdown_dns},
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
+use crate::utils::error::Context;
 use std::future::Future;
 use tracing::{debug, error, info};
 

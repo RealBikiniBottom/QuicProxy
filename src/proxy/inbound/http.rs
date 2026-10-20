@@ -106,7 +106,7 @@ impl AnyInbound for HttpInbound {
                                 )
                                 .await
                             {
-                                error!("Routing error: {:?}", e);
+                                error!("Routing error: {:#}", e);
                             }
                         }
                         Ok(None) => {

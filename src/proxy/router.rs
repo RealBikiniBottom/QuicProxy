@@ -5,7 +5,8 @@ use crate::proxy::outbound::pool::POOL_SHOULD_RETRY;
 use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, UdpHandler, get_default_outbound};
 use crate::proxy::{SessionCloser, SourceAddr, TargetAddr};
 use crate::utils::{copy_bidirectional, format_duration, now};
-use anyhow::{Context, bail};
+use anyhow::bail;
+use crate::utils::error::Context;
 use bytes::Bytes;
 use bytesize::ByteSize;
 use dashmap::DashMap;
@@ -901,7 +902,7 @@ pub async fn start_udp_loop(
                 );
             }
             Err(e) => {
-                error!("inbound_packet.recv_from error: {:?}", e);
+                error!("inbound_packet.recv_from error: {:#}", e);
                 break;
             }
         }

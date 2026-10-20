@@ -6,7 +6,8 @@ use crate::proxy::shadowquic_udp::{
 use crate::utils::interface::InterfaceManager;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 use crate::utils::quic_wrap::quinn_wrap::{QuinnClient, ZeroRttOutcome};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+use crate::utils::error::Context;
 use async_trait::async_trait;
 
 use futures::future::{BoxFuture, FutureExt};

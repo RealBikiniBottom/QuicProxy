@@ -3,7 +3,8 @@ pub mod vmess_impl;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use crate::utils::error::Context;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio::time::timeout;

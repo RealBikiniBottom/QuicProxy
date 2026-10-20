@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
+use crate::utils::error::Context;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http_body_util::{BodyExt, Full};

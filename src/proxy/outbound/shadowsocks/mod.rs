@@ -4,7 +4,8 @@ pub mod stream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use crate::utils::error::Context;
 use async_trait::async_trait;
 // futures used via Sink/Stream supertrait methods in vmess
 use shadowsocks::{

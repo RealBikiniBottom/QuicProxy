@@ -519,7 +519,7 @@ impl InboundSession {
         tokio::spawn(
             async move {
                 if let Err(e) = router.dispatch_stream(stream, &target, &tag, user).await {
-                    error!("Anytls inbound TCP routing error: {:?}", e);
+                    error!("Anytls inbound TCP routing error: {:#}", e);
                 }
             }
             .instrument(span),
@@ -626,7 +626,7 @@ impl InboundSession {
                     )
                     .await
                 {
-                    error!("Anytls inbound UDP routing error: {:?}", e);
+                    error!("Anytls inbound UDP routing error: {:#}", e);
                 }
             }
             .instrument(span),

@@ -23,7 +23,7 @@ use crate::proxy::shadowquic_udp::{
     start_unistream_listener, write_conn_stats_response, write_ext_error_not_available,
 };
 use crate::proxy::{TargetAddr, TlsConfig};
-use anyhow::Context;
+use crate::utils::error::Context;
 
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
 use crate::utils::quic_wrap::quinn_wrap::QuinnServer;

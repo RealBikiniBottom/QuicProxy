@@ -1,4 +1,5 @@
-use anyhow::{Context, bail};
+use anyhow::bail;
+use crate::utils::error::Context;
 use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -183,7 +184,9 @@ impl BacktraceMode {
 }
 
 fn default_backtrace() -> BacktraceMode {
-    BacktraceMode::On
+    // Release builds on Windows/iOS carry no symbols, so captured frames are
+    // all `<unknown>`; errors carry `[file:line]` via utils::error instead.
+    BacktraceMode::Off
 }
 
 fn default_log_max_size() -> Option<u64> {

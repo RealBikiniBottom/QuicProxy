@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+use crate::utils::error::Context;
 use dashmap::DashMap;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, TableDefinition, TableError,

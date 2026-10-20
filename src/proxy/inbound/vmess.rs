@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use crate::utils::read_ahead;
 use aes_gcm::{Aes128Gcm, KeyInit};
-use anyhow::{Context as _, bail};
+use anyhow::bail;
+use crate::utils::error::Context as _;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
