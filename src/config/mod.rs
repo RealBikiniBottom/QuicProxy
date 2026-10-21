@@ -412,6 +412,7 @@ pub enum TunStack {
     Lwip,
     Smoltcp,
     System,
+    Native,
 }
 
 impl Default for TunStack {
