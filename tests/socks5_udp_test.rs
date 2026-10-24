@@ -1,5 +1,5 @@
 mod common;
-use common::{TestContext, Watchdog};
+use common::{TestContext, Watchdog, bind_udp_loopback};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -260,7 +260,7 @@ async fn test_socks5_udp_large_datagrams_through_direct() {
 
         // The shared mock echo server reads into a 2 KiB buffer, so this test
         // runs its own echo server that can hold a full-size datagram.
-        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo = bind_udp_loopback().await;
         let echo_addr = echo.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 64 * 1024];
@@ -305,7 +305,7 @@ async fn test_socks5_udp_large_datagrams_through_direct() {
         context.start_proxy(config, "socks5_in").await;
 
         let (relay_addr, _stream) = context.create_socks5_udp_association().await;
-        let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_socket = bind_udp_loopback().await;
         let mut buf = vec![0u8; 64 * 1024];
 
         for size in [100usize, 2_000, 2_100, 4_096, 16_000, 60_000] {

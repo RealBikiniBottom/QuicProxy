@@ -11,6 +11,7 @@ use tokio::time::timeout;
 use tokio_rustls::{TlsConnector, rustls};
 
 use crate::config::{OutboundConfig, TransportConfig};
+use crate::proxy::outbound::dial::DialOptions;
 use crate::proxy::outbound::pool::PoolOutbound;
 use crate::proxy::outbound::transport::wrap_transport_stream;
 use crate::proxy::{
@@ -30,6 +31,7 @@ pub struct TrojanOutbound {
     pub connect_timeout: Duration,
     pub dns_server_name: Option<String>,
     pub bind_interface: Option<String>,
+    pub dial: DialOptions,
     pub pool_size: u16,
 
     password_hash: String,
@@ -68,6 +70,7 @@ impl TrojanOutbound {
             connect_timeout,
             dns_server_name: cfg.dns.clone(),
             bind_interface: cfg.bind_interface.clone(),
+            dial: DialOptions::from_config(cfg),
             pool_size,
             password_hash,
             tag,
@@ -164,9 +167,12 @@ impl AnyOutbound for TrojanOutbound {
         self.connect_timeout
     }
 
+    fn dial_options(&self) -> DialOptions {
+        self.dial
+    }
+
     async fn connect_stream_base(&self) -> anyhow::Result<AnyStream> {
-        let socket_addr = self.resolve_addr(&self.address).await?;
-        let stream = self.new_tcp_stream(socket_addr).await?;
+        let stream = self.connect_tcp(&self.address).await?;
 
         let stream: AnyStream = if self.tls.enable {
             Box::new(self.connect_tls(stream).await?)

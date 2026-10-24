@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::config::OutboundConfig;
+use crate::proxy::outbound::dial::DialOptions;
 use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo};
 use crate::proxy::{SourceAddr, TargetAddr};
 use crate::utils::new_io_other_error;
@@ -30,6 +31,7 @@ pub struct VmessOutbound {
     connect_timeout: Duration,
     dns_server_name: Option<String>,
     bind_interface: Option<String>,
+    dial: DialOptions,
 }
 
 impl VmessOutbound {
@@ -61,6 +63,7 @@ impl VmessOutbound {
             connect_timeout: cfg.connect_timeout(),
             dns_server_name: cfg.dns.clone(),
             bind_interface: cfg.bind_interface.clone(),
+            dial: DialOptions::from_config(cfg),
         }))
     }
 
@@ -115,9 +118,12 @@ impl AnyOutbound for VmessOutbound {
         self.connect_timeout
     }
 
+    fn dial_options(&self) -> DialOptions {
+        self.dial
+    }
+
     async fn connect_stream_base(&self) -> anyhow::Result<AnyStream> {
-        let proxy_addr = self.resolve_addr(&self.server).await?;
-        let stream = self.new_tcp_stream(proxy_addr).await?;
+        let stream = self.connect_tcp(&self.server).await?;
         Ok(Box::new(stream))
     }
 

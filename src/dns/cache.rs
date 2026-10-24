@@ -128,6 +128,14 @@ impl DnsCache {
         self.disk.set(key, &raw)
     }
 
+    /// Forgets the response for `key`, in memory and on disk.
+    pub fn remove(&self, key: &str) {
+        self.memory.remove(key);
+        if let Err(e) = self.disk.delete(key) {
+            tracing::debug!("dns cache delete failed for {key}: {e:#}");
+        }
+    }
+
     fn remember(&self, key: &str, response: Arc<[u8]>, expiry: u64, now: u64) {
         if self.memory.len() >= MEMORY_ENTRIES && !self.memory.contains_key(key) {
             self.memory.retain(|_, entry| entry.expiry > now);

@@ -15,6 +15,8 @@ use crate::proxy::TargetAddr;
 
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// RFC 8305 "Connection Attempt Delay".
+const DEFAULT_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 fn duration_from_secs_or(value: Option<u64>, default: Duration) -> Duration {
     value.map(Duration::from_secs).unwrap_or(default)
@@ -585,6 +587,8 @@ pub struct OutboundConfig {
     pub address: Option<String>,
     pub port: Option<u16>,
     pub connect_timeout: Option<u64>,
+    /// 多个解析地址时，发起下一次 TCP 连接尝试前等待的毫秒数；0 表示同时发起
+    pub attempt_delay_ms: Option<u64>,
     pub bind_interface: Option<String>,
 
     pub dns: Option<String>,
@@ -633,6 +637,13 @@ impl OutboundConfig {
     /// Returns the configured connection timeout, or the common 30-second default.
     pub fn connect_timeout(&self) -> Duration {
         duration_from_secs_or(self.connect_timeout, DEFAULT_CONNECT_TIMEOUT)
+    }
+
+    /// Returns the delay between staggered TCP connection attempts, or 250 ms.
+    pub fn attempt_delay(&self) -> Duration {
+        self.attempt_delay_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_ATTEMPT_DELAY)
     }
 
     /// Returns the required endpoint parsed as a proxy target address.

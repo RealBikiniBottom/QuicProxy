@@ -182,10 +182,25 @@ pub fn get_default_dns() -> Result<Arc<dyn AnyDNS>> {
     get_dns_by_tag("default_server".as_ref())
 }
 
+/// The DNS server named by `tag`, or the default one.
+pub fn dns_server_for(tag: Option<&str>) -> Result<Arc<dyn AnyDNS>> {
+    match tag {
+        Some(tag) => get_dns_by_tag(tag),
+        None => get_default_dns(),
+    }
+}
+
+/// One address for `domain`, for callers that can use only one (UDP, routing). IPv4 is
+/// kept first; IPv6 is used only when there is no A record and the server allows it.
 pub async fn resolve_domain(domain: &str, dns_server: Arc<dyn AnyDNS>) -> Result<IpAddr> {
     let now = Instant::now();
     let outbound = dns_server.default_outbound();
-    let res = dns_server.lookup(domain, false, &outbound).await?;
+    let mut res = dns_server.lookup(domain, false, &outbound).await?;
+    if res.is_empty() && !dns_server.reject_ipv6() {
+        res = dns_server
+            .lookup_with_type(domain, QTYPE::TYPE(TYPE::AAAA), &outbound)
+            .await?;
+    }
 
     let ip = res
         .choose(&mut rand::rng())
@@ -202,6 +217,42 @@ pub async fn resolve_domain(domain: &str, dns_server: Arc<dyn AnyDNS>) -> Result
     );
 
     Ok(ip)
+}
+
+/// Every address `domain` resolves to: its A and AAAA records, or only the A records when
+/// the server rejects IPv6.
+pub async fn resolve_domain_all(domain: &str, dns_server: Arc<dyn AnyDNS>) -> Result<Vec<IpAddr>> {
+    let now = Instant::now();
+    let outbound = dns_server.default_outbound();
+    let ips = dns_server.lookup(domain, true, &outbound).await?;
+    if ips.is_empty() {
+        bail!("DNS lookup failed for: {domain}");
+    }
+
+    if let Some(observer) = get_observer() {
+        observer.record_dns_time(now.elapsed().as_micros() as u64);
+    }
+    info!(
+        "resolved ips: {:?}, cost: {}",
+        ips,
+        format_duration(now.elapsed())
+    );
+
+    Ok(ips)
+}
+
+/// Every address `address` stands for, in the order the DNS answer gave them.
+pub async fn resolve_target_all(
+    address: &TargetAddr,
+    dns_server_tag: Option<&str>,
+) -> Result<Vec<SocketAddr>> {
+    match address {
+        TargetAddr::Ip(socket_addr) => Ok(vec![*socket_addr]),
+        TargetAddr::Domain(domain, port) => {
+            let ips = resolve_domain_all(domain, dns_server_for(dns_server_tag)?).await?;
+            Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, *port)).collect())
+        }
+    }
 }
 
 fn persist_realip_domains(packet: &Packet<'_>, domain: &str) {
@@ -258,12 +309,7 @@ pub async fn resolve_target(
         return Ok(*socket_addr);
     }
 
-    let dns_server = match dns_server_tag {
-        Some(tag) => get_dns_by_tag(tag)?,
-        None => get_default_dns()?,
-    };
-
-    resolve_target_base(address, dns_server).await
+    resolve_target_base(address, dns_server_for(dns_server_tag)?).await
 }
 
 pub async fn resolve_str(
@@ -277,12 +323,7 @@ pub async fn resolve_str(
     }
 
     // 否则视为域名处理
-    let dns_server = match dns_server_tag {
-        Some(tag) => get_dns_by_tag(tag)?,
-        None => get_default_dns()?,
-    };
-
-    let ip = resolve_domain(address, dns_server).await?;
+    let ip = resolve_domain(address, dns_server_for(dns_server_tag)?).await?;
     Ok(SocketAddr::new(ip, port))
 }
 
@@ -373,6 +414,10 @@ fn apply_ttl_to_response(
     }
 
     min_effective_ttl
+}
+
+fn cache_key(outbound_tag: &str, domain: &str, qtype: QTYPE) -> String {
+    format!("{outbound_tag}:{domain}:{qtype:?}")
 }
 
 fn cap_record_ttls(packet: &mut Packet<'_>, remaining_ttl: u32) {
@@ -481,6 +526,9 @@ pub trait AnyDNS: Send + Sync + 'static {
         if let Ok(ip) = IpAddr::from_str(domain) {
             return Ok(vec![ip]);
         }
+        // A server that rejects IPv6 sends no AAAA query on its own; callers that want IPv6
+        // ask for it with lookup_ipv6 or lookup_with_type.
+        let use_ipv6 = use_ipv6 && !self.reject_ipv6();
         debug!(
             "looking up domain: {} via {}, use ipv6: {}",
             domain,
@@ -572,7 +620,7 @@ pub trait AnyDNS: Send + Sync + 'static {
         let domain = question.qname.to_string();
         let qtype = question.qtype;
 
-        let cache_key = format!("{}:{}:{:?}", outbound.tag(), domain, qtype);
+        let cache_key = cache_key(outbound.tag(), &domain, qtype);
 
         let Some(byte_cache) = self.byte_cache() else {
             return self
@@ -713,6 +761,22 @@ pub trait AnyDNS: Send + Sync + 'static {
 
     fn reject_ipv6(&self) -> bool {
         false
+    }
+
+    /// Drops the cached A and AAAA answers for `domain`, so the next lookup asks upstream.
+    fn invalidate(&self, domain: &str) {
+        let Some(byte_cache) = self.byte_cache() else {
+            return;
+        };
+        let Ok(name) = Name::new(domain) else {
+            return;
+        };
+        let domain = name.to_string();
+        let outbound = self.default_outbound();
+        for qtype in [QTYPE::TYPE(TYPE::A), QTYPE::TYPE(TYPE::AAAA)] {
+            byte_cache.remove(&cache_key(outbound.tag(), &domain, qtype));
+        }
+        info!("dropped cached dns answers for {domain}");
     }
 
     fn min_ttl(&self) -> Option<Duration>;
@@ -1269,6 +1333,117 @@ impl AnyDNS for FakeIPDNS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    const FAKE_V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+    const FAKE_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+
+    /// Answers every A query with FAKE_V4 and every AAAA query with FAKE_V6.
+    struct FakeDns {
+        reject_ipv6: bool,
+        aaaa_queries: AtomicUsize,
+        outbound: Arc<dyn AnyOutbound>,
+    }
+
+    impl FakeDns {
+        fn new(reject_ipv6: bool) -> Self {
+            let cfg = serde_json::from_value(serde_json::json!({ "type": "direct" })).unwrap();
+            Self {
+                reject_ipv6,
+                aaaa_queries: AtomicUsize::new(0),
+                outbound: crate::proxy::outbound::direct::DirectOutbound::new(
+                    "direct".to_string(),
+                    &cfg,
+                )
+                .unwrap(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AnyDNS for FakeDns {
+        fn tag(&self) -> &str {
+            "fake"
+        }
+
+        fn reject_ipv6(&self) -> bool {
+            self.reject_ipv6
+        }
+
+        async fn exchange_without_cache(
+            &self,
+            packet: &Packet<'_>,
+            _outbound: Arc<dyn AnyOutbound>,
+        ) -> Result<Packet<'static>> {
+            let rdata = if packet.questions[0].qtype == QTYPE::TYPE(TYPE::AAAA) {
+                self.aaaa_queries.fetch_add(1, Ordering::SeqCst);
+                RData::AAAA(simple_dns::rdata::AAAA {
+                    address: FAKE_V6.into(),
+                })
+            } else {
+                RData::A(simple_dns::rdata::A {
+                    address: FAKE_V4.into(),
+                })
+            };
+            let mut reply = Packet::new_reply(packet.id());
+            reply.answers.push(ResourceRecord {
+                name: Name::new("example.com").unwrap(),
+                class: CLASS::IN,
+                ttl: 60,
+                rdata,
+                cache_flush: false,
+            });
+            Ok(reply)
+        }
+
+        fn default_outbound(&self) -> Arc<dyn AnyOutbound> {
+            self.outbound.clone()
+        }
+
+        fn min_ttl(&self) -> Option<Duration> {
+            None
+        }
+
+        fn max_ttl(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn rejecting_ipv6_skips_aaaa_unless_asked_for() {
+        let dns = FakeDns::new(true);
+        let outbound = dns.default_outbound();
+
+        let ips = dns.lookup("example.com", true, &outbound).await.unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(FAKE_V4)]);
+        assert_eq!(dns.aaaa_queries.load(Ordering::SeqCst), 0);
+
+        let v6 = dns.lookup_ipv6("example.com", &outbound).await.unwrap();
+        assert_eq!(v6, Some(FAKE_V6));
+        assert_eq!(dns.aaaa_queries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_all_returns_both_families_when_ipv6_allowed() {
+        let dns: Arc<dyn AnyDNS> = Arc::new(FakeDns::new(false));
+        let ips = resolve_domain_all("example.com", dns).await.unwrap();
+        assert!(ips.contains(&IpAddr::V4(FAKE_V4)));
+        assert!(ips.contains(&IpAddr::V6(FAKE_V6)));
+    }
+
+    #[tokio::test]
+    async fn resolve_all_returns_ipv4_only_when_ipv6_rejected() {
+        let dns: Arc<dyn AnyDNS> = Arc::new(FakeDns::new(true));
+        let ips = resolve_domain_all("example.com", dns).await.unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(FAKE_V4)]);
+    }
+
+    #[tokio::test]
+    async fn single_address_resolution_keeps_ipv4() {
+        let dns: Arc<dyn AnyDNS> = Arc::new(FakeDns::new(false));
+        let ip = resolve_domain("example.com", dns).await.unwrap();
+        assert_eq!(ip, IpAddr::V4(FAKE_V4));
+    }
 
     fn dns_query(name: &'static str, qtype: QTYPE) -> Packet<'static> {
         build_dns_query_packet(name, qtype).unwrap()

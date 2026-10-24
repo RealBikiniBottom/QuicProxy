@@ -30,9 +30,12 @@ use crate::{
     proxy::{
         SessionCloser, SourceAddr, TargetAddr, TlsConfig,
         anytls_proto::*,
-        outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo, select_outbound_interface},
+        outbound::{
+            AnyOutbound, AnyPacket, AnyStream, PacketInfo,
+            dial::{DialOptions, connect_tcp_target},
+        },
     },
-    utils::{interface::InterfaceManager, new_io_other_error, new_io_timeout_error},
+    utils::{interface::InterfaceManager, new_io_other_error},
 };
 
 // ─── Protocol Constants ───────────────────────────────────────────────────────
@@ -597,6 +600,7 @@ pub struct AnytlsClient {
     bind_interface: Option<String>,
     dns_server_name: Option<String>,
     disable_mux: bool,
+    dial: DialOptions,
 
     current_session: Arc<Mutex<Option<Arc<Session>>>>,
     create_session_lock: Mutex<()>,
@@ -613,6 +617,7 @@ impl AnytlsClient {
         bind_interface: Option<String>,
         dns_server_name: Option<String>,
         disable_mux: bool,
+        dial: DialOptions,
     ) -> Result<Self> {
         let mut hasher = Sha256::new();
         hasher.update(password.as_bytes());
@@ -635,6 +640,7 @@ impl AnytlsClient {
             bind_interface,
             dns_server_name,
             disable_mux,
+            dial,
             current_session: Arc::new(Mutex::new(None)),
             create_session_lock: Mutex::new(()),
             session_seq: AtomicU64::new(0),
@@ -681,19 +687,14 @@ impl AnytlsClient {
     async fn create_session(&self) -> Result<Arc<Session>> {
         let seq = self.session_seq.fetch_add(1, Ordering::Relaxed);
 
-        let socket_addr =
-            crate::dns::resolve_target(&self.address, self.dns_server_name.as_deref()).await?;
-
-        let used_interface =
-            select_outbound_interface(self.bind_interface.as_deref(), Some(socket_addr));
-
-        let tcp_stream = tokio::time::timeout(
+        let tcp_stream = connect_tcp_target(
+            &self.address,
+            self.dns_server_name.as_deref(),
+            self.bind_interface.as_deref(),
             self.connect_timeout,
-            crate::utils::socket::socket_helpers::new_tcp_stream(socket_addr, used_interface, None),
+            self.dial,
         )
-        .await
-        .map_err(|_| new_io_timeout_error("connect timeout"))?
-        .context("TCP connect failed")?;
+        .await?;
 
         let session = Session::new(
             tcp_stream,
@@ -842,6 +843,7 @@ impl AnytlsOutbound {
             cfg.bind_interface.clone(),
             cfg.dns.clone(),
             cfg.disable_mux,
+            DialOptions::from_config(cfg),
         )?;
 
         let current_session = client.current_session.clone();
@@ -1583,6 +1585,7 @@ mod tests {
             None,
             None,
             false,
+            DialOptions::default(),
         )
         .expect("create client");
 
@@ -2229,6 +2232,7 @@ mod tests {
             port: Some(go_port),
             password: Some(password.to_string()),
             connect_timeout: Some(10),
+            attempt_delay_ms: None,
             bind_interface: None,
             dns: None,
             idle_timeout: None,
@@ -2327,6 +2331,7 @@ mod tests {
             port: Some(go_port),
             password: Some(password.to_string()),
             connect_timeout: Some(10),
+            attempt_delay_ms: None,
             bind_interface: None,
             dns: None,
             idle_timeout: None,

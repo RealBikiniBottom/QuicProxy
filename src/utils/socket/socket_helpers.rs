@@ -5,6 +5,7 @@ use std::sync::Arc;
 #[cfg(not(target_os = "android"))]
 use super::platform::must_bind_socket_on_interface;
 
+use super::udp_recv::MAX_UDP_DATAGRAM;
 use futures::io;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
@@ -109,9 +110,22 @@ pub async fn new_udp_socket(
 
     set_so_mark(&socket, so_mark)?;
     socket.set_broadcast(true)?; // UDP only
+    ensure_udp_send_buffer(&socket);
     socket.set_nonblocking(true)?;
 
     UdpSocket::from_std(socket.into())
+}
+
+/// macOS rejects any datagram larger than SO_SNDBUF with EMSGSIZE, and its default
+/// (net.inet.udp.maxdgram) is only 9216 bytes. Only grows the buffer, never shrinks it.
+pub fn ensure_udp_send_buffer(socket: &socket2::Socket) {
+    if socket
+        .send_buffer_size()
+        .is_ok_and(|size| size < MAX_UDP_DATAGRAM)
+        && let Err(e) = socket.set_send_buffer_size(MAX_UDP_DATAGRAM)
+    {
+        debug!("failed to raise UDP send buffer: {e}");
+    }
 }
 
 fn bind_udp_socket(

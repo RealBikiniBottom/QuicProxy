@@ -56,8 +56,9 @@ pub const UDP_CONTEXT_ID_RECONNECT_MARGIN: u32 = 256;
 const LIVENESS_IDLE: Duration = Duration::from_secs(30);
 
 /// When traffic is flowing (we keep sending) but nothing comes back, the path is
-/// suspect much sooner than [LIVENESS_IDLE].
-const LIVENESS_SILENCE: Duration = Duration::from_secs(30);
+/// suspect after this long. Equal to [LIVENESS_IDLE] for now because shorter values
+/// (1s) probed healthy paths on ordinary jitter; kept separate so it can be lowered alone.
+const LIVENESS_SILENCE: Duration = LIVENESS_IDLE;
 
 /// Tracks whether a cached QUIC connection still receives anything from the
 /// peer. `Connection::open_bi` succeeds on a black-holed path, so stream
@@ -1039,7 +1040,7 @@ mod liveness_tests {
         assert!(!liveness.observe_at(10, 3, 1_000));
 
         let silence = 1_000 + LIVENESS_SILENCE.as_millis() as u64;
-        assert!(!liveness.observe_at(10, 3, silence));
+        assert!(!liveness.observe_at(10, 3, silence - 1));
         assert!(liveness.observe_at(10, 9, silence));
     }
 }

@@ -4,6 +4,7 @@ use crate::proxy::outbound::{AnyPacket, PacketInfo};
 use crate::proxy::router::{Router, get_router, start_udp_loop};
 use crate::proxy::{SourceAddr, TargetAddr};
 use crate::utils::new_io_timeout_error;
+use crate::utils::socket::socket_helpers::ensure_udp_send_buffer;
 use crate::utils::socket::udp_recv;
 use crate::utils::{format_duration, new_io_other_error, now};
 use async_trait::async_trait;
@@ -410,6 +411,7 @@ pub async fn handle_client(
                     UdpSocket::bind("0.0.0.0:0").await?
                 }
             };
+            ensure_udp_send_buffer(&socket2::SockRef::from(&udp_socket));
             let local_addr = udp_socket.local_addr()?;
 
             info!("Bound UDP socket for SOCKS5 ASSOCIATE at {}", local_addr);

@@ -8,6 +8,7 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::config::OutboundConfig;
+use crate::proxy::outbound::dial::DialOptions;
 use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo};
 use crate::proxy::{SourceAddr, TargetAddr};
 
@@ -23,6 +24,7 @@ pub struct Socks5Outbound {
     connect_timeout: Duration,
     dns_server_name: Option<String>,
     bind_interface: Option<String>,
+    dial: DialOptions,
 }
 
 impl Socks5Outbound {
@@ -37,6 +39,7 @@ impl Socks5Outbound {
             connect_timeout: cfg.connect_timeout(),
             dns_server_name: cfg.dns.clone(),
             bind_interface: cfg.bind_interface.clone(),
+            dial: DialOptions::from_config(cfg),
         }))
     }
 }
@@ -63,10 +66,12 @@ impl AnyOutbound for Socks5Outbound {
         self.connect_timeout
     }
 
-    async fn connect_stream_base(&self) -> anyhow::Result<AnyStream> {
-        let proxy_addr = self.resolve_addr(&self.address).await?;
+    fn dial_options(&self) -> DialOptions {
+        self.dial
+    }
 
-        let stream = self.new_tcp_stream(proxy_addr).await?;
+    async fn connect_stream_base(&self) -> anyhow::Result<AnyStream> {
+        let stream = self.connect_tcp(&self.address).await?;
         Ok(Box::new(stream))
     }
 
@@ -170,8 +175,7 @@ impl AnyOutbound for Socks5Outbound {
     }
 
     async fn connect_packet(&self, target: &TargetAddr) -> anyhow::Result<Arc<dyn AnyPacket>> {
-        let proxy_addr = self.resolve_addr(&self.address).await?;
-        let mut stream = self.new_tcp_stream(proxy_addr).await?;
+        let mut stream = self.connect_tcp(&self.address).await?;
 
         // Wrap UDP ASSOCIATE handshake in connect timeout
         let (relay_addr, _) = timeout(self.connect_timeout(), async {

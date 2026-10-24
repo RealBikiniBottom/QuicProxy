@@ -166,18 +166,12 @@ fn generate_tls() -> (NamedTempFile, NamedTempFile) {
 /// short grace period while asserting the process did not exit.
 async fn wait_until_quic_ready(child: &mut ChildGuard, name: &str) {
     let deadline = Instant::now() + START_TIMEOUT;
-    loop {
-        child.assert_running(name);
-        if Instant::now() > deadline {
-            panic!("{name} did not become ready in time");
-        }
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        child.assert_running(name);
-        // A 1.5s uptime without exiting is enough for QUIC server setup.
-        if Instant::now() >= deadline {
-            panic!("{name} did not become ready in time");
-        }
-        return;
+    child.assert_running(name);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    child.assert_running(name);
+    // A 1.5s uptime without exiting is enough for QUIC server setup.
+    if Instant::now() >= deadline {
+        panic!("{name} did not become ready in time");
     }
 }
 

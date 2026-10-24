@@ -1,4 +1,5 @@
 use crate::config::OutboundConfig;
+use crate::proxy::outbound::dial::DialOptions;
 use crate::dns::resolve_target;
 use crate::proxy::outbound::{AnyOutbound, AnyPacket, AnyStream, PacketInfo};
 use crate::proxy::{SessionCloser, SourceAddr, TargetAddr};
@@ -19,6 +20,7 @@ pub struct DirectOutbound {
     connect_timeout: Duration,
     bind_interface: Option<String>,
     dns: Option<String>,
+    dial: DialOptions,
 }
 
 struct DirectUdpOutbound {
@@ -92,6 +94,7 @@ impl DirectOutbound {
             connect_timeout: cfg.connect_timeout(),
             bind_interface: cfg.bind_interface.clone(),
             dns: cfg.dns.clone(),
+            dial: DialOptions::from_config(cfg),
         }))
     }
 }
@@ -118,9 +121,12 @@ impl AnyOutbound for DirectOutbound {
         self.connect_timeout
     }
 
+    fn dial_options(&self) -> DialOptions {
+        self.dial
+    }
+
     async fn connect_stream(&self, target: &TargetAddr) -> Result<AnyStream> {
-        let addr = resolve_target(target, self.dns_server_name()).await?;
-        let stream = self.new_tcp_stream(addr).await?;
+        let stream = self.connect_tcp(target).await?;
 
         Ok(Box::new(stream))
     }

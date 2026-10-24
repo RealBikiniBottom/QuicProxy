@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 
 /// Largest UDP payload (IPv6 without jumbograms); IPv4 tops out slightly lower.
-const MAX_UDP_DATAGRAM: usize = 64 * 1024;
+pub const MAX_UDP_DATAGRAM: usize = 64 * 1024;
 
 thread_local! {
     // One full-size buffer per worker thread instead of one per UDP session: a
@@ -56,6 +56,10 @@ mod tests {
     async fn datagrams_larger_than_mtu_arrive_whole() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // macOS caps outgoing datagrams at the send buffer size (net.inet.udp.maxdgram, 9216).
+        socket2::SockRef::from(&sender)
+            .set_send_buffer_size(MAX_UDP_DATAGRAM)
+            .unwrap();
         let payload: Vec<u8> = (0..16_000u32).map(|i| i as u8).collect();
 
         sender

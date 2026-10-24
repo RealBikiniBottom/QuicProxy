@@ -1,4 +1,5 @@
 pub mod anytls;
+pub mod dial;
 pub mod direct;
 pub mod dns;
 pub mod http;
@@ -17,6 +18,7 @@ use crate::utils::error::Context;
 use anytls::AnytlsOutbound;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use dial::DialOptions;
 use direct::DirectOutbound;
 use dns::DnsOutbound;
 use hysteria2::Hysteria2Outbound;
@@ -554,6 +556,22 @@ pub trait AnyOutbound: Send + Sync {
 
     async fn resolve_addr(&self, address: &TargetAddr) -> anyhow::Result<SocketAddr> {
         resolve_target(address, self.dns_server_name()).await
+    }
+
+    fn dial_options(&self) -> DialOptions {
+        DialOptions::default()
+    }
+
+    /// Opens a TCP connection to `address`, trying each address its domain resolves to.
+    async fn connect_tcp(&self, address: &TargetAddr) -> anyhow::Result<TcpStream> {
+        dial::connect_tcp_target(
+            address,
+            self.dns_server_name(),
+            self.bind_interface(),
+            self.connect_timeout(),
+            self.dial_options(),
+        )
+        .await
     }
 
     async fn new_tcp_stream(&self, connect_to: SocketAddr) -> io::Result<TcpStream> {
