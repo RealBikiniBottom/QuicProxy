@@ -37,12 +37,17 @@ run_client: build
 run_web_manager: build
 	./target/release/quicproxy --manage --port 8081 --web-dir ./src/premium/quicproxy_flutter/build/web
 
+# USE_MIMALLOC=1 时给 build / build-xcframework / build-android 加上 mimalloc feature
 USE_MIMALLOC ?= 0
-CARGO_FLAGS = --release
-
-ifeq ($(USE_MIMALLOC), 1)
-	CARGO_FLAGS += --features mimalloc
+MIMALLOC_FEATURE := $(if $(filter 1,$(USE_MIMALLOC)),mimalloc,)
+# mimalloc 把空闲内存还给系统前等待的毫秒数（mimalloc v3 默认 1000；0 立即归还，-1 不归还）。
+# 编译期写进二进制，仅 USE_MIMALLOC=1 时生效；运行时设置了同名环境变量则以环境变量为准。
+MIMALLOC_PURGE_DELAY ?=
+ifneq ($(strip $(MIMALLOC_PURGE_DELAY)),)
+export MIMALLOC_PURGE_DELAY
 endif
+
+CARGO_FLAGS = --release $(if $(MIMALLOC_FEATURE),--features $(MIMALLOC_FEATURE),)
 
 build:
 	cargo build $(CARGO_FLAGS)
@@ -71,7 +76,7 @@ clean:
 build-android:
 	# cargo install cargo-ndk
 	rustup target add aarch64-linux-android armv7-linux-androideabi
-	cargo ndk -t arm64-v8a -t armeabi-v7a -o ./src/premium/quicproxy_flutter/android/app/src/main/jniLibs build --release --features "jni,premium" --lib
+	cargo ndk -t arm64-v8a -t armeabi-v7a -o ./src/premium/quicproxy_flutter/android/app/src/main/jniLibs build --release --features "jni,premium $(MIMALLOC_FEATURE)" --lib
 
 # ── Flutter Android 打包（需先执行 build-android 准备好 Rust core） ──
 FLUTTER_DIR = ./src/premium/quicproxy_flutter
@@ -104,22 +109,25 @@ apk-verify:
 	@echo "--- Certificate details ---"
 	keytool -printcert -jarfile $(APK_OUTPUT) 2>/dev/null || echo "keytool not available"
 
+# CARGO_UPDATE=1 时先 cargo update（会把 quinn-jls 等 git 依赖拉到最新，可能带来不兼容的 API 变化）
+CARGO_UPDATE ?= 0
+
 build-xcframework:
-	cargo update
+	$(if $(filter 1,$(CARGO_UPDATE)),cargo update,@true)
 	rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
 	@# iOS device
 	IPHONEOS_DEPLOYMENT_TARGET=14.0 \
-	cargo build --release --target aarch64-apple-ios --features "premium" --lib
+	cargo build --release --target aarch64-apple-ios --features "premium $(MIMALLOC_FEATURE)" --lib
 	@# iOS simulator
 	IPHONEOS_DEPLOYMENT_TARGET=14.0 \
-	cargo build --release --target aarch64-apple-ios-sim --features "premium" --lib
+	cargo build --release --target aarch64-apple-ios-sim --features "premium $(MIMALLOC_FEATURE)" --lib
 	IPHONEOS_DEPLOYMENT_TARGET=14.0 \
-	cargo build --release --target x86_64-apple-ios --features "premium" --lib
+	cargo build --release --target x86_64-apple-ios --features "premium $(MIMALLOC_FEATURE)" --lib
 	@# macOS
 	MACOSX_DEPLOYMENT_TARGET=11.0 \
-	cargo build --release --target aarch64-apple-darwin --features "apple-network-extension" --lib
+	cargo build --release --target aarch64-apple-darwin --features "apple-network-extension $(MIMALLOC_FEATURE)" --lib
 	MACOSX_DEPLOYMENT_TARGET=11.0 \
-	cargo build --release --target x86_64-apple-darwin --features "apple-network-extension" --lib
+	cargo build --release --target x86_64-apple-darwin --features "apple-network-extension $(MIMALLOC_FEATURE)" --lib
 	@# Merge iOS simulator fat binary
 	mkdir -p target/ios-simulator-fat
 	lipo -create \

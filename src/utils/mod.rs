@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+pub mod allocator;
 pub mod elevate;
 pub mod error;
 pub mod http_outbound;

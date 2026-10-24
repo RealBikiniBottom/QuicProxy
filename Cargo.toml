@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = ["quinn","premium"]
 quinn = []
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 jni = ["dep:jni"]
 premium = ["dep:tun-rs"]
 apple-network-extension = ["premium"]
@@ -17,7 +17,8 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 jni = { version = "0.21", optional = true }
-mimalloc = { version = "0", optional = true, default-features = false }
+mimalloc = { version = "0", optional = true}
+libmimalloc-sys = { version = "0.1", optional = true, default-features = false, features = ["extended"] }
 arc-swap = "1"
 async-trait = "0"
 bytes = "1"

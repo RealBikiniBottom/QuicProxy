@@ -28,6 +28,10 @@ where
     std::mem::forget(_reload_handle);
     std::mem::forget(_file_guard);
 
+    if let Some(delay) = crate::utils::allocator::apply_mimalloc_options() {
+        info!("mimalloc purge_delay = {delay}ms (compile-time)");
+    }
+
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     InterfaceManager::init();
