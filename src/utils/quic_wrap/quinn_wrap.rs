@@ -1,5 +1,5 @@
-use anyhow::bail;
 use crate::utils::error::Context as _;
+use anyhow::bail;
 use arc_swap::ArcSwap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::{Pin, pin};
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::future::{BoxFuture, FutureExt, Shared};
+use futures::future::FutureExt;
 use quinn::{
     ClientConfig, MtuDiscoveryConfig, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
 };
@@ -21,13 +21,42 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::config::AuthUser;
 use crate::utils::new_io_other_error;
-use crate::utils::socket::socket_helpers::try_create_dualstack_udpsocket;
+use crate::utils::socket::socket_helpers::{
+    try_create_dualstack_udpsocket, tune_quic_socket_buffers,
+};
 
 use super::{QuicBistream, QuicConnection, QuicUnistream};
 
-/// Resolves to whether the server accepted 0-RTT; `false` also when the
-/// connection failed before the handshake finished.
-pub type ZeroRttOutcome = Shared<BoxFuture<'static, bool>>;
+/// Resolves once the server answered a stream opened during 0-RTT: `true` when
+/// it accepted the early data, `false` when it rejected it or the connection
+/// failed before the handshake finished.
+pub fn zero_rtt_verdict(
+    conn: &quinn::Connection,
+    send: &SendStream,
+) -> impl Future<Output = bool> + Send + 'static {
+    let conn = conn.clone();
+    let stopped = send.stopped();
+    async move {
+        if conn.authenticated().await.is_err() {
+            return false;
+        }
+        // After the handshake a rejected 0-RTT stream fails right away, while
+        // an accepted one stays pending until the peer is done with it.
+        !matches!(
+            stopped.now_or_never(),
+            Some(Err(quinn::StoppedError::ZeroRttRejected))
+        )
+    }
+}
+
+/// Synchronous form of [`zero_rtt_verdict`]: `true` only once the handshake
+/// finished and the server rejected the 0-RTT data `send` was opened with.
+pub fn zero_rtt_rejected(send: &SendStream) -> bool {
+    matches!(
+        send.stopped().now_or_never(),
+        Some(Err(quinn::StoppedError::ZeroRttRejected))
+    )
+}
 
 // 300Mbps has a bandwidth-delay product of about 3.75MB at 100ms RTT. These
 // windows leave enough headroom for that workload while keeping each QUIC
@@ -400,6 +429,7 @@ impl QuinnServer {
         server_config.transport_config(transport_config.clone());
 
         let socket = try_create_dualstack_udpsocket(addr)?;
+        tune_quic_socket_buffers(&socket);
         let runtime =
             quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
         let endpoint = quinn::Endpoint::new(
@@ -438,7 +468,7 @@ impl QuinnServer {
                     // instead of one round trip later. JLS authentication
                     // already ran on the ClientHello inside `accept`.
                     let connection = match connecting.into_0rtt() {
-                        Ok((connection, _)) => connection,
+                        Ok(connection) => connection,
                         Err(connecting) => match connecting.await {
                             Ok(connection) => connection,
                             Err(e) => {
@@ -573,6 +603,7 @@ impl QuinnClient {
     }
 
     pub fn rebind(&self, socket: std::net::UdpSocket) -> io::Result<()> {
+        tune_quic_socket_buffers(&socket);
         self.endpoint.rebind(socket)
     }
 
@@ -585,6 +616,7 @@ impl QuinnClient {
         zero_rtt: bool,
         is_jls: bool,
     ) -> anyhow::Result<Self> {
+        tune_quic_socket_buffers(&socket);
         let runtime =
             quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
         let endpoint =
@@ -636,44 +668,39 @@ impl QuinnClient {
         Self::from_config(socket, client_config, server_name, zero_rtt, is_jls)
     }
 
+    /// With 0-RTT the connection is returned before the handshake finished;
+    /// whether the server accepted the early data is decided per stream, see
+    /// [`zero_rtt_verdict`].
     pub async fn connect(&self, remote_addr: SocketAddr) -> anyhow::Result<Arc<quinn::Connection>> {
-        Ok(self.connect_with_0rtt(remote_addr).await?.0)
-    }
-
-    /// Returns the outcome of 0-RTT when the connection was opened with early
-    /// data, `None` when it is already a fully established 1-RTT connection.
-    pub async fn connect_with_0rtt(
-        &self,
-        remote_addr: SocketAddr,
-    ) -> anyhow::Result<(Arc<quinn::Connection>, Option<ZeroRttOutcome>)> {
         let conn = self.endpoint.connect(remote_addr, &self.sni)?;
-        let (raw_conn, outcome) = if self.zero_rtt {
+        let raw_conn = if self.zero_rtt {
             match conn.into_0rtt() {
-                Ok((x, accepted)) => {
-                    let outcome = accepted.boxed().shared();
+                Ok(x) => {
                     let conn_clone = x.clone();
                     let is_jls_clone = self.is_jls;
-                    let accepted = outcome.clone();
                     tokio::spawn(async move {
-                        info!("zero rtt accepted: {}", accepted.await);
+                        if conn_clone.authenticated().await.is_err() {
+                            return;
+                        }
+                        info!("0-rtt quic connection established");
                         if is_jls_clone && conn_clone.is_jls() == Some(false) {
                             error!("JLS hijacked or wrong pwd/iv");
                             conn_clone.close(0u8.into(), b"");
                         }
                     });
                     trace!("trying 0-rtt quic connection");
-                    (x, Some(outcome))
+                    x
                 }
                 Err(e) => {
                     let x = e.await?;
                     info!("1-rtt quic connection established");
-                    (x, None)
+                    x
                 }
             }
         } else {
             let x = conn.await?;
             info!("1-rtt quic connection established");
-            (x, None)
+            x
         };
 
         if self.is_jls && raw_conn.is_jls() == Some(false) {
@@ -681,7 +708,7 @@ impl QuinnClient {
             bail!("JLS hijacked or wrong pwd/iv");
         }
 
-        Ok((Arc::new(raw_conn), outcome))
+        Ok(Arc::new(raw_conn))
     }
 }
 
@@ -731,7 +758,9 @@ impl quinn::rustls::client::danger::ServerCertVerifier for SkipServerVerificatio
 mod tests {
     use super::*;
 
-    async fn resumed_connection_accepts_0rtt(is_jls: bool) -> bool {
+    /// `forget_tickets` swaps in a fresh server session store before the client
+    /// resumes, so the server can no longer accept its 0-RTT data.
+    async fn resumed_connection_accepts_0rtt(is_jls: bool, forget_tickets: bool) -> bool {
         let users = [AuthUser {
             username: "user".to_string(),
             password: "password".to_string(),
@@ -754,6 +783,7 @@ mod tests {
         )
         .unwrap();
         let server_addr = server.endpoint.local_addr().unwrap();
+        let updater = server.updater();
         tokio::spawn(async move {
             while let Ok(conn) = server.accept().await {
                 tokio::spawn(async move { conn.closed().await });
@@ -795,20 +825,44 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         first.close(0u32.into(), b"");
 
-        let resumed = client.endpoint.connect(server_addr, &client.sni).unwrap();
-        let (_conn, accepted) = resumed
+        if forget_tickets {
+            let mut crypto = (**updater.crypto.load()).clone();
+            crypto.session_storage =
+                quinn::rustls::server::ServerSessionMemoryCache::new(SERVER_SESSION_CACHE_SIZE);
+            updater.apply(crypto).unwrap();
+        }
+
+        let resumed = client
+            .endpoint
+            .connect(server_addr, &client.sni)
+            .unwrap()
             .into_0rtt()
             .unwrap_or_else(|_| panic!("no session ticket to resume (jls={is_jls})"));
-        accepted.await
+        let (mut send, recv) = resumed.open_bi().await.unwrap();
+        assert!(recv.is_0rtt(), "a resumed stream is sent as 0-RTT");
+        send.write_all(b"early").await.unwrap();
+        let accepted = zero_rtt_verdict(&resumed, &send).await;
+        assert_eq!(zero_rtt_rejected(&send), !accepted);
+        accepted
     }
 
     #[tokio::test]
     async fn resumed_connection_accepts_0rtt_without_jls() {
-        assert!(resumed_connection_accepts_0rtt(false).await);
+        assert!(resumed_connection_accepts_0rtt(false, false).await);
     }
 
     #[tokio::test]
     async fn resumed_connection_accepts_0rtt_with_jls() {
-        assert!(resumed_connection_accepts_0rtt(true).await);
+        assert!(resumed_connection_accepts_0rtt(true, false).await);
+    }
+
+    #[tokio::test]
+    async fn forgotten_ticket_rejects_0rtt_without_jls() {
+        assert!(!resumed_connection_accepts_0rtt(false, true).await);
+    }
+
+    #[tokio::test]
+    async fn forgotten_ticket_rejects_0rtt_with_jls() {
+        assert!(!resumed_connection_accepts_0rtt(true, true).await);
     }
 }

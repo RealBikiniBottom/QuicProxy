@@ -39,7 +39,7 @@ serde_path_to_error = "0"
 smallvec = "1"
 sha2 = "0.10"
 socket2 = "0"
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1", features = ["full"] }
 tracing = "0"
 tracing-subscriber = { version = "0", features = ["env-filter"] }
 quinn = { package = "quinn", git = "https://github.com/spongebob888/quinn-jls", branch = "jls-main", default-features = false, features = ["runtime-tokio", "rustls-ring"]}
@@ -105,7 +105,13 @@ windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock", "Win
 [profile.dev]
 panic = "unwind"
 
+# panic must stay "unwind": apple.rs / android.rs catch panics at the FFI boundary.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3.24.0"
 
 [build-dependencies]

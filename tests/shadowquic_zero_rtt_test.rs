@@ -9,10 +9,11 @@ mod common;
 use common::TestContext;
 use common::shadowquic::{client_config, jls_client_config, jls_server_config, server_config};
 use quicproxy::config::AuthUser;
-use quicproxy::utils::quic_wrap::quinn_wrap::{QuinnClient, QuinnServer};
+use quicproxy::utils::quic_wrap::quinn_wrap::{QuinnClient, QuinnServer, zero_rtt_verdict};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -25,6 +26,12 @@ const ZERO_RTT_ROUNDS: usize = 3;
 /// Forward UDP between clients and `server`, delaying every packet by
 /// [ONE_WAY_DELAY] in each direction.
 async fn spawn_delay_relay(server: SocketAddr) -> SocketAddr {
+    spawn_switchable_relay(Arc::new(Mutex::new(server))).await
+}
+
+/// Like [spawn_delay_relay], but each new client address is forwarded to
+/// whatever `server` holds at the time its first packet arrives.
+async fn spawn_switchable_relay(server: Arc<Mutex<SocketAddr>>) -> SocketAddr {
     let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let relay_addr = relay.local_addr().unwrap();
 
@@ -39,7 +46,8 @@ async fn spawn_delay_relay(server: SocketAddr) -> SocketAddr {
                 Some(socket) => socket.clone(),
                 None => {
                     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-                    socket.connect(server).await.unwrap();
+                    let target = *server.lock().unwrap();
+                    socket.connect(target).await.unwrap();
                     let (reader, relay) = (socket.clone(), relay.clone());
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 65535];
@@ -269,8 +277,9 @@ async fn test_shadowquic_zero_rtt_survives_busy_server() {
 
     let test_fut = async {
         let client = quic_client(client_socket());
-        let (first, outcome) = client.connect_with_0rtt(addr).await.unwrap();
-        assert!(outcome.is_none(), "a fresh client has no session ticket");
+        let first = client.connect(addr).await.unwrap();
+        let (_send, recv) = first.open_bi().await.unwrap();
+        assert!(!recv.is_0rtt(), "a fresh client has no session ticket");
         tokio::time::sleep(Duration::from_millis(200)).await;
         first.close(0u32.into(), b"");
 
@@ -291,10 +300,12 @@ async fn test_shadowquic_zero_rtt_survives_busy_server() {
             }
         }
 
-        let (_resumed, outcome) = client.connect_with_0rtt(addr).await.unwrap();
-        let outcome = outcome.expect("the client still holds a session ticket");
+        let resumed = client.connect(addr).await.unwrap();
+        let (mut send, recv) = resumed.open_bi().await.unwrap();
+        assert!(recv.is_0rtt(), "the client still holds a session ticket");
+        send.write_all(b"early").await.unwrap();
         assert!(
-            outcome.await,
+            zero_rtt_verdict(&resumed, &send).await,
             "server rejected 0-RTT after {} other clients connected",
             OTHER_CLIENTS
         );
@@ -303,4 +314,88 @@ async fn test_shadowquic_zero_rtt_survives_busy_server() {
     tokio::time::timeout(Duration::from_secs(60), test_fut)
         .await
         .expect("busy-server 0-RTT test timed out after 60s");
+}
+
+/// TCP echo target that counts how many proxied connections reached it.
+async fn spawn_counting_echo() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = stream.split();
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+    (addr, accepted)
+}
+
+/// A client resumes with a ticket the server no longer knows, so the server
+/// rejects the 0-RTT request. It must be replayed on a new connection and reach
+/// the target exactly once.
+#[tokio::test]
+async fn test_shadowquic_rejected_zero_rtt_is_replayed_once() {
+    let mut ctx = TestContext::new().await;
+
+    let start_server = async |ctx: &mut TestContext| {
+        let mut cfg = server_config("user", "testpassword");
+        cfg["inbounds"]["sq_in"]["idle_timeout"] = serde_json::json!(IDLE_TIMEOUT_SECS);
+        cfg["inbounds"]["sq_in"]["tls"]["zero_rtt"] = serde_json::json!(true);
+        let idx = ctx.start_proxy(cfg, "sq_in").await;
+        ctx.proxies[idx].addr
+    };
+    let first_server = start_server(&mut ctx).await;
+    let fresh_server = start_server(&mut ctx).await;
+
+    let upstream = Arc::new(Mutex::new(first_server));
+    let relay = spawn_switchable_relay(upstream.clone()).await;
+
+    let mut client_cfg = client_config("user", "testpassword", relay.port(), None);
+    client_cfg["outbounds"]["servers"]["sq_out"]["idle_timeout"] =
+        serde_json::json!(IDLE_TIMEOUT_SECS);
+    client_cfg["outbounds"]["servers"]["sq_out"]["tls"]["zero_rtt"] = serde_json::json!(true);
+    ctx.start_proxy(client_cfg, "socks_in").await;
+    let proxy = ctx.last_proxy().addr;
+
+    let (target, accepted) = spawn_counting_echo().await;
+
+    let test_fut = async {
+        timed_echo(proxy, target, b"cold").await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+        // Let the cached connection idle out, then point new connections at a
+        // server that never issued the client's ticket.
+        tokio::time::sleep(Duration::from_secs(IDLE_TIMEOUT_SECS + 2)).await;
+        *upstream.lock().unwrap() = fresh_server;
+
+        let elapsed = timed_echo(proxy, target, b"rejected-0rtt").await;
+        println!(
+            "rejected 0-RTT request: {:?} ({:.2} RTT)",
+            elapsed,
+            rtts(elapsed)
+        );
+        // Give a stray duplicate time to show up before counting.
+        tokio::time::sleep(RTT * 2).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "the rejected request must reach the target exactly once"
+        );
+
+        let reused = timed_echo(proxy, target, b"after-replay").await;
+        assert!(
+            reused < RTT * 3 / 2,
+            "the replacement connection should be reused, took {:?}",
+            reused
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    };
+
+    tokio::time::timeout(Duration::from_secs(60), test_fut)
+        .await
+        .expect("rejected 0-RTT test timed out after 60s");
 }

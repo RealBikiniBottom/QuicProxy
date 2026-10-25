@@ -222,6 +222,81 @@ pub fn try_create_dualstack_tcplistener(addr: SocketAddr) -> io::Result<TcpListe
     Ok(listener)
 }
 
+/// Socket buffer size requested for QUIC endpoints. The system defaults (about
+/// 208 KiB on Linux) overflow during bursts at a few hundred Mbps; the dropped
+/// datagrams look like congestion to BBR and cap throughput. quic-go asks for 7 MiB.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+const QUIC_SOCKET_BUFFER: usize = 2 * 1024 * 1024;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+const QUIC_SOCKET_BUFFER: usize = 8 * 1024 * 1024;
+
+/// Grows the receive and send buffers of a QUIC endpoint socket towards
+/// [`QUIC_SOCKET_BUFFER`]. Never shrinks them, and failures are only logged.
+pub fn tune_quic_socket_buffers(socket: &std::net::UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+    grow_buffer(
+        "receive",
+        || sock.recv_buffer_size(),
+        |size| sock.set_recv_buffer_size(size),
+    );
+    grow_buffer(
+        "send",
+        || sock.send_buffer_size(),
+        |size| sock.set_send_buffer_size(size),
+    );
+
+    // Linux silently caps SO_RCVBUF at net.core.rmem_max; with CAP_NET_ADMIN
+    // (servers usually run as root) SO_RCVBUFFORCE bypasses that cap.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if sock
+        .recv_buffer_size()
+        .is_ok_and(|size| size < QUIC_SOCKET_BUFFER)
+    {
+        use std::os::fd::AsRawFd;
+        let size = QUIC_SOCKET_BUFFER as libc::c_int;
+        // SAFETY: valid fd and a c_int option value of the right length.
+        let ret = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUFFORCE,
+                &size as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            debug!(
+                "SO_RCVBUFFORCE failed, QUIC receive buffer stays capped by rmem_max: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Requests `QUIC_SOCKET_BUFFER`, halving on rejection (macOS refuses sizes
+/// above kern.ipc.maxsockbuf instead of capping them) until the current size.
+fn grow_buffer(
+    kind: &str,
+    get: impl Fn() -> std::io::Result<usize>,
+    set: impl Fn(usize) -> std::io::Result<()>,
+) {
+    let current = get().unwrap_or(0);
+    let mut size = QUIC_SOCKET_BUFFER;
+    while size > current {
+        match set(size) {
+            Ok(()) => {
+                trace!("QUIC socket {kind} buffer set to {size}");
+                return;
+            }
+            Err(e) => {
+                trace!("QUIC socket {kind} buffer {size} rejected: {e}");
+                size /= 2;
+            }
+        }
+    }
+    debug!("QUIC socket {kind} buffer left at {current}");
+}
+
 pub fn try_create_dualstack_udpsocket(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     let (socket, _dualstack) = try_create_dualstack_socket(addr, socket2::Type::DGRAM)?;
 

@@ -5,6 +5,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -27,7 +28,7 @@ use crate::utils::keyed_notify::KeyedNotify;
 use crate::utils::new_io_other_error;
 use crate::utils::now;
 use crate::utils::now_millis;
-use crate::utils::quic_wrap::quinn_wrap::{QuinnBistream, ZeroRttOutcome};
+use crate::utils::quic_wrap::quinn_wrap::{QuinnBistream, zero_rtt_rejected};
 use crate::utils::read_ahead;
 
 use super::SourceAddr;
@@ -122,7 +123,11 @@ pub struct PerConnectionState {
     pub udp_recv_map: UdpRecvMap,
     pub udp_recv_map_notify: Arc<KeyedNotify>,
     pub waiting_datagram_buffer: WaitingDatagramBuffer,
-    pub zero_rtt: Option<ZeroRttOutcome>,
+    /// The auth stream when it was sent as 0-RTT. The server only serves
+    /// authenticated connections, so its fate decides whether 1-RTT streams on
+    /// this connection are still usable.
+    pub zero_rtt_auth: Option<quinn::SendStream>,
+    zero_rtt_rejected: AtomicBool,
 }
 
 impl PerConnectionState {
@@ -134,23 +139,22 @@ impl PerConnectionState {
             udp_recv_map,
             udp_recv_map_notify: Arc::new(KeyedNotify::new()),
             waiting_datagram_buffer: Arc::new(DashMap::new()),
-            zero_rtt: None,
+            zero_rtt_auth: None,
+            zero_rtt_rejected: AtomicBool::new(false),
         }
     }
 
-    /// The 0-RTT outcome while it is still unknown or turned out rejected;
-    /// `None` once the connection is known to be fully usable.
-    pub fn unsettled_zero_rtt(&self) -> Option<ZeroRttOutcome> {
-        self.zero_rtt
-            .as_ref()
-            .filter(|outcome| outcome.peek() != Some(&true))
-            .cloned()
+    /// Records that a stream on this connection saw its 0-RTT data rejected.
+    /// Returns `true` only for the first such stream.
+    pub fn mark_zero_rtt_rejected(&self) -> bool {
+        !self.zero_rtt_rejected.swap(true, Ordering::AcqRel)
     }
 
+    /// True once any stream, or the 0-RTT auth stream, saw the server reject
+    /// early data on this connection.
     pub fn zero_rtt_rejected(&self) -> bool {
-        self.zero_rtt
-            .as_ref()
-            .is_some_and(|outcome| outcome.peek() == Some(&false))
+        self.zero_rtt_rejected.load(Ordering::Acquire)
+            || self.zero_rtt_auth.as_ref().is_some_and(zero_rtt_rejected)
     }
 }
 

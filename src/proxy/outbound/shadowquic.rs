@@ -3,11 +3,11 @@ use crate::proxy::shadowquic_udp::{
     UDP_CONTEXT_ID_RECONNECT_MARGIN, gen_sunny_auth_hash, run_bistream_recv_listener,
     start_datagram_loop, start_unistream_listener,
 };
+use crate::utils::error::Context;
 use crate::utils::interface::InterfaceManager;
 use crate::utils::quic_wrap::quinn_wrap::QuinnBistream;
-use crate::utils::quic_wrap::quinn_wrap::{QuinnClient, ZeroRttOutcome};
+use crate::utils::quic_wrap::quinn_wrap::{QuinnClient, zero_rtt_verdict};
 use anyhow::{Result, bail};
-use crate::utils::error::Context;
 use async_trait::async_trait;
 
 use futures::future::{BoxFuture, FutureExt};
@@ -355,9 +355,6 @@ impl ShadowQuicOutbound {
                     conn.stable_id(),
                     conn.remote_address()
                 );
-                if let Some(outcome) = state.zero_rtt.clone() {
-                    self.evict_on_zero_rtt_rejection(&conn, outcome);
-                }
                 let result = (conn.clone(), state.clone());
                 *lock = Some((conn, client, state));
                 Ok(result)
@@ -370,25 +367,57 @@ impl ShadowQuicOutbound {
         }
     }
 
-    fn evict_on_zero_rtt_rejection(&self, conn: &Arc<quinn::Connection>, outcome: ZeroRttOutcome) {
+    /// Wraps the 0-RTT verdict of one stream so that the first stream on a
+    /// connection that sees a rejection closes it and evicts it from the cache.
+    fn watch_zero_rtt(
+        &self,
+        conn: &Arc<quinn::Connection>,
+        state: &Arc<PerConnectionState>,
+        verdict: impl Future<Output = bool> + Send + 'static,
+    ) -> BoxFuture<'static, bool> {
         let cache = self.cached_client.clone();
         let conn = conn.clone();
+        let state = state.clone();
         let tag = self.tag.clone();
-        tokio::spawn(async move {
-            if outcome.await {
-                return;
+        async move {
+            let accepted = verdict.await;
+            if !accepted && state.mark_zero_rtt_rejected() {
+                warn!(
+                    "[{}] server rejected 0-RTT on quic connection {}, replaying on a new one",
+                    tag,
+                    conn.stable_id()
+                );
+                conn.close(CONN_UNHEALTHY_CLOSE_CODE.into(), ZERO_RTT_REJECTED_REASON);
+                let mut lock = cache.lock().await;
+                if matches!(&*lock, Some((cached, _, _)) if cached.stable_id() == conn.stable_id())
+                {
+                    *lock = None;
+                }
             }
-            warn!(
-                "[{}] server rejected 0-RTT on quic connection {}, replaying on a new one",
-                tag,
-                conn.stable_id()
-            );
-            conn.close(CONN_UNHEALTHY_CLOSE_CODE.into(), ZERO_RTT_REJECTED_REASON);
-            let mut lock = cache.lock().await;
-            if matches!(&*lock, Some((cached, _, _)) if cached.stable_id() == conn.stable_id()) {
-                *lock = None;
-            }
-        });
+            accepted
+        }
+        .boxed()
+    }
+
+    /// The 0-RTT verdict of a freshly opened stream, `None` when the stream is
+    /// already known to be usable.
+    ///
+    /// A 1-RTT stream still needs one when early data was rejected: the server
+    /// never saw the 0-RTT auth stream, so it would not serve this one either.
+    fn stream_zero_rtt_verdict(
+        &self,
+        conn: &Arc<quinn::Connection>,
+        state: &Arc<PerConnectionState>,
+        send: &quinn::SendStream,
+        recv: &quinn::RecvStream,
+    ) -> Option<BoxFuture<'static, bool>> {
+        if recv.is_0rtt() {
+            Some(self.watch_zero_rtt(conn, state, zero_rtt_verdict(conn, send)))
+        } else if state.zero_rtt_rejected() {
+            Some(self.watch_zero_rtt(conn, state, std::future::ready(false)))
+        } else {
+            None
+        }
     }
 
     async fn establish_connection(
@@ -420,29 +449,35 @@ impl ShadowQuicOutbound {
             })?,
         );
 
-        let (conn, zero_rtt) =
-            tokio::time::timeout(self.connect_timeout, client.connect_with_0rtt(remote_addr))
-                .await
-                .map_err(|_| {
-                    new_io_other_error(format!(
-                        "ShadowQuic connect timeout after {:?} to {}",
-                        self.connect_timeout, remote_addr
-                    ))
-                })?
-                .map_err(|e| {
-                    new_io_other_error(format!(
-                        "ShadowQuic connect failed to {}: {:?}",
-                        remote_addr, e
-                    ))
-                })?;
+        let conn = tokio::time::timeout(self.connect_timeout, client.connect(remote_addr))
+            .await
+            .map_err(|_| {
+                new_io_other_error(format!(
+                    "ShadowQuic connect timeout after {:?} to {}",
+                    self.connect_timeout, remote_addr
+                ))
+            })?
+            .map_err(|e| {
+                new_io_other_error(format!(
+                    "ShadowQuic connect failed to {}: {:?}",
+                    remote_addr, e
+                ))
+            })?;
 
-        if let Some(auth_hash) = self.auth_hash {
-            self.send_auth(&conn, auth_hash).await?;
-        }
+        let zero_rtt_auth = match self.auth_hash {
+            Some(auth_hash) => self.send_auth(&conn, auth_hash).await?,
+            None => None,
+        };
 
         let mut state = PerConnectionState::new();
-        state.zero_rtt = zero_rtt;
+        let auth_verdict = zero_rtt_auth
+            .as_ref()
+            .map(|send| zero_rtt_verdict(&conn, send));
+        state.zero_rtt_auth = zero_rtt_auth;
         let state = Arc::new(state);
+        if let Some(verdict) = auth_verdict {
+            tokio::spawn(self.watch_zero_rtt(&conn, &state, verdict));
+        }
 
         match self.udp_mod {
             UdpMode::OverStream => start_unistream_listener(
@@ -466,12 +501,14 @@ impl ShadowQuicOutbound {
     /// serving any request and closes the connection when it fails, so any
     /// error here must abort establishment instead of caching an unusable
     /// connection.
+    ///
+    /// Returns the auth stream when it went out as 0-RTT data.
     async fn send_auth(
         &self,
         conn: &quinn::Connection,
         auth_hash: [u8; SUNNY_QUIC_AUTH_LEN],
-    ) -> anyhow::Result<()> {
-        let (mut send, _recv) = tokio::time::timeout(self.connect_timeout, conn.open_bi())
+    ) -> anyhow::Result<Option<quinn::SendStream>> {
+        let (mut send, recv) = tokio::time::timeout(self.connect_timeout, conn.open_bi())
             .await
             .map_err(|_| {
                 new_io_other_error(format!(
@@ -492,7 +529,7 @@ impl ShadowQuicOutbound {
         send.flush().await.context("failed to flush auth packet")?;
         let _ = send.finish();
 
-        Ok(())
+        Ok(recv.is_0rtt().then_some(send))
     }
 
     /// Open a stream on the cached connection, retrying once on a fresh
@@ -612,8 +649,9 @@ impl ShadowQuicOutbound {
     )> {
         for _ in 0..2 {
             let opened = self.open_udp_bistream_with_capacity().await?;
-            let accepted = match opened.3.unsettled_zero_rtt() {
-                Some(outcome) => outcome.await,
+            let (conn, send, recv, state) = &opened;
+            let accepted = match self.stream_zero_rtt_verdict(conn, state, send, recv) {
+                Some(verdict) => verdict.await,
                 None => true,
             };
             if accepted {
@@ -743,9 +781,10 @@ impl AnyOutbound for ShadowQuicOutbound {
             );
         }
 
+        let verdict = self.stream_zero_rtt_verdict(&conn, &state, &send, &recv);
         let stream: AnyStream = Box::new(QuinnBistream::new(send, recv));
-        Ok(match state.unsettled_zero_rtt() {
-            Some(outcome) => Box::new(ZeroRttStream::new(stream, outcome, self.tag.clone())),
+        Ok(match verdict {
+            Some(verdict) => Box::new(ZeroRttStream::new(stream, verdict, self.tag.clone())),
             None => stream,
         })
     }
@@ -823,7 +862,7 @@ enum ZeroRttPhase {
 /// again on a new connection without the caller noticing.
 struct ZeroRttStream {
     inner: AnyStream,
-    outcome: ZeroRttOutcome,
+    outcome: BoxFuture<'static, bool>,
     sent: Vec<u8>,
     shutdown: bool,
     tag: String,
@@ -831,7 +870,7 @@ struct ZeroRttStream {
 }
 
 impl ZeroRttStream {
-    fn new(inner: AnyStream, outcome: ZeroRttOutcome, tag: String) -> Self {
+    fn new(inner: AnyStream, outcome: BoxFuture<'static, bool>, tag: String) -> Self {
         Self {
             inner,
             outcome,
@@ -990,7 +1029,7 @@ mod zero_rtt_stream_tests {
     ) {
         let (local, remote) = tokio::io::duplex(4 * ZERO_RTT_REPLAY_LIMIT);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let outcome = async move { rx.await.unwrap_or(false) }.boxed().shared();
+        let outcome = async move { rx.await.unwrap_or(false) }.boxed();
         let stream = ZeroRttStream::new(Box::new(local), outcome, "test".to_string());
         (stream, remote, tx)
     }
