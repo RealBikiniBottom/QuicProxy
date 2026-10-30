@@ -684,13 +684,21 @@ fn render_qr_text(data: &str) -> Option<String> {
     Some(out)
 }
 
-fn system_instance() -> &'static Mutex<System> {
+fn system_instance() -> Option<&'static Mutex<System>> {
     static SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
-    SYSTEM.get_or_init(|| Mutex::new(System::new_all()))
+    if let Some(system) = SYSTEM.get() {
+        return Some(system);
+    }
+    // Don't cache a failed init so later requests can retry.
+    let system = System::new_all().ok()?;
+    Some(SYSTEM.get_or_init(|| Mutex::new(system)))
 }
 
 async fn get_runtime_core_version() -> Result<impl IntoResponse, StatusCode> {
-    let mut system = system_instance().lock().unwrap_or_else(|e| e.into_inner());
+    let mut system = system_instance()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     system.refresh_memory();
 
     Ok(Json(build_core_version_response(&system)))
@@ -713,13 +721,13 @@ fn build_core_version_response(system: &System) -> CoreVersionResponse {
 
 fn build_system_info(system: &System) -> SystemInfoResponse {
     SystemInfoResponse {
-        os_name: System::name(),
-        os_version: System::os_version(),
-        kernel_version: System::kernel_version(),
-        host_name: System::host_name(),
+        os_name: System::name().ok(),
+        os_version: System::os_version().ok(),
+        kernel_version: System::kernel_version().ok(),
+        host_name: System::host_name().ok(),
         arch: std::env::consts::ARCH.to_string(),
         cpu_count: system.cpus().len(),
-        uptime_secs: System::uptime(),
+        uptime_secs: System::uptime().unwrap_or(0),
     }
 }
 

@@ -99,12 +99,12 @@ async fn handle_system_info(
     sys.refresh_memory();
 
     let info = SystemInfoResponse {
-        os_name: System::name(),
-        os_version: System::os_version(),
-        kernel_version: System::kernel_version(),
-        host_name: System::host_name(),
+        os_name: System::name().ok(),
+        os_version: System::os_version().ok(),
+        kernel_version: System::kernel_version().ok(),
+        host_name: System::host_name().ok(),
         cpu_count: sys.cpus().len(),
-        uptime_secs: System::uptime(),
+        uptime_secs: System::uptime().unwrap_or(0),
     };
 
     Ok(Json(info))
@@ -124,7 +124,7 @@ async fn handle_cpu(
         .iter()
         .map(|cpu| CpuInfo {
             name: cpu.name().to_string(),
-            usage: cpu.cpu_usage(),
+            usage: cpu.usage(),
             frequency: cpu.frequency(),
         })
         .collect();
