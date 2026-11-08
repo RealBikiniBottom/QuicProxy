@@ -28,18 +28,31 @@ if (-not $binaries) { throw "no .exe/.dll found under $root" }
 
 $errors = @()
 foreach ($bin in $binaries) {
-  $deps = & dumpbin /NOLOGO /DEPENDENTS $bin.FullName |
-    ForEach-Object { $_.ToString().Trim() } |
-    Where-Object { $_ -match '^[^\s]+\.dll$' }
+  # dumpbin lists normal imports, then (optionally) delay-load imports.
+  # Delay-loaded DLLs are optional at startup (e.g. jni's jvm.dll), so only
+  # the VC++ runtime rules apply to them.
+  $deps = @()
+  $section = ""
+  foreach ($line in (& dumpbin /NOLOGO /DEPENDENTS $bin.FullName)) {
+    $t = $line.ToString().Trim()
+    if ($t -match '^Image has the following delay load dependencies') { $section = "delay"; continue }
+    if ($t -match '^Image has the following dependencies') { $section = "normal"; continue }
+    if ($t -eq "Summary") { break }
+    if ($section -and $t -match '^[^\s]+\.dll$') {
+      $deps += [pscustomobject]@{ Name = $t; Delay = ($section -eq "delay") }
+    }
+  }
   $rel = $bin.FullName.Substring($root.Length).TrimStart('\', '/')
-  foreach ($dep in $deps) {
+  foreach ($d in $deps) {
+    $dep = $d.Name
     $local = Test-Path (Join-Path $bin.DirectoryName $dep)
     if ($dep -match $debugCrt) {
       $errors += "${rel}: imports debug CRT $dep"
     } elseif ($dep -match $vcRuntime) {
       if (-not $local) { $errors += "${rel}: imports $dep but it is not shipped next to it" }
-    } elseif ($dep -match '^(api|ext)-ms-') {
-      # API sets are resolved by the loader.
+    } elseif ($d.Delay -or $dep -match '^(api|ext)-ms-' -or $dep -ieq 'jvm.dll') {
+      # Delay-loaded imports are optional; API sets are resolved by the loader;
+      # jvm.dll (package:jni) is only loaded when a JVM is spawned.
     } elseif (-not $local -and -not (Test-Path (Join-Path $system32 $dep))) {
       $errors += "${rel}: imports $dep which is neither shipped nor in System32"
     }
