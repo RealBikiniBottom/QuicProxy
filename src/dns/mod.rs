@@ -24,9 +24,11 @@ use tracing::{debug, error, info, warn};
 
 mod cache;
 mod doh;
+pub mod ecs;
 pub use cache::DnsCache;
 use cache::Flight;
 use doh::DohClient;
+use ecs::{ClientSubnet, ClientSubnetPolicy};
 
 static DNS_MAP: LazyLock<DashMap<String, Arc<dyn AnyDNS>>> = LazyLock::new(DashMap::new);
 static BLOCK_DDR: AtomicBool = AtomicBool::new(false);
@@ -416,8 +418,16 @@ fn apply_ttl_to_response(
     min_effective_ttl
 }
 
-fn cache_key(outbound_tag: &str, domain: &str, qtype: QTYPE) -> String {
-    format!("{outbound_tag}:{domain}:{qtype:?}")
+fn cache_key(
+    outbound_tag: &str,
+    domain: &str,
+    qtype: QTYPE,
+    subnet: Option<ClientSubnet>,
+) -> String {
+    match subnet {
+        Some(subnet) => format!("{outbound_tag}:{domain}:{qtype:?}:ecs={subnet}"),
+        None => format!("{outbound_tag}:{domain}:{qtype:?}"),
+    }
 }
 
 fn cap_record_ttls(packet: &mut Packet<'_>, remaining_ttl: u32) {
@@ -607,11 +617,18 @@ pub trait AnyDNS: Send + Sync + 'static {
         None
     }
 
+    /// The EDNS Client Subnet this server adds to upstream queries.
+    fn client_subnet(&self) -> Option<&ClientSubnetPolicy> {
+        None
+    }
+
     async fn exchange_with_cache(
         &self,
         packet: &Packet<'_>,
         outbound: Arc<dyn AnyOutbound>,
     ) -> Result<Packet<'static>> {
+        let adjusted = self.client_subnet().and_then(|p| p.apply(packet));
+        let packet = adjusted.as_ref().unwrap_or(packet);
         if packet.questions.is_empty() {
             return self.exchange_without_cache(packet, outbound).await;
         }
@@ -620,7 +637,7 @@ pub trait AnyDNS: Send + Sync + 'static {
         let domain = question.qname.to_string();
         let qtype = question.qtype;
 
-        let cache_key = cache_key(outbound.tag(), &domain, qtype);
+        let cache_key = cache_key(outbound.tag(), &domain, qtype, ecs::get(packet));
 
         let Some(byte_cache) = self.byte_cache() else {
             return self
@@ -753,8 +770,11 @@ pub trait AnyDNS: Send + Sync + 'static {
                 .map(|b| b.to_vec())
                 .map_err(|e| anyhow!("Failed to build DNS reply: {e}"));
         }
-        self.exchange_with_cache(&packet, self.default_outbound())
-            .await?
+        let mut response = self
+            .exchange_with_cache(&packet, self.default_outbound())
+            .await?;
+        ecs::restore_response(&mut response, ecs::get(&packet), packet.opt().is_some());
+        response
             .build_bytes_vec()
             .map_err(|e| anyhow!("Failed to build DNS response: {e}"))
     }
@@ -773,8 +793,9 @@ pub trait AnyDNS: Send + Sync + 'static {
         };
         let domain = name.to_string();
         let outbound = self.default_outbound();
+        let subnet = self.client_subnet().map(|p| p.subnet);
         for qtype in [QTYPE::TYPE(TYPE::A), QTYPE::TYPE(TYPE::AAAA)] {
-            byte_cache.remove(&cache_key(outbound.tag(), &domain, qtype));
+            byte_cache.remove(&cache_key(outbound.tag(), &domain, qtype, subnet));
         }
         info!("dropped cached dns answers for {domain}");
     }
@@ -791,6 +812,10 @@ pub trait AnyDNS: Send + Sync + 'static {
     }
 }
 
+fn client_subnet_policy(cfg: &DnsServerConfig) -> Result<Option<ClientSubnetPolicy>> {
+    ClientSubnetPolicy::from_config(cfg.client_subnet.as_deref(), cfg.client_subnet_override)
+}
+
 pub struct UdpDns {
     pub tag: String,
     pub address: TargetAddr,
@@ -799,6 +824,7 @@ pub struct UdpDns {
     pub outbound: Arc<dyn AnyOutbound>,
     pub byte_cache: DnsByteCache,
     pub reject_ipv6: bool,
+    pub client_subnet: Option<ClientSubnetPolicy>,
 }
 
 impl UdpDns {
@@ -842,6 +868,7 @@ impl UdpDns {
             outbound,
             byte_cache,
             reject_ipv6,
+            client_subnet: client_subnet_policy(cfg)?,
         }))
     }
 }
@@ -858,6 +885,10 @@ impl AnyDNS for UdpDns {
 
     fn reject_ipv6(&self) -> bool {
         self.reject_ipv6
+    }
+
+    fn client_subnet(&self) -> Option<&ClientSubnetPolicy> {
+        self.client_subnet.as_ref()
     }
 
     async fn exchange_without_cache(
@@ -916,6 +947,7 @@ pub struct HttpsDns {
     client: DohClient,
     dns_server_name: Option<String>,
     pub reject_ipv6: bool,
+    client_subnet: Option<ClientSubnetPolicy>,
 }
 
 impl HttpsDns {
@@ -961,6 +993,7 @@ impl HttpsDns {
             byte_cache,
             client,
             reject_ipv6,
+            client_subnet: client_subnet_policy(cfg)?,
         }))
     }
 }
@@ -977,6 +1010,10 @@ impl AnyDNS for HttpsDns {
 
     fn reject_ipv6(&self) -> bool {
         self.reject_ipv6
+    }
+
+    fn client_subnet(&self) -> Option<&ClientSubnetPolicy> {
+        self.client_subnet.as_ref()
     }
 
     fn dns_server(&self) -> Option<&str> {

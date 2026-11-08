@@ -896,6 +896,7 @@ async fn test_dns_cache_shares_concurrent_misses_and_serves_hits() {
             outbound: outbound.clone(),
             byte_cache: Some(DnsCache::new_with_tag(cache_tag, "cached_udp").unwrap()),
             reject_ipv6: false,
+            client_subnet: None,
         };
 
         let a = QTYPE::TYPE(TYPE::A);

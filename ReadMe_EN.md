@@ -55,6 +55,7 @@ Inbound:
 - AnyTLS
 - AnyTLS-JLS
 - Trojan
+- DNS (DNS-over-HTTPS, RFC 8484, JLS supported)
 
 Outbound:
 

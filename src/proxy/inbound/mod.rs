@@ -1,4 +1,5 @@
 pub mod anytls;
+pub mod doh;
 pub mod http;
 pub mod mix;
 pub mod shadowquic;
@@ -13,6 +14,7 @@ use crate::premium::tun::tun::TunInbound;
 
 use crate::config::{AuthUser, Config};
 use crate::proxy::inbound::anytls::AnytlsInbound;
+use crate::proxy::inbound::doh::DohInbound;
 use crate::proxy::inbound::http::HttpInbound;
 use crate::proxy::inbound::mix::MixInbound;
 use crate::proxy::inbound::shadowquic::ShadowQuicInbound;
@@ -112,6 +114,7 @@ pub fn init_inbounds(cfg: &Config) -> anyhow::Result<mpsc::UnboundedReceiver<any
             "trojan" => Arc::new(TrojanInbound::new(name_clone, item, merged_users.clone())?),
             "anytls" => Arc::new(AnytlsInbound::new(name_clone, item, merged_users.clone())?),
             "vmess" => Arc::new(VmessInbound::new(name_clone, item, merged_users.clone())?),
+            "dns" => Arc::new(DohInbound::new(name_clone, item)?),
             #[cfg(feature = "premium")]
             "tun" => Arc::new(TunInbound::new(name_clone, item)),
             #[cfg(not(feature = "premium"))]

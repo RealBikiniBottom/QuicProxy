@@ -27,8 +27,8 @@ hex = "0"
 base64 = "0"
 simple-dns = "0"
 reqwest = { version = "0", default-features = false, features = ["rustls-tls", "json", "socks"] }
-hyper = { version = "1", features = ["client", "http1", "http2"] }
-hyper-util = { version = "0", features = ["client", "http1", "http2", "tokio"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0", features = ["client", "server", "server-auto", "service", "http1", "http2", "tokio"] }
 http-body-util = "0"
 rand = "0.10"
 httparse = "1"
@@ -114,6 +114,8 @@ codegen-units = 1
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3.24.0"
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "https-ring"] }
+reqwest = { version = "0", default-features = false, features = ["rustls-tls", "http2"] }
 
 [build-dependencies]
 chrono = { version = "0", default-features = false, features = ["clock", "std"] }

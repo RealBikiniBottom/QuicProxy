@@ -1059,6 +1059,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "enum-as-inner"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1430,7 +1442,7 @@ dependencies = [
  "futures-channel",
  "futures-io",
  "futures-util",
- "hickory-proto",
+ "hickory-proto 0.26.3",
  "idna",
  "ipnet",
  "jni 0.22.4",
@@ -1438,6 +1450,36 @@ dependencies = [
  "thiserror 2.0.21",
  "tinyvec",
  "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "hickory-proto"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8a6fe56c0038198998a6f217ca4e7ef3a5e51f46163bd6dd60b5c71ca6c6502"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cfg-if",
+ "data-encoding",
+ "enum-as-inner",
+ "futures-channel",
+ "futures-io",
+ "futures-util",
+ "h2",
+ "http",
+ "idna",
+ "ipnet",
+ "once_cell",
+ "rand 0.9.5",
+ "ring",
+ "rustls 0.23.36 (git+https://github.com/spongebob888/rustls-jls?branch=jls-main)",
+ "thiserror 2.0.21",
+ "tinyvec",
+ "tokio",
+ "tokio-rustls 0.26.6",
  "tracing",
  "url",
 ]
@@ -1464,6 +1506,27 @@ dependencies = [
 
 [[package]]
 name = "hickory-resolver"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc62a9a99b0bfb44d2ab95a7208ac952d31060efc16241c87eaf36406fecf87a"
+dependencies = [
+ "cfg-if",
+ "futures-util",
+ "hickory-proto 0.25.2",
+ "moka",
+ "once_cell",
+ "parking_lot",
+ "rand 0.9.5",
+ "rustls 0.23.36 (git+https://github.com/spongebob888/rustls-jls?branch=jls-main)",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tracing",
+]
+
+[[package]]
+name = "hickory-resolver"
 version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3da5255c95d5a716857d54b5b8f4e8d67c3484d3beaaaae2ce25063b3ba981"
@@ -1471,7 +1534,7 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "hickory-net",
- "hickory-proto",
+ "hickory-proto 0.26.3",
  "ipconfig",
  "ipnet",
  "jni 0.22.4",
@@ -2868,6 +2931,7 @@ dependencies = [
  "futures",
  "hashbrown 0.17.1",
  "hex",
+ "hickory-resolver 0.25.2",
  "hmac 0.12.1",
  "http-body-util",
  "httparse",
@@ -3206,6 +3270,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -3550,7 +3615,7 @@ dependencies = [
  "cfg-if",
  "dynosaur",
  "futures",
- "hickory-resolver",
+ "hickory-resolver 0.26.3",
  "libc",
  "log",
  "lru_time_cache",

@@ -363,6 +363,11 @@ pub struct DnsServerConfig {
     pub range: Option<Vec<String>>,
     #[serde(default)]
     pub reject_ipv6: bool,
+    /// EDNS Client Subnet added to upstream queries, e.g. `"203.0.113.0/24"`.
+    pub client_subnet: Option<String>,
+    /// Replace a client subnet the query already carries instead of keeping it.
+    #[serde(default)]
+    pub client_subnet_override: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -469,6 +474,23 @@ pub struct InboundConfig {
     pub tun_fd: Option<i32>,
     #[serde(default)]
     pub tun_stack: TunStack,
+    /// DNS inbound: the DNS server tag answering queries. Defaults to the default server.
+    pub dns: Option<String>,
+    /// DNS inbound: the DNS-over-HTTPS request path. Defaults to `/dns-query`.
+    pub path: Option<String>,
+    /// DNS inbound ECS: unset passes the client's through, `"auto"` derives it from the
+    /// client address, `"strip"` removes it, or a fixed subnet such as `"198.51.100.0/24"`.
+    pub client_subnet: Option<String>,
+    /// DNS inbound: prefix lengths for `client_subnet: "auto"`. Default 24 / 56.
+    pub client_subnet_prefix: Option<ClientSubnetPrefix>,
+    /// DNS inbound: take the client address from this header, e.g. `X-Forwarded-For`.
+    pub client_subnet_header: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct ClientSubnetPrefix {
+    pub ipv4: Option<u8>,
+    pub ipv6: Option<u8>,
 }
 
 impl InboundConfig {

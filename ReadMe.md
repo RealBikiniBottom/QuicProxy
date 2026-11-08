@@ -57,6 +57,7 @@ curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/s
 - AnyTLS
 - AnyTLS-JLS
 - Trojan
+- DNS（DNS-over-HTTPS，RFC 8484，支持 JLS）
 
 出站：
 
