@@ -156,6 +156,24 @@ async fn test_speedtest_through_trojan() {
     assert!(snap.summary.idle_rtt_ms.is_some());
     assert!(snap.summary.loaded_rtt_ms.is_some());
     assert!(snap.summary.jitter_ms.is_some());
+    // Trojan is not QUIC: no data RTT, so no power; utilization still exists.
+    assert!(snap.samples.iter().all(|s| s.data_rtt_ms.is_none()));
+    assert_eq!(snap.summary.down_data_rtt_ms, None);
+    assert_eq!(snap.summary.down_power, None);
+    assert_eq!(snap.summary.up_power, None);
+    assert!(
+        snap.summary
+            .down_utilization
+            .is_some_and(|u| u > 0.0 && u <= 1.0)
+    );
+    // Per-second loss: UDP echo for every node, QUIC never for trojan.
+    assert!(snap.samples.iter().all(|s| s.quic_loss_pct.is_none()));
+    assert!(
+        snap.samples
+            .iter()
+            .any(|s| s.udp_loss_pct.is_some_and(|l| (0.0..=100.0).contains(&l))),
+        "no per-second UDP loss"
+    );
     assert!(
         snap.summary.udp_loss_pct.is_some(),
         "UDP echo never answered"

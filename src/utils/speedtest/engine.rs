@@ -18,9 +18,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use super::proto::{self, SPEEDTEST_DOMAIN};
-use super::{Mode, Phase, SpeedTestTask};
+use super::{Mode, Phase, SampleInput, SpeedTestTask};
 use crate::proxy::TargetAddr;
-use crate::proxy::outbound::{AnyOutbound, AnyStream};
+use crate::proxy::outbound::{AnyOutbound, AnyStream, PathState};
 
 /// Idle latency measurement at the start of a round.
 pub(super) const IDLE_LATENCY: Duration = Duration::from_secs(3);
@@ -28,6 +28,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(1);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const UDP_INTERVAL: Duration = Duration::from_millis(50);
 const UDP_PROBE_LEN: usize = 32;
+/// Bound on the server-side stats query so a slow answer under load does not
+/// hold up the 1 s sampler for long.
+const DOWNLINK_STATE_TIMEOUT: Duration = Duration::from_secs(1);
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
 /// Samples taken this early in a phase are dropped from the summary, since
@@ -366,11 +369,27 @@ async fn sampler(task: Arc<SpeedTestTask>, outbound: Arc<dyn AnyOutbound>) {
         let secs = now.duration_since(last_at).as_secs_f64().max(0.001);
         let down_bps = ((bytes.0 - last_bytes.0) as f64 * 8.0 / secs) as u64;
         let up_bps = ((bytes.1 - last_bytes.1) as f64 * 8.0 / secs) as u64;
-        let quic = outbound
-            .get_uplink_state()
-            .await
-            .map(|s| (s.lost_packets, s.sent_packets));
-        task.on_sample(down_bps, up_bps, last_gen, quic);
+        let phase = task.phase();
+        let uplink = outbound.get_uplink_state().await;
+        // The server's RTT estimate is the one fed by download data packets;
+        // query it only while downloading.
+        let downlink = if phase == Phase::Download {
+            timeout(DOWNLINK_STATE_TIMEOUT, outbound.get_downlink_state())
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let quic = uplink.as_ref().map(|s| (s.lost_packets, s.sent_packets));
+        task.on_sample(SampleInput {
+            down_bps,
+            up_bps,
+            gen_at_start: last_gen,
+            quic,
+            data_rtt_ms: data_rtt_ms(phase, uplink.as_ref(), downlink.as_ref()),
+            data_path: data_path(phase, uplink.as_ref(), downlink.as_ref()),
+        });
         last_bytes = bytes;
         last_at = now;
         last_gen = task.phase_gen();
@@ -383,6 +402,40 @@ async fn sampler(task: Arc<SpeedTestTask>, outbound: Arc<dyn AnyOutbound>) {
         {
             task.stop(Some("max_bytes"));
         }
+    }
+}
+
+/// RTT of the QUIC connection as seen by the side that sends the phase's
+/// data: the server while downloading, the client otherwise. Falls back to
+/// the other side's estimate when one is unavailable (hysteria2 has no
+/// server-side query).
+pub(super) fn data_rtt_ms(
+    phase: Phase,
+    uplink: Option<&PathState>,
+    downlink: Option<&PathState>,
+) -> Option<f64> {
+    let valid = |s: Option<&PathState>| {
+        s.map(|s| s.rtt as f64)
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .map(|r| (r * 100.0).round() / 100.0)
+    };
+    match phase {
+        Phase::Download => valid(downlink).or_else(|| valid(uplink)),
+        _ => valid(uplink).or_else(|| valid(downlink)),
+    }
+}
+
+/// Loss counters of the side sending the phase's data: (server side, lost,
+/// sent). Unlike the RTT there is no fallback: the client's counters during a
+/// download count its ACKs, not the data.
+pub(super) fn data_path(
+    phase: Phase,
+    uplink: Option<&PathState>,
+    downlink: Option<&PathState>,
+) -> Option<(bool, u64, u64)> {
+    match phase {
+        Phase::Download => downlink.map(|s| (true, s.lost_packets, s.sent_packets)),
+        _ => uplink.map(|s| (false, s.lost_packets, s.sent_packets)),
     }
 }
 
@@ -431,5 +484,64 @@ impl AsyncWrite for CountingStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(rtt: f32) -> PathState {
+        PathState {
+            lost_packets: 0,
+            sent_packets: 0,
+            mtu: 1200,
+            rtt,
+        }
+    }
+
+    #[test]
+    fn data_path_counts_the_sending_side_only() {
+        let mut up = path(20.0);
+        up.lost_packets = 1;
+        up.sent_packets = 100;
+        let mut down = path(30.0);
+        down.lost_packets = 7;
+        down.sent_packets = 900;
+        assert_eq!(
+            data_path(Phase::Download, Some(&up), Some(&down)),
+            Some((true, 7, 900))
+        );
+        // hysteria2 while downloading: the client's counters are ACKs.
+        assert_eq!(data_path(Phase::Download, Some(&up), None), None);
+        assert_eq!(
+            data_path(Phase::Upload, Some(&up), Some(&down)),
+            Some((false, 1, 100))
+        );
+        assert_eq!(
+            data_path(Phase::IdleLatency, Some(&up), None),
+            Some((false, 1, 100))
+        );
+    }
+
+    #[test]
+    fn data_rtt_follows_the_sending_side() {
+        let up = path(20.0);
+        let down = path(35.555);
+        assert_eq!(
+            data_rtt_ms(Phase::Download, Some(&up), Some(&down)),
+            Some(35.56)
+        );
+        assert_eq!(
+            data_rtt_ms(Phase::Upload, Some(&up), Some(&down)),
+            Some(20.0)
+        );
+        // hysteria2: no server-side estimate.
+        assert_eq!(data_rtt_ms(Phase::Download, Some(&up), None), Some(20.0));
+        // Non-QUIC outbounds report nothing.
+        assert_eq!(data_rtt_ms(Phase::Upload, None, None), None);
+        assert_eq!(data_path(Phase::Upload, None, None), None);
+        // A connection with no RTT sample yet is ignored.
+        assert_eq!(data_rtt_ms(Phase::Upload, Some(&path(0.0)), None), None);
     }
 }

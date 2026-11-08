@@ -162,7 +162,43 @@ pub struct Sample {
     pub phase: Phase,
     pub down_bps: u64,
     pub up_bps: u64,
+    /// TCP ping RTT through the tunnel.
     pub rtt_ms: Option<f64>,
+    /// RTT estimate of the QUIC connection carrying the transfer; absent for
+    /// non-QUIC outbounds.
+    pub data_rtt_ms: Option<f64>,
+    /// UDP echo loss over this sample's interval; absent when fewer than
+    /// [`MIN_UDP_SENT`] probes were sent.
+    pub udp_loss_pct: Option<f64>,
+    /// QUIC packet loss of the side sending this interval's data (server while
+    /// downloading, client otherwise); absent for non-QUIC outbounds, when the
+    /// server cannot report it, or below [`MIN_QUIC_SENT`] packets.
+    pub quic_loss_pct: Option<f64>,
+}
+
+/// Fewest UDP probes in an interval for a per-sample loss figure.
+pub const MIN_UDP_SENT: u64 = 5;
+/// Fewest QUIC packets in an interval for a per-sample loss figure.
+pub const MIN_QUIC_SENT: u64 = 10;
+
+/// What the sampler measured over one interval.
+pub(super) struct SampleInput {
+    pub down_bps: u64,
+    pub up_bps: u64,
+    /// Phase generation at the start of the interval.
+    pub gen_at_start: u64,
+    /// Client-side (lost, sent) QUIC packet counters, for the summary.
+    pub quic: Option<(u64, u64)>,
+    pub data_rtt_ms: Option<f64>,
+    /// (lost, sent) counters of the side sending the data, and whether that
+    /// side is the server.
+    pub data_path: Option<(bool, u64, u64)>,
+}
+
+/// Loss in percent from counter deltas; None below `min_sent`.
+pub(super) fn interval_loss_pct(lost: u64, sent: u64, min_sent: u64) -> Option<f64> {
+    (sent >= min_sent && sent > 0)
+        .then(|| ((lost as f64 * 100.0 / sent as f64).min(100.0) * 100.0).round() / 100.0)
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -220,6 +256,11 @@ struct Inner {
     round_t_ms: u64,
     rounds: VecDeque<Round>,
     quic_last: Option<(u64, u64)>,
+    /// UDP (sent, lost) totals at the previous sample.
+    udp_mark: (u64, u64),
+    /// Data-path counters at the previous sample: (server side, phase gen,
+    /// lost, sent).
+    data_path_mark: Option<(bool, u64, u64, u64)>,
     stop_reason: Option<String>,
     error: Option<String>,
     finished_at: Option<Instant>,
@@ -334,7 +375,15 @@ impl SpeedTestTask {
         inner.round.udp_lost += lost;
     }
 
-    fn on_sample(&self, down_bps: u64, up_bps: u64, gen_at_start: u64, quic: Option<(u64, u64)>) {
+    fn on_sample(&self, input: SampleInput) {
+        let SampleInput {
+            down_bps,
+            up_bps,
+            gen_at_start,
+            quic,
+            data_rtt_ms,
+            data_path,
+        } = input;
         let t_ms = self.elapsed_ms();
         let warmup = engine::warmup(self.req.phase_secs);
         let mut inner = self.lock();
@@ -345,10 +394,18 @@ impl SpeedTestTask {
             Phase::Download if clean => {
                 inner.total.down.push(down_bps);
                 inner.round.down.push(down_bps);
+                if let Some(rtt) = data_rtt_ms {
+                    inner.total.down_data_rtt.push(rtt);
+                    inner.round.down_data_rtt.push(rtt);
+                }
             }
             Phase::Upload if clean => {
                 inner.total.up.push(up_bps);
                 inner.round.up.push(up_bps);
+                if let Some(rtt) = data_rtt_ms {
+                    inner.total.up_data_rtt.push(rtt);
+                    inner.round.up_data_rtt.push(rtt);
+                }
             }
             _ => {}
         }
@@ -363,6 +420,30 @@ impl SpeedTestTask {
             inner.round.quic_now = Some(q);
             inner.quic_last = Some(q);
         }
+        let udp_now = (inner.total.udp_sent, inner.total.udp_lost);
+        let (sent0, lost0) = inner.udp_mark;
+        inner.udp_mark = udp_now;
+        let udp_loss_pct = interval_loss_pct(
+            udp_now.1.saturating_sub(lost0),
+            udp_now.0.saturating_sub(sent0),
+            MIN_UDP_SENT,
+        );
+        // Deltas only within one phase and one side, so a stale reading from
+        // an earlier download is never diffed against the current one.
+        let cur_gen = inner.phase_gen;
+        let quic_loss_pct = match (data_path, inner.data_path_mark) {
+            (Some((server, lost, sent)), Some((server0, gen0, lost0, sent0)))
+                if server == server0 && cur_gen == gen0 =>
+            {
+                interval_loss_pct(
+                    lost.saturating_sub(lost0),
+                    sent.saturating_sub(sent0),
+                    MIN_QUIC_SENT,
+                )
+            }
+            _ => None,
+        };
+        inner.data_path_mark = data_path.map(|(server, lost, sent)| (server, cur_gen, lost, sent));
         let seq = inner.next_seq;
         inner.next_seq += 1;
         let sample = Sample {
@@ -372,6 +453,9 @@ impl SpeedTestTask {
             down_bps,
             up_bps,
             rtt_ms: inner.current.rtt_ms,
+            data_rtt_ms,
+            udp_loss_pct,
+            quic_loss_pct,
         };
         if inner.samples.len() >= MAX_SAMPLES {
             inner.samples.pop_front();
@@ -381,6 +465,10 @@ impl SpeedTestTask {
 
     fn phase_gen(&self) -> u64 {
         self.lock().phase_gen
+    }
+
+    fn phase(&self) -> Phase {
+        self.lock().phase
     }
 
     fn udp_sent(&self, n: u64) {
@@ -559,6 +647,8 @@ pub fn start(req: SpeedTestRequest) -> Result<Arc<SpeedTestTask>, StartError> {
             round_t_ms: 0,
             rounds: VecDeque::new(),
             quic_last: None,
+            udp_mark: (0, 0),
+            data_path_mark: None,
             stop_reason: None,
             error: None,
             finished_at: None,
@@ -594,5 +684,21 @@ pub fn stop(id: &str) -> bool {
 pub fn stop_all() {
     for task in tasks().iter() {
         task.stop(None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_loss_needs_enough_packets() {
+        assert_eq!(interval_loss_pct(1, 20, MIN_UDP_SENT), Some(5.0));
+        assert_eq!(interval_loss_pct(0, 4, MIN_UDP_SENT), None);
+        assert_eq!(interval_loss_pct(0, 0, 0), None);
+        assert_eq!(interval_loss_pct(1, 3, 1), Some(33.33));
+        // Losses are detected late, so one interval can report more losses
+        // than it sent.
+        assert_eq!(interval_loss_pct(30, 20, MIN_UDP_SENT), Some(100.0));
     }
 }

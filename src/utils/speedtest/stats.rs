@@ -33,6 +33,52 @@ pub struct Summary {
     pub quic_loss_pct: Option<f64>,
     pub probe_timeouts: u64,
     pub errors: u64,
+    /// Mean rate over peak rate of the direction's samples (ρ in [0, 1]).
+    pub down_utilization: Option<f64>,
+    pub up_utilization: Option<f64>,
+    /// Mean RTT of the QUIC connection carrying the transfer (ms); absent for
+    /// non-QUIC outbounds.
+    pub down_data_rtt_ms: Option<f64>,
+    pub up_data_rtt_ms: Option<f64>,
+    /// Normalised Kleinrock power ρ / (data RTT / 50 ms); see [`power`].
+    pub down_power: Option<f64>,
+    pub up_power: Option<f64>,
+}
+
+/// Delay that normalises power.
+pub const POWER_REFERENCE_RTT_MS: f64 = 50.0;
+
+/// Power figures of one direction.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct Power {
+    pub utilization: Option<f64>,
+    pub data_rtt_ms: Option<f64>,
+    pub power: Option<f64>,
+}
+
+/// Normalised Kleinrock power P = ρ / (D / 50 ms) over a phase's samples.
+///
+/// ρ = mean rate / peak rate: the test saturates the link, so its peak rate
+/// stands in for the capacity. D is the arithmetic mean of the data RTTs
+/// (the QUIC connection's RTT estimate) sampled alongside the rates.
+pub(super) fn power(rates: &[u64], data_rtts: &[f64]) -> Power {
+    let peak = rates.iter().copied().max().unwrap_or(0);
+    let utilization = (peak > 0).then(|| {
+        let mean = rates.iter().map(|&r| r as f64).sum::<f64>() / rates.len() as f64;
+        (mean / peak as f64).clamp(0.0, 1.0)
+    });
+    let data_rtt_ms = (!data_rtts.is_empty())
+        .then(|| data_rtts.iter().sum::<f64>() / data_rtts.len() as f64)
+        .filter(|d| *d > 0.0);
+    let power = match (utilization, data_rtt_ms) {
+        (Some(rho), Some(d)) => Some(round4(rho / (d / POWER_REFERENCE_RTT_MS))),
+        _ => None,
+    };
+    Power {
+        utilization: utilization.map(round4),
+        data_rtt_ms: data_rtt_ms.map(round2),
+        power,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -60,6 +106,9 @@ impl Jitter {
 pub(super) struct Acc {
     pub down: Vec<u64>,
     pub up: Vec<u64>,
+    /// Data RTTs of the clean download/upload samples.
+    pub down_data_rtt: Vec<f64>,
+    pub up_data_rtt: Vec<f64>,
     idle_rtt: Vec<f64>,
     loaded_rtt: Vec<f64>,
     tcp_jitter: Jitter,
@@ -98,6 +147,8 @@ impl Acc {
             )),
             _ => None,
         };
+        let down_power = power(&self.down, &self.down_data_rtt);
+        let up_power = power(&self.up, &self.up_data_rtt);
         Summary {
             down: rate_summary(&self.down),
             up: rate_summary(&self.up),
@@ -110,12 +161,22 @@ impl Acc {
             quic_loss_pct,
             probe_timeouts: self.probe_timeouts,
             errors: self.errors,
+            down_utilization: down_power.utilization,
+            up_utilization: up_power.utilization,
+            down_data_rtt_ms: down_power.data_rtt_ms,
+            up_data_rtt_ms: up_power.data_rtt_ms,
+            down_power: down_power.power,
+            up_power: up_power.power,
         }
     }
 }
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
 }
 
 fn percentile<T: Copy>(sorted: &[T], pct: usize) -> T {
@@ -189,6 +250,44 @@ mod tests {
         acc.udp_received = 18;
         acc.udp_lost = 2;
         assert_eq!(acc.summary().udp_loss_pct, Some(10.0));
+    }
+
+    #[test]
+    fn power_is_utilization_over_normalised_data_rtt() {
+        // mean 75 / peak 100 → ρ = 0.75; D = 60 ms → P = 0.75 / 1.2 = 0.625
+        let p = power(&[50, 100, 75, 75], &[40.0, 80.0, 60.0]);
+        assert_eq!(p.utilization, Some(0.75));
+        assert_eq!(p.data_rtt_ms, Some(60.0));
+        assert_eq!(p.power, Some(0.625));
+
+        // No data RTT (non-QUIC outbound): utilization only.
+        let p = power(&[50, 100], &[]);
+        assert_eq!(p.utilization, Some(0.75));
+        assert_eq!(p.data_rtt_ms, None);
+        assert_eq!(p.power, None);
+
+        assert_eq!(
+            power(&[], &[10.0]),
+            Power {
+                data_rtt_ms: Some(10.0),
+                ..Power::default()
+            }
+        );
+        assert_eq!(power(&[0, 0], &[10.0]).power, None);
+    }
+
+    #[test]
+    fn summary_reports_power_per_direction() {
+        let mut acc = Acc::default();
+        acc.down = vec![100, 100];
+        acc.down_data_rtt = vec![25.0, 25.0];
+        acc.up = vec![10];
+        let s = acc.summary();
+        assert_eq!(s.down_utilization, Some(1.0));
+        assert_eq!(s.down_data_rtt_ms, Some(25.0));
+        assert_eq!(s.down_power, Some(2.0));
+        assert_eq!(s.up_utilization, Some(1.0));
+        assert_eq!(s.up_power, None);
     }
 
     #[test]
