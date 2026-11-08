@@ -1,7 +1,4 @@
 {
-  // Users listed here are registered on every inbound that supports user
-  // management (trojan / anytls / shadowquic). They can also be managed at
-  // runtime through the core API: GET/POST/DELETE /users and GET /users/stats.
   "users": [
     { "username": "user", "password": "pwd" }
   ],
@@ -12,7 +9,6 @@
       "port": 13431,
       "idle_timeout": 500,
       "mtu_discoveriy": false,
-      "gso": true,
       "tls": {
         "enable_jls": true,
         "jls_username": "user",
@@ -21,31 +17,6 @@
         "sni": "www.apple.com"
       }
     },
-    "anytls_inbound": {
-      "type": "anytls",
-      "address": "::",
-      "port": 13431,
-      "password": "pwd",
-      "idle_timeout": 500,
-      "tls": {
-        "enable": true,
-        "insecure": true,
-        "sni": "www.apple.com"
-      }
-    },
-    "trojan_inbound": {
-      "type": "trojan",
-      "address": "::",
-      "port": 13441,
-      "password": "pwd",
-      "idle_timeout": 500,
-      "transport": {
-        "type": "tcp"
-      },
-      "tls": {
-        "enable": true
-      }
-    }
   },
   "outbounds": {
     "default_server": "direct",
@@ -60,7 +31,6 @@
   },
   "cache": {
     "all_cache": {
-      "memory_size_mb": 10,
       "path": "server_cache.db"
     }
   },
