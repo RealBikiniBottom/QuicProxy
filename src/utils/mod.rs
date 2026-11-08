@@ -21,6 +21,7 @@ pub mod quic_wrap;
 pub mod read_ahead;
 pub mod shutdown;
 pub mod socket;
+pub mod speedtest;
 pub mod system;
 pub mod system_proxy;
 pub mod time;

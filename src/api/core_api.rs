@@ -9,6 +9,7 @@ use crate::proxy::{
     router::get_router,
 };
 use crate::utils::http_outbound::request_via_outbound_with_dns;
+use crate::utils::speedtest;
 use crate::{
     config::{AuthUser, RouterMode},
     proxy::inbound::{build_sub_links, create_tcp_listener},
@@ -17,7 +18,7 @@ use axum::{
     Router,
     extract::{Query, State},
     http::{HeaderName, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{get, post, put},
 };
 use hashbrown::HashMap;
@@ -83,6 +84,12 @@ pub async fn init_core_api(
         .route("/qr", get(get_qr))
         .route("/geoip_db", get(get_geoip_db))
         .route("/geoip_db/update", post(post_geoip_db_update))
+        .route(
+            "/speedtest",
+            get(get_speedtest)
+                .post(post_speedtest)
+                .delete(delete_speedtest),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             password,
             auth_middleware,
@@ -469,6 +476,58 @@ async fn get_request(Query(params): Query<RequestParams>) -> Result<impl IntoRes
         body,
         duration_ms,
     }))
+}
+
+// ─── Handler: Speed test ───
+
+#[derive(Deserialize)]
+struct SpeedTestQuery {
+    id: Option<String>,
+    since: Option<u64>,
+}
+
+async fn post_speedtest(
+    Json(req): Json<speedtest::SpeedTestRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    match speedtest::start(req) {
+        Ok(task) => Ok(Json(serde_json::json!({
+            "id": task.id,
+            "tag": task.tag,
+            "effective_tag": task.effective_tag,
+        }))),
+        Err(e) => {
+            let status = match e {
+                speedtest::StartError::NotFound => StatusCode::NOT_FOUND,
+                speedtest::StartError::Busy(_) => StatusCode::CONFLICT,
+                speedtest::StartError::Unsupported(_) => StatusCode::BAD_REQUEST,
+            };
+            Err((status, e.to_string()))
+        }
+    }
+}
+
+async fn get_speedtest(Query(q): Query<SpeedTestQuery>) -> Result<Response, StatusCode> {
+    match q.id {
+        Some(id) => {
+            let task = speedtest::get(&id).ok_or(StatusCode::NOT_FOUND)?;
+            Ok(Json(task.snapshot(q.since, true)).into_response())
+        }
+        None => {
+            let list: Vec<_> = speedtest::list()
+                .iter()
+                .map(|t| t.snapshot(None, false))
+                .collect();
+            Ok(Json(list).into_response())
+        }
+    }
+}
+
+async fn delete_speedtest(Query(q): Query<SpeedTestQuery>) -> StatusCode {
+    match q.id {
+        Some(id) if speedtest::stop(&id) => StatusCode::NO_CONTENT,
+        Some(_) => StatusCode::NOT_FOUND,
+        None => StatusCode::BAD_REQUEST,
+    }
 }
 
 // ─── Handler: Traffic ───

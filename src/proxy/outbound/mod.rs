@@ -9,6 +9,7 @@ pub mod selector;
 pub mod shadowquic;
 pub mod shadowsocks;
 pub mod socks5;
+pub mod speedtest;
 pub mod transport;
 pub mod trojan;
 pub mod vmess;
@@ -27,6 +28,7 @@ use serde::Serialize;
 use shadowquic::ShadowQuicOutbound;
 use shadowsocks::ShadowsocksOutbound;
 use socks5::Socks5Outbound;
+use speedtest::SpeedtestOutbound;
 use std::io;
 use std::io::IoSlice;
 use std::net::{IpAddr, SocketAddr};
@@ -90,6 +92,7 @@ pub fn init_outbounds(cfg: &Config) -> anyhow::Result<()> {
             "shadowsocks" => ShadowsocksOutbound::new(name_str, item)?,
             "vmess" => VmessOutbound::new(name_str, item)?,
             "dns" => DnsOutbound::new(name_str, item)?,
+            "speedtest" => SpeedtestOutbound::new(name_str, item)?,
             "selector" => SelectorOutbound::new(name_str, item)?,
             "urltest" => SelectorOutbound::new(name_str, item)?,
             _ => bail!("Unknown outbound type: {}", protocol),

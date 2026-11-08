@@ -667,6 +667,9 @@ JSON5EOF
     "servers": {
       "direct": {
         "type": "direct"
+      },
+      "speedtest": {
+        "type": "speedtest"
       }
     }
   },
@@ -677,7 +680,13 @@ JSON5EOF
     }
   },
   "router": {
-    "default_mode": "rule"
+    "default_mode": "rule",
+    "rules": [
+      {
+        "domain": ["speedtest.quicproxy.internal"],
+        "outbound": "speedtest"
+      }
+    ]
   },
   "observe": {
     "enabled": true,
