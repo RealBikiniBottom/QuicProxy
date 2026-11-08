@@ -52,6 +52,9 @@
     "servers": {
       "direct": {
         "type": "direct"
+      },
+      "speedtest": {
+        "type": "speedtest"
       }
     }
   },
@@ -62,7 +65,13 @@
     }
   },
   "router": {
-    "default_mode": "rule"
+    "default_mode": "rule",
+    "rules": [
+      {
+        "domain": ["speedtest.quicproxy.internal"],
+        "outbound": "speedtest"
+      }
+    ]
   },
   "dns": {
     "default_server": "local_dns",

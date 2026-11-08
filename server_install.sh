@@ -691,7 +691,7 @@ JSON5EOF
   "observe": {
     "enabled": true,
     "cache": "all_cache",
-    "log_interval": 30
+    "log_interval": 300
   },
   "api": {
     "address": "::",
