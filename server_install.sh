@@ -663,7 +663,7 @@ JSON5EOF
   cat >> "$CONFIG_PATH" << JSON5EOF
   },
   "outbounds": {
-    "default_server": "direct",
+    "final_outbound": "direct",
     "servers": {
       "direct": {
         "type": "direct"
