@@ -111,6 +111,10 @@ jobs:
             throw "missing wintun.dll: $wintunDll"
           }
 
+      - name: Verify VC++ runtime is bundled
+        shell: pwsh
+        run: ./.github/scripts/check-windows-runtime.ps1 -Dir quicproxy_flutter/build/windows/x64/runner/Release
+
       - name: Update version in Inno Setup script
         shell: pwsh
         run: |

@@ -285,6 +285,10 @@ jobs:
             }
           }
 
+      - name: Verify VC++ runtime is bundled
+        shell: pwsh
+        run: ./.github/scripts/check-windows-runtime.ps1 -Dir flutter_build_dir
+
       - name: Update version in Inno Setup script
         shell: pwsh
         run: |

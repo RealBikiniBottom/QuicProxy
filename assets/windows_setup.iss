@@ -17,7 +17,7 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 Name: "cn"; MessagesFile: "cn.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
 Source: "../flutter_build_dir/*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
