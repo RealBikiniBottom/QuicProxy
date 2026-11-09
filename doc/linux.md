@@ -15,6 +15,14 @@
 curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/linux_install.sh | sudo bash
 ```
 
+GitHub 访问不畅时，可改用 jsDelivr CDN 拉取脚本（脚本会优先从官网 CDN 下载安装包，失败自动回退 GitHub）：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/RealBikiniBottom/QuicProxy@master/linux_install.sh | sudo bash
+```
+
+可用 `--mirror auto|cdn|github` 指定下载源，默认 `auto`。
+
 安装完成后终端会打印随机生成的 API 密码和管理面板地址。打开浏览器输入 web 地址，就可以直接使用了。
 
 ## 管理命令

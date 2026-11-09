@@ -7,6 +7,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
+const STARTUP_CHECK_STEPS: usize = 6;
+const STARTUP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// 核心进程管理器
 ///
 /// 前端通过 API 下发 core 配置 JSON，管理器写入文件后启动 quicproxy 核心进程。
@@ -192,8 +195,71 @@ impl CoreManager {
             });
         }
 
+        // core 配置错误、端口被占用等情况会让进程立刻退出。稍等片刻再确认，
+        // 避免向前端报告“已启动”而实际进程已经不在了。
+        for _ in 0..STARTUP_CHECK_STEPS {
+            tokio::time::sleep(STARTUP_CHECK_INTERVAL).await;
+            match child.try_wait() {
+                // 以 --elevate 启动时，父进程拉起提权后的 core 后会以 0 正常退出，
+                // 这种情况不算启动失败。
+                Ok(Some(status)) if status.success() => break,
+                Ok(Some(status)) => {
+                    // 给日志收集任务一点时间读完最后几行输出
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let tail = self.recent_log_text(5).await;
+                    let message = if tail.is_empty() {
+                        format!("Core exited right after start ({})", status)
+                    } else {
+                        format!("Core exited right after start ({}): {}", status, tail)
+                    };
+                    error!("{}", message);
+                    anyhow::bail!(message);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Failed to check core process status: {}", e);
+                    break;
+                }
+            }
+        }
+
         *self.inner.process.write().await = Some(child);
         Ok(())
+    }
+
+    /// core API 的本地端口与密码（来自最近一次下发的配置），供管理端转发请求
+    pub async fn api_endpoint(&self) -> (u16, String) {
+        (
+            *self.inner.config_api_port.read().await,
+            self.inner.config_api_password.read().await.clone(),
+        )
+    }
+
+    async fn recent_log_text(&self, lines: usize) -> String {
+        let logs = self.inner.logs.lock().await;
+        let skip = logs.len().saturating_sub(lines);
+        logs.iter()
+            .skip(skip)
+            .map(|entry| entry.message.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// 异常退出（崩溃、配置错误等）的进程不再算作运行中
+    fn reap_exited(&self) {
+        let Ok(mut guard) = self.inner.process.try_write() else {
+            return;
+        };
+        let exited = match guard.as_mut() {
+            // 正常退出（如 --elevate 交给提权进程）保持原有语义，只回收异常退出的进程
+            Some(child) => matches!(child.try_wait(), Ok(Some(status)) if !status.success()),
+            None => false,
+        };
+        if exited {
+            warn!("Core process has exited");
+            *guard = None;
+        }
     }
 
     /// 停止 core 进程
@@ -220,7 +286,11 @@ impl CoreManager {
         let api_password = self.inner.config_api_password.read().await.clone();
 
         // 优先通过 API 优雅退出
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
         let mut request = client.get(format!("http://127.0.0.1:{}/quit", api_port));
         if !api_password.is_empty() {
             request = request.header("Authorization", api_password);
@@ -268,6 +338,7 @@ impl CoreManager {
     }
 
     fn is_running(&self) -> bool {
+        self.reap_exited();
         self.inner
             .process
             .try_read()
@@ -277,6 +348,7 @@ impl CoreManager {
     }
 
     pub fn status(&self) -> CoreStatus {
+        self.reap_exited();
         let pid = self
             .inner
             .process

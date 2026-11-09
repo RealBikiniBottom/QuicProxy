@@ -5,8 +5,9 @@ set -euo pipefail
 # QuicProxy Client Installer — 一键安装客户端（管理模式）
 #
 # 用法:
-#   curl -fsSL https://raw.githubusercontent.com/.../linux_install.sh | sudo bash -s -- --password mypass
-#   curl -fsSL https://raw.githubusercontent.com/.../linux_install.sh | sudo bash -s -- --password mypass --web-ui with
+#   curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/linux_install.sh | sudo bash -s -- --password mypass
+#   # raw.githubusercontent.com 访问不畅时可经 jsDelivr 拉取脚本:
+#   curl -fsSL https://cdn.jsdelivr.net/gh/RealBikiniBottom/QuicProxy@master/linux_install.sh | sudo bash -s -- --web-ui with
 #
 # 特性:
 #   - 自动检测 CPU 架构 (x86_64 / aarch64 / armv7l)
@@ -15,6 +16,7 @@ set -euo pipefail
 #   - 支持用户选择安装带 Web UI 或不带 Web UI 的版本
 #   - 无论是否带 Web UI，都统一通过 systemd / init.d 管理
 #   - 支持通过 --web-dir 指定已有的 Flutter Web 产物目录
+#   - 下载源: 官网 CDN (web.quicproxy.org) 优先，失败自动回退 GitHub Releases（--mirror 可指定）
 # ────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'
@@ -36,8 +38,12 @@ SERVICE_NAME="quicproxy"
 SYSTEMD_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 INITD_FILE="/etc/init.d/${SERVICE_NAME}"
 WEB_ASSET_NAME="QuicProxy-Web-Full.zip"
-CORE_MIN_FREE_BYTES=$((120 * 1024 * 1024))
-WEB_MIN_FREE_BYTES=$((200 * 1024 * 1024))
+
+# 发布流程会把最新版安装包同步到官网 (static/assets → /assets/)，经 Cloudflare 加速。
+# 官网只保留最新版，因此指定 --version 时不使用该源。
+# 网站仓库是私有的，jsDelivr 无法分发安装包，只用于分发本脚本和查询最新版本号。
+CDN_ASSET_BASE="${CDN_ASSET_BASE:-https://web.quicproxy.org/assets}"
+JSDELIVR_DATA_API="https://data.jsdelivr.com/v1/packages/gh/${REPO}/resolved?specifier=latest"
 
 # 用户可覆盖
 PASSWORD="${PASSWORD:-}"
@@ -45,6 +51,7 @@ PORT="${PORT:-8080}"
 WEB_DIR="${WEB_DIR:-}"
 WEB_UI_MODE="${WEB_UI_MODE:-ask}"
 VERSION="${VERSION:-}"
+MIRROR="${MIRROR:-auto}"   # auto: 官网 CDN 优先，失败回退 GitHub; cdn: 只用官网 CDN; github: 只用 GitHub
 WORK_DIR="${WORK_DIR:-${INSTALL_DIR}}"
 HOST="${HOST:-::}"
 PERSIST_PATH="${WORK_DIR}/persist.json"
@@ -96,53 +103,93 @@ has_zip_extractor() {
   command -v unzip &>/dev/null || command -v bsdtar &>/dev/null
 }
 
-bytes_to_human() {
-  local bytes="${1:-0}"
-  awk -v bytes="$bytes" '
-    function human(x, i, units) {
-      split("B KiB MiB GiB TiB", units, " ")
-      i = 1
-      while (x >= 1024 && i < 5) {
-        x /= 1024
-        i++
-      }
-      return sprintf("%.1f %s", x, units[i])
-    }
-    BEGIN {
-      print human(bytes)
-    }
-  '
-}
-
-get_free_bytes() {
-  local target_path="$1"
-  df -Pk "$target_path" 2>/dev/null | awk 'NR==2 {print $4 * 1024}'
-}
-
 build_release_download_url() {
   local asset_name="$1"
 
-  if [[ -n "${VERSION:-}" ]]; then
-    echo "https://github.com/${REPO}/releases/download/${VERSION}/${asset_name}"
+  if [[ -n "${TAG_NAME:-}" ]]; then
+    echo "https://github.com/${REPO}/releases/download/${TAG_NAME}/${asset_name}"
   else
     echo "https://github.com/${REPO}/releases/latest/download/${asset_name}"
   fi
 }
 
-get_remote_file_size() {
-  local url="$1"
-  local content_length
+build_cdn_download_url() {
+  local asset_name="$1"
+  # 官网只有最新版；用户指定了版本就跳过
+  [[ -z "${VERSION:-}" ]] || return 1
+  echo "${CDN_ASSET_BASE}/${asset_name}"
+}
 
-  content_length=$(curl -fsSLI --connect-timeout 10 --max-time 30 "$url" 2>/dev/null \
-    | tr -d '\r' \
-    | awk 'BEGIN{IGNORECASE=1} /^content-length:/ {print $2}' \
-    | tail -1)
+# 按 MIRROR 输出候选下载地址，每行一个，按优先级排序
+build_download_urls() {
+  local asset_name="$1"
+  local cdn_url=""
+  cdn_url=$(build_cdn_download_url "$asset_name" || true)
+  local gh_url
+  gh_url=$(build_release_download_url "$asset_name")
 
-  if [[ ! "$content_length" =~ ^[0-9]+$ ]]; then
-    return 1
+  case "$MIRROR" in
+    cdn)
+      [[ -n "$cdn_url" ]] && echo "$cdn_url"
+      ;;
+    github)
+      echo "$gh_url"
+      ;;
+    *)
+      [[ -n "$cdn_url" ]] && echo "$cdn_url"
+      echo "$gh_url"
+      ;;
+  esac
+}
+
+# download_with_fallback <输出文件> <校验函数> <超时秒> <url...>
+# 依次尝试每个地址，下载成功且校验通过即返回 0
+download_with_fallback() {
+  local output="$1"
+  local verify_fn="$2"
+  local max_time="$3"
+  shift 3
+
+  local url
+  for url in "$@"; do
+    log_info "下载: ${url}"
+    rm -f "$output"
+    if curl -fSL --connect-timeout 10 --max-time "$max_time" --retry 2 --retry-delay 1 \
+        -o "$output" "$url"; then
+      if "$verify_fn" "$output"; then
+        return 0
+      fi
+      log_warn "文件校验失败，换下一个下载源"
+    else
+      log_warn "下载失败，换下一个下载源"
+    fi
+  done
+  return 1
+}
+
+verify_tarball() {
+  tar tzf "$1" &>/dev/null
+}
+
+verify_zip() {
+  if command -v unzip &>/dev/null; then
+    unzip -tq "$1" &>/dev/null
+  else
+    bsdtar -tf "$1" &>/dev/null
   fi
+}
 
-  echo "$content_length"
+normalize_mirror() {
+  case "$MIRROR" in
+    auto|cdn|github) ;;
+    jsdelivr|web) MIRROR="cdn" ;;
+    gh) MIRROR="github" ;;
+    *)
+      log_error "无效的下载源: ${MIRROR}"
+      log_info "支持的值: auto, cdn, github"
+      exit 1
+      ;;
+  esac
 }
 
 extract_zip_to_dir() {
@@ -218,74 +265,6 @@ prompt_web_ui_mode() {
   fi
 }
 
-calculate_required_install_bytes() {
-  local asset_size_bytes="$1"
-  local min_free_bytes="$2"
-  local required_bytes=$((asset_size_bytes * 4))
-
-  if (( required_bytes < min_free_bytes )); then
-    required_bytes=$min_free_bytes
-  fi
-
-  echo "$required_bytes"
-}
-
-check_install_space() {
-  log_step "检查安装空间..."
-
-  mkdir -p "$INSTALL_DIR"
-
-  local free_bytes
-  free_bytes=$(get_free_bytes "$INSTALL_DIR") || {
-    log_error "无法检测 ${INSTALL_DIR} 所在分区的剩余空间"
-    exit 1
-  }
-
-  local core_url
-  core_url=$(build_release_download_url "quicproxy-core-${ARCH_TARGET}.tar.gz")
-
-  local core_size_bytes
-  core_size_bytes=$(get_remote_file_size "$core_url") || {
-    log_error "无法获取 Core 安装包大小，无法继续安装"
-    exit 1
-  }
-
-  local core_required_bytes
-  core_required_bytes=$(calculate_required_install_bytes "$core_size_bytes" "$CORE_MIN_FREE_BYTES")
-
-  local total_required_bytes="$core_required_bytes"
-
-  log_info "Core 包大小: $(bytes_to_human "$core_size_bytes")"
-  log_info "Core 预留空间: $(bytes_to_human "$core_required_bytes")"
-
-  if [[ "$WEB_UI_MODE" == "with" ]] && [[ -z "$WEB_DIR" ]]; then
-    local web_url
-    web_url=$(build_release_download_url "${WEB_ASSET_NAME}")
-
-    local web_size_bytes
-    web_size_bytes=$(get_remote_file_size "$web_url") || {
-      log_error "无法获取 Web UI 安装包大小，无法继续安装"
-      exit 1
-    }
-
-    local web_required_bytes
-    web_required_bytes=$(calculate_required_install_bytes "$web_size_bytes" "$WEB_MIN_FREE_BYTES")
-    total_required_bytes=$((total_required_bytes + web_required_bytes))
-
-    log_info "Web UI 包大小: $(bytes_to_human "$web_size_bytes")"
-    log_info "Web UI 预留空间: $(bytes_to_human "$web_required_bytes")"
-  fi
-
-  log_info "当前可用空间: $(bytes_to_human "$free_bytes")"
-  log_info "总预留空间: $(bytes_to_human "$total_required_bytes")"
-
-  if (( free_bytes < total_required_bytes )); then
-    log_error "磁盘空间不足，无法继续安装"
-    log_error "当前可用: $(bytes_to_human "$free_bytes")，至少需要: $(bytes_to_human "$total_required_bytes")"
-    exit 1
-  fi
-}
-
 check_existing_installation() {
   log_step "检查已有安装..."
 
@@ -351,17 +330,36 @@ detect_latest_version() {
     return
   fi
 
-  local api_response
-  api_response=$(curl -sfL --connect-timeout 10 --max-time 30 "$GITHUB_API" 2>/dev/null) || {
-    log_error "无法访问 GitHub API, 请检查网络连接"
-    log_info "可用 VERSION=v1.0.0 手动指定版本"
-    exit 1
-  }
+  TAG_NAME=""
 
-  TAG_NAME=$(echo "$api_response" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+  # 1) GitHub API（未登录每小时 60 次限额，可能被限流）
+  if [[ "$MIRROR" != "cdn" ]]; then
+    local api_response
+    if api_response=$(curl -sfL --connect-timeout 10 --max-time 20 "$GITHUB_API" 2>/dev/null); then
+      TAG_NAME=$(echo "$api_response" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    fi
+  fi
+
+  # 2) jsDelivr 数据接口（返回去掉 v 前缀的版本号）
+  if [[ -z "$TAG_NAME" ]] && [[ "$MIRROR" != "github" ]]; then
+    local cdn_response cdn_version
+    if cdn_response=$(curl -sfL --connect-timeout 10 --max-time 20 "$JSDELIVR_DATA_API" 2>/dev/null); then
+      cdn_version=$(echo "$cdn_response" | grep -o '"version": *"[^"]*"' | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/')
+      [[ -n "$cdn_version" ]] && TAG_NAME="v${cdn_version#v}"
+    fi
+  fi
+
+  # 3) github.com 的 releases/latest 跳转（不走 API 限额）
+  if [[ -z "$TAG_NAME" ]]; then
+    local location
+    location=$(curl -sI --connect-timeout 10 --max-time 20 "https://github.com/${REPO}/releases/latest" 2>/dev/null \
+      | tr -d '\r' | awk 'tolower($1)=="location:" {print $2}' | tail -1)
+    [[ "$location" == */releases/tag/* ]] && TAG_NAME="${location##*/}"
+  fi
 
   if [[ -z "$TAG_NAME" ]]; then
-    log_error "解析 GitHub API 响应失败"
+    log_error "无法获取最新版本 (GitHub / jsDelivr 均不可达)，请检查网络"
+    log_info "可用 --version v1.0.0 手动指定版本"
     exit 1
   fi
 
@@ -375,21 +373,14 @@ detect_latest_version() {
 download_and_install() {
   log_step "下载 QuicProxy (${ARCH_TARGET})..."
 
-  local download_url
-  download_url=$(build_release_download_url "quicproxy-core-${ARCH_TARGET}.tar.gz")
-
+  local asset_name="quicproxy-core-${ARCH_TARGET}.tar.gz"
   local tarball="${TMPDIR}/quicproxy.tar.gz"
+  local urls=()
+  mapfile -t urls < <(build_download_urls "$asset_name")
 
-  log_info "下载地址: ${download_url}"
-  curl -fSL --connect-timeout 10 --max-time 300 -o "$tarball" "$download_url" || {
-    log_error "下载失败, 请检查网络或版本号"
+  if ! download_with_fallback "$tarball" verify_tarball 300 "${urls[@]}"; then
+    log_error "所有下载源均失败, 请检查网络或版本号"
     log_info "如果 release 中还没有 ${ARCH_TARGET} 产物，请联系开发者"
-    exit 1
-  }
-
-  log_info "校验文件..."
-  if ! tar tzf "$tarball" &>/dev/null; then
-    log_error "下载的文件损坏, 请重试"
     exit 1
   fi
 
@@ -444,14 +435,12 @@ setup_web_ui() {
 
   mkdir -p "$INSTALL_DIR"
 
-  local web_url
-  web_url=$(build_release_download_url "${WEB_ASSET_NAME}")
-
   local web_zip="${TMPDIR}/${WEB_ASSET_NAME}"
   local web_staging_dir="${TMPDIR}/web"
+  local urls=()
+  mapfile -t urls < <(build_download_urls "$WEB_ASSET_NAME")
 
-  log_info "下载 Web UI: ${web_url}"
-  if ! curl -fSL --connect-timeout 10 --max-time 600 -o "$web_zip" "$web_url"; then
+  if ! download_with_fallback "$web_zip" verify_zip 600 "${urls[@]}"; then
     log_error "Web UI 下载失败，无法继续安装"
     exit 1
   fi
@@ -804,16 +793,17 @@ main() {
   check_root
   check_deps
   normalize_web_ui_mode
+  normalize_mirror
   prompt_web_ui_mode
   detect_arch
   detect_latest_version
   check_existing_installation
-  check_install_space
 
   log_info "安装目录: ${INSTALL_DIR}"
   log_info "Core 目录: ${CORE_DIR}"
   log_info "架构:      ${ARCH_TARGET}"
   log_info "端口:      ${PORT}"
+  log_info "下载源:    ${MIRROR}"
 
   stop_existing
   download_and_install
@@ -842,9 +832,11 @@ while [[ $# -gt 0 ]]; do
       WORK_DIR="$2"; shift 2 ;;
     --version)
       VERSION="$2"; shift 2 ;;
+    --mirror)
+      MIRROR="$2"; shift 2 ;;
     *)
       log_error "未知参数: $1"
-      echo "用法: sudo bash linux_install.sh [--password PASS] [--port 8080] [--host ::] [--web-ui ask|with|without] [--web-dir /path] [--work-dir /path] [--version v1.0.0]"
+      echo "用法: sudo bash linux_install.sh [--password PASS] [--port 8080] [--host ::] [--web-ui ask|with|without] [--web-dir /path] [--work-dir /path] [--version v1.0.0] [--mirror auto|cdn|github]"
       exit 1
       ;;
   esac

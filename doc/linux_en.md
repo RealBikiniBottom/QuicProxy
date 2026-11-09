@@ -15,6 +15,14 @@ Install QuicProxy on a local Linux device with one command and manage proxies th
 curl -fsSL https://raw.githubusercontent.com/RealBikiniBottom/QuicProxy/master/linux_install.sh | sudo bash
 ```
 
+If GitHub is slow or unreachable, fetch the script through the jsDelivr CDN instead (the script downloads packages from the official site CDN first and falls back to GitHub automatically):
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/RealBikiniBottom/QuicProxy@master/linux_install.sh | sudo bash
+```
+
+Use `--mirror auto|cdn|github` to choose the download source (default `auto`).
+
 After installation, the terminal prints a randomly generated API password and the management panel address. Open that web address in your browser and you can start using it right away.
 
 ## Management Commands

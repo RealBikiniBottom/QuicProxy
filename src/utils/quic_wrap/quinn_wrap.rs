@@ -138,10 +138,10 @@ fn make_transport_config(
             "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
             "cubic" => Arc::new(quinn::congestion::CubicConfig::default()),
             "newreno" => Arc::new(quinn::congestion::NewRenoConfig::default()),
-            // "copa" => Arc::new(quinn::congestion::CopaConfig::default()),
-            // "copa-nc" => Arc::new(quinn::congestion::CopaConfig::copa_nc()),
-            // "copa-auto" => Arc::new(quinn::congestion::CopaConfig::copa_auto()),
-            // "copa-auto-nc" => Arc::new(quinn::congestion::CopaConfig::copa_auto_nc()),
+            "copa" => Arc::new(quinn::congestion::CopaConfig::default()),
+            "copa-nc" => Arc::new(quinn::congestion::CopaConfig::copa_nc()),
+            "copa-auto" => Arc::new(quinn::congestion::CopaConfig::copa_auto()),
+            "copa-auto-nc" => Arc::new(quinn::congestion::CopaConfig::copa_auto_nc()),
             other => {
                 warn!(
                     "unknown congestion controller '{}', falling back to bbr",
