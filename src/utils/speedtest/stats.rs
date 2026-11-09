@@ -18,10 +18,14 @@ pub struct RateSummary {
 pub struct Summary {
     pub down: Option<RateSummary>,
     pub up: Option<RateSummary>,
-    /// Median TCP ping RTT while no transfer was running.
+    /// Mean request-ping RTT while no transfer was running.
     pub idle_rtt_ms: Option<f64>,
-    /// Median TCP ping RTT during download/upload.
+    /// Mean request-ping RTT during download and upload, after each phase's
+    /// warm-up; [`Summary::down_loaded_rtt_ms`] and
+    /// [`Summary::up_loaded_rtt_ms`] split it by direction.
     pub loaded_rtt_ms: Option<f64>,
+    pub down_loaded_rtt_ms: Option<f64>,
+    pub up_loaded_rtt_ms: Option<f64>,
     /// Mean absolute difference between consecutive RTTs (UDP echo when
     /// available, TCP ping otherwise).
     pub jitter_ms: Option<f64>,
@@ -33,52 +37,77 @@ pub struct Summary {
     pub quic_loss_pct: Option<f64>,
     pub probe_timeouts: u64,
     pub errors: u64,
-    /// Mean rate over peak rate of the direction's samples (ρ in [0, 1]).
-    pub down_utilization: Option<f64>,
-    pub up_utilization: Option<f64>,
-    /// Mean RTT of the QUIC connection carrying the transfer (ms); absent for
-    /// non-QUIC outbounds.
+    /// Mean of the QUIC connection's smoothed RTT (polled every 100 ms) over
+    /// the clean transfer time, in ms; absent for non-QUIC outbounds. Shown
+    /// next to the request latency; not part of the power.
     pub down_data_rtt_ms: Option<f64>,
     pub up_data_rtt_ms: Option<f64>,
-    /// Normalised Kleinrock power ρ / (data RTT / 50 ms); see [`power`].
+    /// Mean over the clean transfer seconds of the per-second power
+    /// [`second_power`], in Mbit/s.
     pub down_power: Option<f64>,
     pub up_power: Option<f64>,
+    /// How upload bytes were counted: confirmed by the server, or written
+    /// locally (a version 1 server).
+    pub up_counting: Option<UpCounting>,
+}
+
+/// Source of the upload byte count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpCounting {
+    /// Bytes the server reported received (protocol version 2).
+    Acked,
+    /// Bytes written into the tunnel stream (version 1 server).
+    Written,
 }
 
 /// Delay that normalises power.
 pub const POWER_REFERENCE_RTT_MS: f64 = 50.0;
 
-/// Power figures of one direction.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(super) struct Power {
-    pub utilization: Option<f64>,
-    pub data_rtt_ms: Option<f64>,
-    pub power: Option<f64>,
+/// Power of one second: P_t = rate_t / (ping_t / 50 ms), in Mbit/s, where
+/// ping_t is the mean request-ping RTT completed in that second. None
+/// without a ping.
+pub(super) fn second_power(rate_bps: u64, ping_ms: Option<f64>) -> Option<f64> {
+    let ping = ping_ms.filter(|p| *p > 0.0)?;
+    Some(rate_bps as f64 / 1e6 / (ping / POWER_REFERENCE_RTT_MS))
 }
 
-/// Normalised Kleinrock power P = ρ / (D / 50 ms) over a phase's samples.
-///
-/// ρ = mean rate / peak rate: the test saturates the link, so its peak rate
-/// stands in for the capacity. D is the arithmetic mean of the data RTTs
-/// (the QUIC connection's RTT estimate) sampled alongside the rates.
-pub(super) fn power(rates: &[u64], data_rtts: &[f64]) -> Power {
-    let peak = rates.iter().copied().max().unwrap_or(0);
-    let utilization = (peak > 0).then(|| {
-        let mean = rates.iter().map(|&r| r as f64).sum::<f64>() / rates.len() as f64;
-        (mean / peak as f64).clamp(0.0, 1.0)
-    });
-    let data_rtt_ms = (!data_rtts.is_empty())
-        .then(|| data_rtts.iter().sum::<f64>() / data_rtts.len() as f64)
-        .filter(|d| *d > 0.0);
-    let power = match (utilization, data_rtt_ms) {
-        (Some(rho), Some(d)) => Some(round4(rho / (d / POWER_REFERENCE_RTT_MS))),
-        _ => None,
-    };
-    Power {
-        utilization: utilization.map(round4),
-        data_rtt_ms: data_rtt_ms.map(round2),
-        power,
+/// One clean (post-warm-up) transfer phase of one direction.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct PhaseAcc {
+    /// Payload bits and the time they took, summed over the 1 s samples.
+    pub bits: f64,
+    pub secs: f64,
+    /// Sum and count of the 100 ms data-RTT polls.
+    pub rtt_sum_ms: f64,
+    pub rtt_n: u64,
+}
+
+impl PhaseAcc {
+    pub fn add(&mut self, rate_bps: u64, secs: f64, rtt: Option<(f64, u32)>) {
+        self.bits += rate_bps as f64 * secs;
+        self.secs += secs;
+        if let Some((mean, n)) = rtt {
+            self.rtt_sum_ms += mean * n as f64;
+            self.rtt_n += n as u64;
+        }
     }
+}
+
+/// Total bits over total time of `phases`.
+fn mean_bps(phases: &[PhaseAcc]) -> Option<u64> {
+    let secs: f64 = phases.iter().map(|p| p.secs).sum();
+    (secs > 0.0).then(|| (phases.iter().map(|p| p.bits).sum::<f64>() / secs).round() as u64)
+}
+
+/// Poll-weighted mean data RTT of `phases`.
+fn mean_data_rtt(phases: &[PhaseAcc]) -> Option<f64> {
+    let n: u64 = phases.iter().map(|p| p.rtt_n).sum();
+    (n > 0).then(|| round2(phases.iter().map(|p| p.rtt_sum_ms).sum::<f64>() / n as f64))
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
 #[derive(Debug, Default)]
@@ -106,11 +135,19 @@ impl Jitter {
 pub(super) struct Acc {
     pub down: Vec<u64>,
     pub up: Vec<u64>,
-    /// Data RTTs of the clean download/upload samples.
-    pub down_data_rtt: Vec<f64>,
-    pub up_data_rtt: Vec<f64>,
+    /// Clean transfer phases: bytes over time and data RTT.
+    pub down_phases: Vec<PhaseAcc>,
+    pub up_phases: Vec<PhaseAcc>,
+    /// Per-second power of the clean transfer samples.
+    pub down_powers: Vec<f64>,
+    pub up_powers: Vec<f64>,
+    pub up_counting: Option<UpCounting>,
+    /// Phase generation of the last entry of each list.
+    down_gen: Option<u64>,
+    up_gen: Option<u64>,
     idle_rtt: Vec<f64>,
-    loaded_rtt: Vec<f64>,
+    down_loaded_rtt: Vec<f64>,
+    up_loaded_rtt: Vec<f64>,
     tcp_jitter: Jitter,
     udp_jitter: Jitter,
     pub udp_sent: u64,
@@ -123,13 +160,53 @@ pub(super) struct Acc {
 }
 
 impl Acc {
-    pub fn add_rtt(&mut self, phase: Phase, rtt: f64) {
-        if phase.loaded() {
-            self.loaded_rtt.push(rtt);
-        } else if phase.idle() {
-            self.idle_rtt.push(rtt);
+    /// Adds a clean 1 s transfer sample to the phase with generation
+    /// `phase_gen`, with its data RTT and power.
+    pub fn add_transfer(
+        &mut self,
+        phase: Phase,
+        phase_gen: u64,
+        rate_bps: u64,
+        secs: f64,
+        rtt: Option<(f64, u32)>,
+        power: Option<f64>,
+    ) {
+        let (phases, last, powers) = match phase {
+            Phase::Download => (
+                &mut self.down_phases,
+                &mut self.down_gen,
+                &mut self.down_powers,
+            ),
+            Phase::Upload => (&mut self.up_phases, &mut self.up_gen, &mut self.up_powers),
+            _ => return,
+        };
+        if let Some(p) = power {
+            powers.push(p);
+        }
+        if *last != Some(phase_gen) || phases.is_empty() {
+            phases.push(PhaseAcc::default());
+            *last = Some(phase_gen);
+        }
+        phases.last_mut().unwrap().add(rate_bps, secs, rtt);
+    }
+
+    /// A request-ping RTT. Loaded pings only count after the phase's
+    /// warm-up (`clean`), like the throughput.
+    pub fn add_rtt(&mut self, phase: Phase, rtt: f64, clean: bool) {
+        match phase {
+            Phase::Download if clean => self.down_loaded_rtt.push(rtt),
+            Phase::Upload if clean => self.up_loaded_rtt.push(rtt),
+            _ if phase.idle() => self.idle_rtt.push(rtt),
+            _ => {}
         }
         self.tcp_jitter.add(rtt);
+    }
+
+    pub fn set_up_counting(&mut self, c: UpCounting) {
+        // One written stream makes the whole figure "written".
+        if self.up_counting != Some(UpCounting::Written) {
+            self.up_counting = Some(c);
+        }
     }
 
     pub fn add_udp_rtt(&mut self, rtt: f64) {
@@ -147,13 +224,25 @@ impl Acc {
             )),
             _ => None,
         };
-        let down_power = power(&self.down, &self.down_data_rtt);
-        let up_power = power(&self.up, &self.up_data_rtt);
+        let rates = |values: &[u64], phases: &[PhaseAcc]| {
+            rate_summary(values).map(|mut r| {
+                r.avg_bps = mean_bps(phases).unwrap_or(r.avg_bps);
+                r
+            })
+        };
+        let loaded: Vec<f64> = self
+            .down_loaded_rtt
+            .iter()
+            .chain(&self.up_loaded_rtt)
+            .copied()
+            .collect();
         Summary {
-            down: rate_summary(&self.down),
-            up: rate_summary(&self.up),
-            idle_rtt_ms: median(&self.idle_rtt),
-            loaded_rtt_ms: median(&self.loaded_rtt),
+            down: rates(&self.down, &self.down_phases),
+            up: rates(&self.up, &self.up_phases),
+            idle_rtt_ms: mean(&self.idle_rtt).map(round2),
+            loaded_rtt_ms: mean(&loaded).map(round2),
+            down_loaded_rtt_ms: mean(&self.down_loaded_rtt).map(round2),
+            up_loaded_rtt_ms: mean(&self.up_loaded_rtt).map(round2),
             jitter_ms: self.udp_jitter.value().or_else(|| self.tcp_jitter.value()),
             udp_loss_pct,
             udp_sent: self.udp_sent,
@@ -161,12 +250,11 @@ impl Acc {
             quic_loss_pct,
             probe_timeouts: self.probe_timeouts,
             errors: self.errors,
-            down_utilization: down_power.utilization,
-            up_utilization: up_power.utilization,
-            down_data_rtt_ms: down_power.data_rtt_ms,
-            up_data_rtt_ms: up_power.data_rtt_ms,
-            down_power: down_power.power,
-            up_power: up_power.power,
+            down_data_rtt_ms: mean_data_rtt(&self.down_phases),
+            up_data_rtt_ms: mean_data_rtt(&self.up_phases),
+            down_power: mean(&self.down_powers).map(round4),
+            up_power: mean(&self.up_powers).map(round4),
+            up_counting: self.up_counting,
         }
     }
 }
@@ -199,15 +287,6 @@ pub(super) fn rate_summary(values: &[u64]) -> Option<RateSummary> {
     })
 }
 
-fn median(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    Some(round2(percentile(&sorted, 50)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,12 +305,12 @@ mod tests {
     #[test]
     fn rtt_split_by_phase_and_jitter() {
         let mut acc = Acc::default();
-        acc.add_rtt(Phase::IdleLatency, 100.0);
-        acc.add_rtt(Phase::IdleLatency, 110.0);
-        acc.add_rtt(Phase::Download, 200.0);
-        acc.add_rtt(Phase::Connecting, 999.0);
+        acc.add_rtt(Phase::IdleLatency, 100.0, false);
+        acc.add_rtt(Phase::IdleLatency, 110.0, false);
+        acc.add_rtt(Phase::Download, 200.0, true);
+        acc.add_rtt(Phase::Connecting, 999.0, false);
         let s = acc.summary();
-        assert_eq!(s.idle_rtt_ms, Some(100.0));
+        assert_eq!(s.idle_rtt_ms, Some(105.0));
         assert_eq!(s.loaded_rtt_ms, Some(200.0));
         // |110-100| + |200-110| + |999-200| over 3
         assert_eq!(s.jitter_ms, Some(round2((10.0 + 90.0 + 799.0) / 3.0)));
@@ -253,41 +332,70 @@ mod tests {
     }
 
     #[test]
-    fn power_is_utilization_over_normalised_data_rtt() {
-        // mean 75 / peak 100 → ρ = 0.75; D = 60 ms → P = 0.75 / 1.2 = 0.625
-        let p = power(&[50, 100, 75, 75], &[40.0, 80.0, 60.0]);
-        assert_eq!(p.utilization, Some(0.75));
-        assert_eq!(p.data_rtt_ms, Some(60.0));
-        assert_eq!(p.power, Some(0.625));
-
-        // No data RTT (non-QUIC outbound): utilization only.
-        let p = power(&[50, 100], &[]);
-        assert_eq!(p.utilization, Some(0.75));
-        assert_eq!(p.data_rtt_ms, None);
-        assert_eq!(p.power, None);
-
-        assert_eq!(
-            power(&[], &[10.0]),
-            Power {
-                data_rtt_ms: Some(10.0),
-                ..Power::default()
-            }
-        );
-        assert_eq!(power(&[0, 0], &[10.0]).power, None);
+    fn second_power_is_rate_over_normalised_ping() {
+        // 80 Mbit/s with a 100 ms request ping → 80 / 2 = 40.
+        assert_eq!(second_power(80_000_000, Some(100.0)), Some(40.0));
+        assert_eq!(second_power(80_000_000, Some(25.0)), Some(160.0));
+        assert_eq!(second_power(80_000_000, None), None);
+        assert_eq!(second_power(80_000_000, Some(0.0)), None);
     }
 
     #[test]
-    fn summary_reports_power_per_direction() {
+    fn summary_power_rates_and_latency() {
         let mut acc = Acc::default();
-        acc.down = vec![100, 100];
-        acc.down_data_rtt = vec![25.0, 25.0];
-        acc.up = vec![10];
+        // Download: 100 Mbit/s for 1 s and 200 Mbit/s for 1.5 s; second 2
+        // has no ping, so no power.
+        acc.add_transfer(
+            Phase::Download,
+            1,
+            100_000_000,
+            1.0,
+            Some((40.0, 10)),
+            Some(50.0),
+        );
+        acc.add_transfer(Phase::Download, 1, 200_000_000, 1.5, Some((100.0, 5)), None);
+        // A second download phase (new generation, e.g. the next round).
+        acc.add_transfer(Phase::Download, 3, 100_000_000, 1.0, None, Some(150.0));
+        acc.add_transfer(Phase::Upload, 2, 10_000_000, 1.0, None, None);
+        acc.down = vec![100_000_000, 200_000_000, 100_000_000];
+        acc.up = vec![10_000_000];
+        assert_eq!(acc.down_phases.len(), 2);
+
+        acc.add_rtt(Phase::Download, 10.0, false); // warm-up: not loaded
+        acc.add_rtt(Phase::Download, 20.0, true);
+        acc.add_rtt(Phase::Download, 40.0, true);
+        acc.add_rtt(Phase::Upload, 90.0, true);
+        acc.add_rtt(Phase::IdleLatency, 5.0, false);
+        acc.add_rtt(Phase::Waiting, 7.0, false);
+
         let s = acc.summary();
-        assert_eq!(s.down_utilization, Some(1.0));
-        assert_eq!(s.down_data_rtt_ms, Some(25.0));
-        assert_eq!(s.down_power, Some(2.0));
-        assert_eq!(s.up_utilization, Some(1.0));
+        // Bytes over time: (100 + 300 + 100) Mbit / 3.5 s, not the mean of
+        // the per-second rates (133.3).
+        assert_eq!(
+            s.down.as_ref().unwrap().avg_bps,
+            (500e6 / 3.5f64).round() as u64
+        );
+        assert_eq!(s.down.as_ref().unwrap().max_bps, 200_000_000);
+        // Mean of the per-second powers that exist.
+        assert_eq!(s.down_power, Some(100.0));
         assert_eq!(s.up_power, None);
+        // Data RTT: (400 + 500) / 15 polls.
+        assert_eq!(s.down_data_rtt_ms, Some(60.0));
+        assert_eq!(s.down_loaded_rtt_ms, Some(30.0));
+        assert_eq!(s.up_loaded_rtt_ms, Some(90.0));
+        assert_eq!(s.loaded_rtt_ms, Some(50.0));
+        assert_eq!(s.idle_rtt_ms, Some(6.0));
+    }
+
+    #[test]
+    fn written_upload_counting_wins() {
+        let mut acc = Acc::default();
+        assert_eq!(acc.summary().up_counting, None);
+        acc.set_up_counting(UpCounting::Acked);
+        assert_eq!(acc.summary().up_counting, Some(UpCounting::Acked));
+        acc.set_up_counting(UpCounting::Written);
+        acc.set_up_counting(UpCounting::Acked);
+        assert_eq!(acc.summary().up_counting, Some(UpCounting::Written));
     }
 
     #[test]

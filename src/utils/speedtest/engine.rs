@@ -18,19 +18,24 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use super::proto::{self, SPEEDTEST_DOMAIN};
-use super::{Mode, Phase, SampleInput, SpeedTestTask};
+use super::{Mode, Phase, SampleInput, SpeedTestTask, UpCounting};
 use crate::proxy::TargetAddr;
 use crate::proxy::outbound::{AnyOutbound, AnyStream, PathState};
 
 /// Idle latency measurement at the start of a round.
 pub(super) const IDLE_LATENCY: Duration = Duration::from_secs(3);
-const PING_INTERVAL: Duration = Duration::from_secs(1);
+/// Request pings run back to back at most this often, so each 1 s sample
+/// usually holds several for its per-second latency and power.
+const PING_INTERVAL: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const UDP_INTERVAL: Duration = Duration::from_millis(50);
 const UDP_PROBE_LEN: usize = 32;
-/// Bound on the server-side stats query so a slow answer under load does not
-/// hold up the 1 s sampler for long.
+/// Bound on one server-side stats query, so a slow answer under load only
+/// skips a few data-RTT polls.
 const DOWNLINK_STATE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How often the data path's RTT and loss counters are read. The RTT is
+/// quinn's smoothed estimate, so polling faster adds little.
+const DATA_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
 /// Samples taken this early in a phase are dropped from the summary, since
@@ -75,7 +80,7 @@ async fn run_inner(task: &Arc<SpeedTestTask>, outbound: &Arc<dyn AnyOutbound>) -
     // The first connection doubles as the support check: a node that is not a
     // quicproxy server with a speedtest route fails the handshake here.
     let first = tokio::select! {
-        r = connect(task, outbound) => r.context("node does not support built-in speed test")?,
+        r = connect(task, outbound) => r.context("node does not support built-in speed test")?.0,
         _ = task.cancel.cancelled() => return Ok(()),
     };
 
@@ -83,6 +88,7 @@ async fn run_inner(task: &Arc<SpeedTestTask>, outbound: &Arc<dyn AnyOutbound>) -
     background.spawn(tcp_probe(task.clone(), outbound.clone(), first));
     background.spawn(udp_probe(task.clone(), outbound.clone()));
     background.spawn(sampler(task.clone(), outbound.clone()));
+    background.spawn(data_poller(task.clone(), outbound.clone()));
 
     let result = tokio::select! {
         r = rounds(task, outbound) => r,
@@ -165,7 +171,14 @@ async fn transfer(
     outbound: &Arc<dyn AnyOutbound>,
     phase: Phase,
 ) -> Result<()> {
-    let mut s = connect(task, outbound).await?;
+    let (mut s, version) = connect(task, outbound).await?;
+    if phase == Phase::Upload && version >= proto::VERSION_UPLOAD_ACKED {
+        task.set_up_counting(UpCounting::Acked);
+        return upload_acked(task, s).await;
+    }
+    if phase == Phase::Upload {
+        task.set_up_counting(UpCounting::Written);
+    }
     loop {
         match phase {
             Phase::Download => {
@@ -188,6 +201,38 @@ async fn transfer(
     }
 }
 
+/// Uploads on a version 2 stream, counting the bytes the server reports
+/// received rather than the bytes written. Reading and writing run at once:
+/// the server's reports would otherwise back up and stall the upload.
+async fn upload_acked(task: &Arc<SpeedTestTask>, mut s: CountingStream) -> Result<()> {
+    s.count_writes = false;
+    s.count_reads = false;
+    let (mut rd, mut wr) = tokio::io::split(s);
+    loop {
+        let writer = async {
+            wr.write_all(&command(proto::CMD_UPLOAD_ACKED, proto::MAX_TRANSFER))
+                .await?;
+            proto::write_payload(&mut wr, proto::MAX_TRANSFER).await?;
+            anyhow::Ok(())
+        };
+        let reader = async {
+            let mut last = 0u64;
+            loop {
+                let got = rd.read_u64().await?;
+                if got < last || got > proto::MAX_TRANSFER {
+                    bail!("bad upload progress {got} after {last}");
+                }
+                task.up.fetch_add(got - last, Ordering::Relaxed);
+                last = got;
+                if got == proto::MAX_TRANSFER {
+                    return anyhow::Ok(());
+                }
+            }
+        };
+        tokio::try_join!(writer, reader)?;
+    }
+}
+
 fn command(cmd: u8, arg: u64) -> [u8; 9] {
     let mut buf = [0u8; 9];
     buf[0] = cmd;
@@ -203,10 +248,11 @@ fn udp_target() -> TargetAddr {
     TargetAddr::Domain(SPEEDTEST_DOMAIN.to_string(), proto::UDP_PORT)
 }
 
+/// Opens a speed test stream; returns it with the negotiated version.
 async fn connect(
     task: &Arc<SpeedTestTask>,
     outbound: &Arc<dyn AnyOutbound>,
-) -> Result<CountingStream> {
+) -> Result<(CountingStream, u8)> {
     let limit = outbound.connect_timeout() + PROBE_TIMEOUT;
     timeout(limit, async {
         let inner = outbound.connect_stream(&tcp_target()).await?;
@@ -214,9 +260,11 @@ async fn connect(
             inner,
             down: task.down.clone(),
             up: task.up.clone(),
+            count_reads: true,
+            count_writes: true,
         };
-        proto::client_handshake(&mut s).await?;
-        anyhow::Ok(s)
+        let version = proto::client_handshake(&mut s).await?;
+        anyhow::Ok((s, version))
     })
     .await
     .context("speed test connect timed out")?
@@ -237,7 +285,7 @@ async fn tcp_probe(
         tick.tick().await;
         if conn.is_none() {
             match connect(&task, &outbound).await {
-                Ok(s) => conn = Some(s),
+                Ok((s, _)) => conn = Some(s),
                 Err(e) => {
                     debug!("speed test {} ping reconnect failed: {e:#}", task.id);
                     task.on_tcp_timeout();
@@ -369,26 +417,16 @@ async fn sampler(task: Arc<SpeedTestTask>, outbound: Arc<dyn AnyOutbound>) {
         let secs = now.duration_since(last_at).as_secs_f64().max(0.001);
         let down_bps = ((bytes.0 - last_bytes.0) as f64 * 8.0 / secs) as u64;
         let up_bps = ((bytes.1 - last_bytes.1) as f64 * 8.0 / secs) as u64;
-        let phase = task.phase();
-        let uplink = outbound.get_uplink_state().await;
-        // The server's RTT estimate is the one fed by download data packets;
-        // query it only while downloading.
-        let downlink = if phase == Phase::Download {
-            timeout(DOWNLINK_STATE_TIMEOUT, outbound.get_downlink_state())
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-        let quic = uplink.as_ref().map(|s| (s.lost_packets, s.sent_packets));
+        let quic = outbound
+            .get_uplink_state()
+            .await
+            .map(|s| (s.lost_packets, s.sent_packets));
         task.on_sample(SampleInput {
             down_bps,
             up_bps,
             gen_at_start: last_gen,
+            secs,
             quic,
-            data_rtt_ms: data_rtt_ms(phase, uplink.as_ref(), downlink.as_ref()),
-            data_path: data_path(phase, uplink.as_ref(), downlink.as_ref()),
         });
         last_bytes = bytes;
         last_at = now;
@@ -402,6 +440,36 @@ async fn sampler(task: Arc<SpeedTestTask>, outbound: Arc<dyn AnyOutbound>) {
         {
             task.stop(Some("max_bytes"));
         }
+    }
+}
+
+/// Reads the data path every [`DATA_POLL_INTERVAL`]: the server's state
+/// while downloading (the side sending the data), the client's otherwise.
+async fn data_poller(task: Arc<SpeedTestTask>, outbound: Arc<dyn AnyOutbound>) {
+    let mut tick = interval(DATA_POLL_INTERVAL);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        let phase_gen = task.phase_gen();
+        let phase = task.phase();
+        let (uplink, downlink) = if phase == Phase::Download {
+            let down = timeout(DOWNLINK_STATE_TIMEOUT, outbound.get_downlink_state())
+                .await
+                .ok()
+                .flatten();
+            let up = match down {
+                Some(_) => None,
+                None => outbound.get_uplink_state().await,
+            };
+            (up, down)
+        } else {
+            (outbound.get_uplink_state().await, None)
+        };
+        task.on_data_poll(
+            phase_gen,
+            data_rtt_ms(phase, uplink.as_ref(), downlink.as_ref()),
+            data_path(phase, uplink.as_ref(), downlink.as_ref()),
+        );
     }
 }
 
@@ -442,11 +510,14 @@ pub(super) fn data_path(
 // ─── Counting stream ───
 
 /// Counts every byte read and written so throughput is measured at the
-/// tunnel's payload level.
+/// tunnel's payload level. An acked upload turns counting off and counts the
+/// server's reports instead.
 struct CountingStream {
     inner: AnyStream,
     down: Arc<AtomicU64>,
     up: Arc<AtomicU64>,
+    count_reads: bool,
+    count_writes: bool,
 }
 
 impl AsyncRead for CountingStream {
@@ -458,7 +529,7 @@ impl AsyncRead for CountingStream {
         let before = buf.filled().len();
         let r = Pin::new(&mut self.inner).poll_read(cx, buf);
         let n = buf.filled().len() - before;
-        if n > 0 {
+        if n > 0 && self.count_reads {
             self.down.fetch_add(n as u64, Ordering::Relaxed);
         }
         r
@@ -472,7 +543,9 @@ impl AsyncWrite for CountingStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let r = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = r {
+        if let Poll::Ready(Ok(n)) = r
+            && self.count_writes
+        {
             self.up.fetch_add(n as u64, Ordering::Relaxed);
         }
         r

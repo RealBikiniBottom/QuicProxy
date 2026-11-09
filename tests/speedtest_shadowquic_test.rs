@@ -6,11 +6,53 @@ mod common;
 
 use common::shadowquic::{client_config, server_config};
 use common::{TestContext, Watchdog};
-use quicproxy::utils::speedtest::{self, Direction, Mode, Phase, SpeedTestRequest, State};
+use quicproxy::utils::speedtest::{
+    self, Direction, Mode, Phase, Snapshot, SpeedTestRequest, State, UpCounting,
+};
 use serde_json::json;
 use std::time::Duration;
 
 const SPEEDTEST_DOMAIN: &str = "speedtest.quicproxy.internal";
+
+/// The summary's power is the mean of the per-second powers, each the
+/// second's rate over its request ping normalised to 50 ms.
+fn check_power(snap: &Snapshot) {
+    for (phase, power) in [
+        (Phase::Download, snap.summary.down_power),
+        (Phase::Upload, snap.summary.up_power),
+    ] {
+        let mut per_second = Vec::new();
+        for s in snap.samples.iter().filter(|s| s.phase == phase) {
+            let Some(p) = s.power else { continue };
+            let rate = if phase == Phase::Download {
+                s.down_bps
+            } else {
+                s.up_bps
+            };
+            let ping = s.rtt_ms.expect("power without a ping");
+            let expected = rate as f64 / 1e6 / (ping / 50.0);
+            // rtt_ms is rounded to 0.01 ms, a few percent on loopback.
+            assert!(
+                (p - expected).abs() <= 0.05 * expected,
+                "{phase:?}: {p} vs {expected}"
+            );
+            per_second.push(p);
+        }
+        assert!(
+            !per_second.is_empty(),
+            "no per-second power during {phase:?}"
+        );
+        let mean = per_second.iter().sum::<f64>() / per_second.len() as f64;
+        let power = power.unwrap_or_else(|| panic!("{phase:?}: no power"));
+        assert!(
+            (power - mean).abs() <= 0.01 * mean,
+            "{phase:?}: {power} vs mean {mean}"
+        );
+    }
+    assert!(snap.summary.down_loaded_rtt_ms.is_some());
+    assert!(snap.summary.up_loaded_rtt_ms.is_some());
+    assert_eq!(snap.summary.up_counting, Some(UpCounting::Acked));
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_speedtest_power_through_shadowquic() {
@@ -83,21 +125,21 @@ async fn test_speedtest_power_through_shadowquic() {
             "no per-second QUIC loss during {phase:?}"
         );
     }
-    let s = &snap.summary;
-    for (dir, rtt, util, power) in [
-        ("down", s.down_data_rtt_ms, s.down_utilization, s.down_power),
-        ("up", s.up_data_rtt_ms, s.up_utilization, s.up_power),
-    ] {
-        let rtt = rtt.unwrap_or_else(|| panic!("{dir}: no data RTT"));
-        let util = util.unwrap_or_else(|| panic!("{dir}: no utilization"));
-        let power = power.unwrap_or_else(|| panic!("{dir}: no power"));
-        assert!(rtt > 0.0 && util > 0.0 && util <= 1.0, "{dir}: {s:?}");
-        // The summary rounds the RTT to 0.01 ms, which on loopback (~0.1 ms)
-        // moves the recomputed value by a few percent.
-        let expected = util / (rtt / 50.0);
-        assert!(
-            (power - expected).abs() <= 0.1 * expected,
-            "{dir}: power {power} vs {expected}"
-        );
-    }
+    // The data RTT is quinn's smoothed RTT polled every 100 ms, averaged per
+    // 1 s sample.
+    assert_eq!(snap.data_rtt_source, Some("quic_srtt"));
+    let polls: Vec<u32> = snap
+        .samples
+        .iter()
+        .filter(|s| s.data_rtt_ms.is_some())
+        .map(|s| s.data_rtt_samples)
+        .collect();
+    assert!(
+        polls.iter().any(|&n| n >= 5),
+        "expected several polls per sample: {polls:?}"
+    );
+    // The data RTT is shown, not used for power.
+    assert!(snap.summary.down_data_rtt_ms.is_some_and(|r| r > 0.0));
+    assert!(snap.summary.up_data_rtt_ms.is_some_and(|r| r > 0.0));
+    check_power(&snap);
 }

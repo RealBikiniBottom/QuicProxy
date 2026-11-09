@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::proxy::outbound::{AnyOutbound, OUTBOUNDS_MAP};
 use stats::Acc;
-pub use stats::{RateSummary, Summary};
+pub use stats::{RateSummary, Summary, UpCounting};
 
 /// Finished tasks stay queryable for this long.
 const KEEP_FINISHED: Duration = Duration::from_secs(600);
@@ -162,11 +162,20 @@ pub struct Sample {
     pub phase: Phase,
     pub down_bps: u64,
     pub up_bps: u64,
-    /// TCP ping RTT through the tunnel.
+    /// Mean request-ping RTT (through the tunnel) of the pings completed in
+    /// this interval; absent when none completed.
     pub rtt_ms: Option<f64>,
-    /// RTT estimate of the QUIC connection carrying the transfer; absent for
-    /// non-QUIC outbounds.
+    /// Number of pings behind `rtt_ms`.
+    pub rtt_samples: u32,
+    /// Power of this second, rate / (rtt_ms / 50 ms) in Mbit/s; only for
+    /// transfer samples after the warm-up.
+    pub power: Option<f64>,
+    /// Mean over this interval of the QUIC connection's smoothed RTT, polled
+    /// every 100 ms on the side sending the data; absent for non-QUIC
+    /// outbounds.
     pub data_rtt_ms: Option<f64>,
+    /// Number of polls behind `data_rtt_ms`.
+    pub data_rtt_samples: u32,
     /// UDP echo loss over this sample's interval; absent when fewer than
     /// [`MIN_UDP_SENT`] probes were sent.
     pub udp_loss_pct: Option<f64>,
@@ -187,13 +196,16 @@ pub(super) struct SampleInput {
     pub up_bps: u64,
     /// Phase generation at the start of the interval.
     pub gen_at_start: u64,
+    /// Length of the interval.
+    pub secs: f64,
     /// Client-side (lost, sent) QUIC packet counters, for the summary.
     pub quic: Option<(u64, u64)>,
-    pub data_rtt_ms: Option<f64>,
-    /// (lost, sent) counters of the side sending the data, and whether that
-    /// side is the server.
-    pub data_path: Option<(bool, u64, u64)>,
 }
+
+/// What the data RTT means, reported in the snapshot once the outbound
+/// reported one: quinn's RFC 6298 smoothed RTT (its latest raw sample is not
+/// public), polled every 100 ms.
+pub const DATA_RTT_SOURCE: &str = "quic_srtt";
 
 /// Loss in percent from counter deltas; None below `min_sent`.
 pub(super) fn interval_loss_pct(lost: u64, sent: u64, min_sent: u64) -> Option<f64> {
@@ -236,6 +248,8 @@ pub struct Snapshot {
     pub rounds: Vec<Round>,
     pub samples: Vec<Sample>,
     pub next_seq: u64,
+    /// [`DATA_RTT_SOURCE`] once the outbound reported a data RTT.
+    pub data_rtt_source: Option<&'static str>,
     pub stop_reason: Option<String>,
     pub error: Option<String>,
 }
@@ -261,6 +275,13 @@ struct Inner {
     /// Data-path counters at the previous sample: (server side, phase gen,
     /// lost, sent).
     data_path_mark: Option<(bool, u64, u64, u64)>,
+    /// Latest data-path counters from the RTT poller.
+    data_path_latest: Option<(bool, u64, u64)>,
+    /// Data-RTT polls since the last sample: (phase gen, sum ms, count).
+    rtt_polls: (u64, f64, u32),
+    /// Request pings since the last sample: (phase gen, sum ms, count).
+    pings: (u64, f64, u32),
+    data_rtt_seen: bool,
     stop_reason: Option<String>,
     error: Option<String>,
     finished_at: Option<Instant>,
@@ -349,11 +370,26 @@ impl SpeedTestTask {
     }
 
     fn on_tcp_rtt(&self, rtt_ms: f64) {
+        let warmup = engine::warmup(self.req.phase_secs);
         let mut inner = self.lock();
         inner.current.rtt_ms = Some(rtt_ms);
         let phase = inner.phase;
-        inner.total.add_rtt(phase, rtt_ms);
-        inner.round.add_rtt(phase, rtt_ms);
+        let clean = inner.phase_started.elapsed() >= warmup;
+        inner.total.add_rtt(phase, rtt_ms, clean);
+        inner.round.add_rtt(phase, rtt_ms, clean);
+        let phase_gen = inner.phase_gen;
+        let (g, sum, n) = inner.pings;
+        inner.pings = if g == phase_gen && n > 0 {
+            (g, sum + rtt_ms, n + 1)
+        } else {
+            (phase_gen, rtt_ms, 1)
+        };
+    }
+
+    fn set_up_counting(&self, c: UpCounting) {
+        let mut inner = self.lock();
+        inner.total.set_up_counting(c);
+        inner.round.set_up_counting(c);
     }
 
     fn on_tcp_timeout(&self) {
@@ -380,9 +416,8 @@ impl SpeedTestTask {
             down_bps,
             up_bps,
             gen_at_start,
+            secs,
             quic,
-            data_rtt_ms,
-            data_path,
         } = input;
         let t_ms = self.elapsed_ms();
         let warmup = engine::warmup(self.req.phase_secs);
@@ -390,25 +425,41 @@ impl SpeedTestTask {
         inner.current.down_bps = down_bps;
         inner.current.up_bps = up_bps;
         let clean = inner.phase_gen == gen_at_start && inner.phase_started.elapsed() >= warmup;
-        match inner.phase {
-            Phase::Download if clean => {
-                inner.total.down.push(down_bps);
-                inner.round.down.push(down_bps);
-                if let Some(rtt) = data_rtt_ms {
-                    inner.total.down_data_rtt.push(rtt);
-                    inner.round.down_data_rtt.push(rtt);
+        // Only polls made during this interval's phase count.
+        let (poll_gen, poll_sum, poll_n) = std::mem::replace(&mut inner.rtt_polls, (0, 0.0, 0));
+        let data_rtt = (poll_n > 0 && poll_gen == gen_at_start && poll_gen == inner.phase_gen)
+            .then(|| (poll_sum / poll_n as f64, poll_n));
+        let (ping_gen, ping_sum, ping_n) = std::mem::replace(&mut inner.pings, (0, 0.0, 0));
+        let ping = (ping_n > 0 && ping_gen == gen_at_start && ping_gen == inner.phase_gen)
+            .then(|| (ping_sum / ping_n as f64, ping_n));
+        let phase = inner.phase;
+        let phase_gen = inner.phase_gen;
+        let rate = match phase {
+            Phase::Download => down_bps,
+            _ => up_bps,
+        };
+        let power = (clean && phase.loaded())
+            .then(|| stats::second_power(rate, ping.map(|(p, _)| p)))
+            .flatten();
+        if clean && phase.loaded() {
+            inner
+                .total
+                .add_transfer(phase, phase_gen, rate, secs, data_rtt, power);
+            inner
+                .round
+                .add_transfer(phase, phase_gen, rate, secs, data_rtt, power);
+            match phase {
+                Phase::Download => {
+                    inner.total.down.push(down_bps);
+                    inner.round.down.push(down_bps);
+                }
+                _ => {
+                    inner.total.up.push(up_bps);
+                    inner.round.up.push(up_bps);
                 }
             }
-            Phase::Upload if clean => {
-                inner.total.up.push(up_bps);
-                inner.round.up.push(up_bps);
-                if let Some(rtt) = data_rtt_ms {
-                    inner.total.up_data_rtt.push(rtt);
-                    inner.round.up_data_rtt.push(rtt);
-                }
-            }
-            _ => {}
         }
+        let data_path = inner.data_path_latest;
         if let Some(q) = quic {
             if inner.total.quic_base.is_none() {
                 inner.total.quic_base = Some(q);
@@ -452,8 +503,11 @@ impl SpeedTestTask {
             phase: inner.phase,
             down_bps,
             up_bps,
-            rtt_ms: inner.current.rtt_ms,
-            data_rtt_ms,
+            rtt_ms: ping.map(|(p, _)| (p * 100.0).round() / 100.0),
+            rtt_samples: ping.map_or(0, |(_, n)| n),
+            power: power.map(|p| (p * 10_000.0).round() / 10_000.0),
+            data_rtt_ms: data_rtt.map(|(mean, _)| (mean * 100.0).round() / 100.0),
+            data_rtt_samples: data_rtt.map_or(0, |(_, n)| n),
             udp_loss_pct,
             quic_loss_pct,
         };
@@ -465,6 +519,30 @@ impl SpeedTestTask {
 
     fn phase_gen(&self) -> u64 {
         self.lock().phase_gen
+    }
+
+    /// One 100 ms poll of the data path: its RTT and loss counters. Polls
+    /// from a phase that has since ended are dropped.
+    fn on_data_poll(
+        &self,
+        phase_gen: u64,
+        rtt_ms: Option<f64>,
+        data_path: Option<(bool, u64, u64)>,
+    ) {
+        let mut inner = self.lock();
+        if inner.phase_gen != phase_gen {
+            return;
+        }
+        inner.data_path_latest = data_path;
+        if let Some(rtt) = rtt_ms {
+            inner.data_rtt_seen = true;
+            let (g, sum, n) = inner.rtt_polls;
+            inner.rtt_polls = if g == phase_gen && n > 0 {
+                (g, sum + rtt, n + 1)
+            } else {
+                (phase_gen, rtt, 1)
+            };
+        }
     }
 
     fn phase(&self) -> Phase {
@@ -543,6 +621,7 @@ impl SpeedTestTask {
             },
             samples,
             next_seq: inner.next_seq,
+            data_rtt_source: inner.data_rtt_seen.then_some(DATA_RTT_SOURCE),
             stop_reason: inner.stop_reason.clone(),
             error: inner.error.clone(),
         }
@@ -649,6 +728,10 @@ pub fn start(req: SpeedTestRequest) -> Result<Arc<SpeedTestTask>, StartError> {
             quic_last: None,
             udp_mark: (0, 0),
             data_path_mark: None,
+            data_path_latest: None,
+            rtt_polls: (0, 0.0, 0),
+            pings: (0, 0.0, 0),
+            data_rtt_seen: false,
             stop_reason: None,
             error: None,
             finished_at: None,
