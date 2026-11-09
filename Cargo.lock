@@ -2476,9 +2476,9 @@ dependencies = [
 
 [[package]]
 name = "notify-types"
-version = "2.2.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a437a9308232ce794b1e7fdf540d38ea37efc3c73492640c13b4c8568b8f108"
+checksum = "8c491a384baf9fec20df565cdb8138a12809d4c7439763b566eb8114c5d59979"
 dependencies = [
  "bitflags 2.13.2",
 ]
@@ -3028,7 +3028,7 @@ dependencies = [
 [[package]]
 name = "quinn"
 version = "0.12.0"
-source = "git+https://github.com/spongebob888/quinn-jls?branch=jls-main#2c39497abd8bbb4f9ecc1b5bc0bef5e3835877cc"
+source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=copa#7848b06e45bd3d0c9de37bd096cc2fa506d8476f"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3069,7 +3069,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.12.0"
-source = "git+https://github.com/spongebob888/quinn-jls?branch=jls-main#2c39497abd8bbb4f9ecc1b5bc0bef5e3835877cc"
+source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=copa#7848b06e45bd3d0c9de37bd096cc2fa506d8476f"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -3104,7 +3104,7 @@ dependencies = [
 [[package]]
 name = "quinn-udp"
 version = "0.6.3"
-source = "git+https://github.com/spongebob888/quinn-jls?branch=jls-main#2c39497abd8bbb4f9ecc1b5bc0bef5e3835877cc"
+source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=copa#7848b06e45bd3d0c9de37bd096cc2fa506d8476f"
 dependencies = [
  "cfg_aliases",
  "libc",
