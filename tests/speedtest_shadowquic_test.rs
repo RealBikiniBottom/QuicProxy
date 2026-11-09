@@ -14,27 +14,37 @@ use std::time::Duration;
 
 const SPEEDTEST_DOMAIN: &str = "speedtest.quicproxy.internal";
 
-/// The summary's power is the mean of the per-second powers, each the
-/// second's rate (Mbit/s) over its request ping (ms).
+/// Loaded latency is the QUIC RTT; the summary's power is the mean of the
+/// per-second powers, each the second's rate (Mbit/s) over its loaded
+/// latency (ms).
 fn check_power(snap: &Snapshot) {
-    for (phase, power) in [
-        (Phase::Download, snap.summary.down_power),
-        (Phase::Upload, snap.summary.up_power),
+    for (phase, power, loaded) in [
+        (
+            Phase::Download,
+            snap.summary.down_power,
+            snap.summary.down_loaded_rtt_ms,
+        ),
+        (
+            Phase::Upload,
+            snap.summary.up_power,
+            snap.summary.up_loaded_rtt_ms,
+        ),
     ] {
         let mut per_second = Vec::new();
         for s in snap.samples.iter().filter(|s| s.phase == phase) {
+            assert!(s.rtt_ms.is_none(), "ping during {phase:?}");
             let Some(p) = s.power else { continue };
             let rate = if phase == Phase::Download {
                 s.down_bps
             } else {
                 s.up_bps
             };
-            let ping = s.rtt_ms.expect("power without a ping");
-            // P_t = rate (Mbit/s) / ping (ms). rtt_ms is rounded to 1 µs,
-            // which is a few percent of a loopback ping.
-            let expected = rate as f64 / 1e6 / ping;
+            let rtt = s.data_rtt_ms.expect("power without a loaded latency");
+            // P_t = rate (Mbit/s) / loaded latency (ms); data_rtt_ms is
+            // rounded to 0.01 ms, a few percent on loopback.
+            let expected = rate as f64 / 1e6 / rtt;
             assert!(
-                (p - expected).abs() <= 0.05 * expected,
+                (p - expected).abs() <= 0.1 * expected,
                 "{phase:?}: {p} vs {expected}"
             );
             per_second.push(p);
@@ -49,9 +59,11 @@ fn check_power(snap: &Snapshot) {
             (power - mean).abs() <= 0.01 * mean,
             "{phase:?}: {power} vs mean {mean}"
         );
+        assert!(
+            loaded.is_some_and(|r| r > 0.0),
+            "{phase:?}: no loaded latency"
+        );
     }
-    assert!(snap.summary.down_loaded_rtt_ms.is_some());
-    assert!(snap.summary.up_loaded_rtt_ms.is_some());
     assert_eq!(snap.summary.up_counting, Some(UpCounting::Acked));
 }
 
@@ -139,8 +151,5 @@ async fn test_speedtest_power_through_shadowquic() {
         polls.iter().any(|&n| n >= 5),
         "expected several polls per sample: {polls:?}"
     );
-    // The data RTT is shown, not used for power.
-    assert!(snap.summary.down_data_rtt_ms.is_some_and(|r| r > 0.0));
-    assert!(snap.summary.up_data_rtt_ms.is_some_and(|r| r > 0.0));
     check_power(&snap);
 }

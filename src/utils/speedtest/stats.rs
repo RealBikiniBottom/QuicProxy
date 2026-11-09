@@ -20,14 +20,18 @@ pub struct Summary {
     pub up: Option<RateSummary>,
     /// Mean request-ping RTT while no transfer was running.
     pub idle_rtt_ms: Option<f64>,
-    /// Mean request-ping RTT during download and upload, after each phase's
-    /// warm-up; [`Summary::down_loaded_rtt_ms`] and
-    /// [`Summary::up_loaded_rtt_ms`] split it by direction.
+    /// Loaded latency: the QUIC connection's smoothed RTT polled every 100 ms
+    /// during download and upload, after each phase's warm-up, on the side
+    /// sending the data (server while downloading, client while uploading);
+    /// the mean of the polls. No ping is sent during transfers. Absent for
+    /// non-QUIC outbounds, and for a direction whose side cannot report it.
+    /// [`Summary::down_loaded_rtt_ms`] and [`Summary::up_loaded_rtt_ms`]
+    /// split it by direction.
     pub loaded_rtt_ms: Option<f64>,
     pub down_loaded_rtt_ms: Option<f64>,
     pub up_loaded_rtt_ms: Option<f64>,
     /// Mean absolute difference between consecutive RTTs (UDP echo when
-    /// available, TCP ping otherwise).
+    /// available, idle request pings otherwise).
     pub jitter_ms: Option<f64>,
     /// UDP echo loss; absent when the node never echoed a datagram.
     pub udp_loss_pct: Option<f64>,
@@ -37,11 +41,6 @@ pub struct Summary {
     pub quic_loss_pct: Option<f64>,
     pub probe_timeouts: u64,
     pub errors: u64,
-    /// Mean of the QUIC connection's smoothed RTT (polled every 100 ms) over
-    /// the clean transfer time, in ms; absent for non-QUIC outbounds. Shown
-    /// next to the request latency; not part of the power.
-    pub down_data_rtt_ms: Option<f64>,
-    pub up_data_rtt_ms: Option<f64>,
     /// Mean over the clean transfer seconds of the per-second power
     /// [`second_power`], in Mbit/s per ms.
     pub down_power: Option<f64>,
@@ -61,12 +60,12 @@ pub enum UpCounting {
     Written,
 }
 
-/// Power of one second, after Kleinrock: P_t = rate_t / ping_t in Mbit/s
-/// per ms, where ping_t is the mean request-ping RTT completed in that
-/// second (the loaded request latency). None without a ping.
-pub(super) fn second_power(rate_bps: u64, ping_ms: Option<f64>) -> Option<f64> {
-    let ping = ping_ms.filter(|p| *p > 0.0)?;
-    Some(rate_bps as f64 / 1e6 / ping)
+/// Power of one second, after Kleinrock: P_t = rate_t / rtt_t in Mbit/s per
+/// ms, where rtt_t is that second's loaded latency (mean of its QUIC RTT
+/// polls). None without one.
+pub(super) fn second_power(rate_bps: u64, rtt_ms: Option<f64>) -> Option<f64> {
+    let rtt = rtt_ms.filter(|p| *p > 0.0)?;
+    Some(rate_bps as f64 / 1e6 / rtt)
 }
 
 /// One clean (post-warm-up) transfer phase of one direction.
@@ -97,7 +96,7 @@ fn mean_bps(phases: &[PhaseAcc]) -> Option<u64> {
     (secs > 0.0).then(|| (phases.iter().map(|p| p.bits).sum::<f64>() / secs).round() as u64)
 }
 
-/// Poll-weighted mean data RTT of `phases`.
+/// Poll-weighted mean loaded latency of `phases`.
 fn mean_data_rtt(phases: &[PhaseAcc]) -> Option<f64> {
     let n: u64 = phases.iter().map(|p| p.rtt_n).sum();
     (n > 0).then(|| round2(phases.iter().map(|p| p.rtt_sum_ms).sum::<f64>() / n as f64))
@@ -143,8 +142,6 @@ pub(super) struct Acc {
     down_gen: Option<u64>,
     up_gen: Option<u64>,
     idle_rtt: Vec<f64>,
-    down_loaded_rtt: Vec<f64>,
-    up_loaded_rtt: Vec<f64>,
     tcp_jitter: Jitter,
     udp_jitter: Jitter,
     pub udp_sent: u64,
@@ -187,14 +184,10 @@ impl Acc {
         phases.last_mut().unwrap().add(rate_bps, secs, rtt);
     }
 
-    /// A request-ping RTT. Loaded pings only count after the phase's
-    /// warm-up (`clean`), like the throughput.
-    pub fn add_rtt(&mut self, phase: Phase, rtt: f64, clean: bool) {
-        match phase {
-            Phase::Download if clean => self.down_loaded_rtt.push(rtt),
-            Phase::Upload if clean => self.up_loaded_rtt.push(rtt),
-            _ if phase.idle() => self.idle_rtt.push(rtt),
-            _ => {}
+    /// A request-ping RTT; pings only run outside transfers.
+    pub fn add_rtt(&mut self, phase: Phase, rtt: f64) {
+        if phase.idle() {
+            self.idle_rtt.push(rtt);
         }
         self.tcp_jitter.add(rtt);
     }
@@ -227,19 +220,19 @@ impl Acc {
                 r
             })
         };
-        let loaded: Vec<f64> = self
-            .down_loaded_rtt
+        let all_phases: Vec<PhaseAcc> = self
+            .down_phases
             .iter()
-            .chain(&self.up_loaded_rtt)
+            .chain(&self.up_phases)
             .copied()
             .collect();
         Summary {
             down: rates(&self.down, &self.down_phases),
             up: rates(&self.up, &self.up_phases),
             idle_rtt_ms: mean(&self.idle_rtt).map(round2),
-            loaded_rtt_ms: mean(&loaded).map(round2),
-            down_loaded_rtt_ms: mean(&self.down_loaded_rtt).map(round2),
-            up_loaded_rtt_ms: mean(&self.up_loaded_rtt).map(round2),
+            loaded_rtt_ms: mean_data_rtt(&all_phases),
+            down_loaded_rtt_ms: mean_data_rtt(&self.down_phases),
+            up_loaded_rtt_ms: mean_data_rtt(&self.up_phases),
             jitter_ms: self.udp_jitter.value().or_else(|| self.tcp_jitter.value()),
             udp_loss_pct,
             udp_sent: self.udp_sent,
@@ -247,8 +240,6 @@ impl Acc {
             quic_loss_pct,
             probe_timeouts: self.probe_timeouts,
             errors: self.errors,
-            down_data_rtt_ms: mean_data_rtt(&self.down_phases),
-            up_data_rtt_ms: mean_data_rtt(&self.up_phases),
             down_power: mean(&self.down_powers).map(round4),
             up_power: mean(&self.up_powers).map(round4),
             up_counting: self.up_counting,
@@ -302,15 +293,16 @@ mod tests {
     #[test]
     fn rtt_split_by_phase_and_jitter() {
         let mut acc = Acc::default();
-        acc.add_rtt(Phase::IdleLatency, 100.0, false);
-        acc.add_rtt(Phase::IdleLatency, 110.0, false);
-        acc.add_rtt(Phase::Download, 200.0, true);
-        acc.add_rtt(Phase::Connecting, 999.0, false);
+        acc.add_rtt(Phase::IdleLatency, 100.0);
+        acc.add_rtt(Phase::IdleLatency, 110.0);
+        acc.add_rtt(Phase::Waiting, 120.0);
+        acc.add_rtt(Phase::Connecting, 999.0);
         let s = acc.summary();
-        assert_eq!(s.idle_rtt_ms, Some(105.0));
-        assert_eq!(s.loaded_rtt_ms, Some(200.0));
-        // |110-100| + |200-110| + |999-200| over 3
-        assert_eq!(s.jitter_ms, Some(round2((10.0 + 90.0 + 799.0) / 3.0)));
+        assert_eq!(s.idle_rtt_ms, Some(110.0));
+        // Pings are not the loaded latency.
+        assert_eq!(s.loaded_rtt_ms, None);
+        // |110-100| + |120-110| + |999-120| over 3
+        assert_eq!(s.jitter_ms, Some(round2((10.0 + 10.0 + 879.0) / 3.0)));
 
         acc.add_udp_rtt(50.0);
         acc.add_udp_rtt(54.0);
@@ -330,7 +322,7 @@ mod tests {
 
     #[test]
     fn second_power_is_rate_over_ping() {
-        // 80 Mbit/s with a 40 ms request ping → 2 Mbit/s per ms.
+        // 80 Mbit/s at a 40 ms loaded latency → 2 Mbit/s per ms.
         assert_eq!(second_power(80_000_000, Some(40.0)), Some(2.0));
         assert_eq!(second_power(80_000_000, Some(160.0)), Some(0.5));
         assert_eq!(second_power(80_000_000, None), None);
@@ -341,29 +333,32 @@ mod tests {
     fn summary_power_rates_and_latency() {
         let mut acc = Acc::default();
         // Download: 100 Mbit/s for 1 s and 200 Mbit/s for 1.5 s; second 2
-        // has no ping, so no power.
+        // has no RTT poll, so no power.
         acc.add_transfer(
             Phase::Download,
             1,
             100_000_000,
             1.0,
             Some((40.0, 10)),
-            Some(50.0),
+            Some(2.5),
         );
-        acc.add_transfer(Phase::Download, 1, 200_000_000, 1.5, Some((100.0, 5)), None);
+        acc.add_transfer(Phase::Download, 1, 200_000_000, 1.5, None, None);
         // A second download phase (new generation, e.g. the next round).
-        acc.add_transfer(Phase::Download, 3, 100_000_000, 1.0, None, Some(150.0));
+        acc.add_transfer(
+            Phase::Download,
+            3,
+            100_000_000,
+            1.0,
+            Some((100.0, 10)),
+            Some(1.0),
+        );
+        // Upload without a QUIC RTT (TCP node, or hysteria2's server side).
         acc.add_transfer(Phase::Upload, 2, 10_000_000, 1.0, None, None);
         acc.down = vec![100_000_000, 200_000_000, 100_000_000];
         acc.up = vec![10_000_000];
         assert_eq!(acc.down_phases.len(), 2);
-
-        acc.add_rtt(Phase::Download, 10.0, false); // warm-up: not loaded
-        acc.add_rtt(Phase::Download, 20.0, true);
-        acc.add_rtt(Phase::Download, 40.0, true);
-        acc.add_rtt(Phase::Upload, 90.0, true);
-        acc.add_rtt(Phase::IdleLatency, 5.0, false);
-        acc.add_rtt(Phase::Waiting, 7.0, false);
+        acc.add_rtt(Phase::IdleLatency, 5.0);
+        acc.add_rtt(Phase::Waiting, 7.0);
 
         let s = acc.summary();
         // Bytes over time: (100 + 300 + 100) Mbit / 3.5 s, not the mean of
@@ -374,13 +369,12 @@ mod tests {
         );
         assert_eq!(s.down.as_ref().unwrap().max_bps, 200_000_000);
         // Mean of the per-second powers that exist.
-        assert_eq!(s.down_power, Some(100.0));
+        assert_eq!(s.down_power, Some(1.75));
         assert_eq!(s.up_power, None);
-        // Data RTT: (400 + 500) / 15 polls.
-        assert_eq!(s.down_data_rtt_ms, Some(60.0));
-        assert_eq!(s.down_loaded_rtt_ms, Some(30.0));
-        assert_eq!(s.up_loaded_rtt_ms, Some(90.0));
-        assert_eq!(s.loaded_rtt_ms, Some(50.0));
+        // Loaded latency: poll-weighted QUIC RTT, (400 + 1000) / 20.
+        assert_eq!(s.down_loaded_rtt_ms, Some(70.0));
+        assert_eq!(s.up_loaded_rtt_ms, None);
+        assert_eq!(s.loaded_rtt_ms, Some(70.0));
         assert_eq!(s.idle_rtt_ms, Some(6.0));
     }
 

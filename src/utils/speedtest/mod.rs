@@ -163,16 +163,16 @@ pub struct Sample {
     pub down_bps: u64,
     pub up_bps: u64,
     /// Mean request-ping RTT (through the tunnel) of the pings completed in
-    /// this interval; absent when none completed.
+    /// this interval; pings run only outside transfers (idle latency).
     pub rtt_ms: Option<f64>,
     /// Number of pings behind `rtt_ms`.
     pub rtt_samples: u32,
-    /// Power of this second, rate / rtt_ms in Mbit/s per ms; only for
-    /// transfer samples after the warm-up that had a ping.
+    /// Power of this second, rate / data_rtt_ms in Mbit/s per ms; only for
+    /// transfer samples after the warm-up that have a loaded latency.
     pub power: Option<f64>,
-    /// Mean over this interval of the QUIC connection's smoothed RTT, polled
-    /// every 100 ms on the side sending the data; absent for non-QUIC
-    /// outbounds.
+    /// Loaded latency of this interval: mean of the QUIC connection's
+    /// smoothed RTT, polled every 100 ms on the side sending the data;
+    /// absent for non-QUIC outbounds and for a side that cannot report it.
     pub data_rtt_ms: Option<f64>,
     /// Number of polls behind `data_rtt_ms`.
     pub data_rtt_samples: u32,
@@ -370,13 +370,11 @@ impl SpeedTestTask {
     }
 
     fn on_tcp_rtt(&self, rtt_ms: f64) {
-        let warmup = engine::warmup(self.req.phase_secs);
         let mut inner = self.lock();
         inner.current.rtt_ms = Some(rtt_ms);
         let phase = inner.phase;
-        let clean = inner.phase_started.elapsed() >= warmup;
-        inner.total.add_rtt(phase, rtt_ms, clean);
-        inner.round.add_rtt(phase, rtt_ms, clean);
+        inner.total.add_rtt(phase, rtt_ms);
+        inner.round.add_rtt(phase, rtt_ms);
         let phase_gen = inner.phase_gen;
         let (g, sum, n) = inner.pings;
         inner.pings = if g == phase_gen && n > 0 {
@@ -439,7 +437,7 @@ impl SpeedTestTask {
             _ => up_bps,
         };
         let power = (clean && phase.loaded())
-            .then(|| stats::second_power(rate, ping.map(|(p, _)| p)))
+            .then(|| stats::second_power(rate, data_rtt.map(|(r, _)| r)))
             .flatten();
         if clean && phase.loaded() {
             inner

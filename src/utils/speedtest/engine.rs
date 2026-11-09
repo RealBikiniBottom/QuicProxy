@@ -24,8 +24,7 @@ use crate::proxy::outbound::{AnyOutbound, AnyStream, PathState};
 
 /// Idle latency measurement at the start of a round.
 pub(super) const IDLE_LATENCY: Duration = Duration::from_secs(3);
-/// Request pings run back to back at most this often, so each 1 s sample
-/// usually holds several for its per-second latency and power.
+/// Request pings (idle latency only) run back to back at most this often.
 const PING_INTERVAL: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const UDP_INTERVAL: Duration = Duration::from_millis(50);
@@ -283,6 +282,11 @@ async fn tcp_probe(
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        // Pings give the idle latency only; under load the QUIC RTT is the
+        // latency, and a ping stream would compete with the transfer.
+        if task.phase().loaded() {
+            continue;
+        }
         if conn.is_none() {
             match connect(&task, &outbound).await {
                 Ok((s, _)) => conn = Some(s),
@@ -457,11 +461,7 @@ async fn data_poller(task: Arc<SpeedTestTask>, outbound: Arc<dyn AnyOutbound>) {
                 .await
                 .ok()
                 .flatten();
-            let up = match down {
-                Some(_) => None,
-                None => outbound.get_uplink_state().await,
-            };
-            (up, down)
+            (None, down)
         } else {
             (outbound.get_uplink_state().await, None)
         };
@@ -473,10 +473,10 @@ async fn data_poller(task: Arc<SpeedTestTask>, outbound: Arc<dyn AnyOutbound>) {
     }
 }
 
-/// RTT of the QUIC connection as seen by the side that sends the phase's
-/// data: the server while downloading, the client otherwise. Falls back to
-/// the other side's estimate when one is unavailable (hysteria2 has no
-/// server-side query).
+/// Loaded latency: RTT of the QUIC connection as seen by the side that sends
+/// the phase's data, the server while downloading and the client otherwise.
+/// No fallback to the other side (hysteria2 has no server-side query, so it
+/// has no download latency).
 pub(super) fn data_rtt_ms(
     phase: Phase,
     uplink: Option<&PathState>,
@@ -488,8 +488,10 @@ pub(super) fn data_rtt_ms(
             .map(|r| (r * 100.0).round() / 100.0)
     };
     match phase {
-        Phase::Download => valid(downlink).or_else(|| valid(uplink)),
-        _ => valid(uplink).or_else(|| valid(downlink)),
+        // No fallback: the client's estimate barely moves while it only
+        // sends ACKs, so it would not be the download's latency.
+        Phase::Download => valid(downlink),
+        _ => valid(uplink),
     }
 }
 
@@ -609,8 +611,8 @@ mod tests {
             data_rtt_ms(Phase::Upload, Some(&up), Some(&down)),
             Some(20.0)
         );
-        // hysteria2: no server-side estimate.
-        assert_eq!(data_rtt_ms(Phase::Download, Some(&up), None), Some(20.0));
+        // hysteria2: no server-side estimate, so no download latency.
+        assert_eq!(data_rtt_ms(Phase::Download, Some(&up), None), None);
         // Non-QUIC outbounds report nothing.
         assert_eq!(data_rtt_ms(Phase::Upload, None, None), None);
         assert_eq!(data_path(Phase::Upload, None, None), None);

@@ -31,47 +31,6 @@ async fn wait_phase(task: &Arc<SpeedTestTask>, phase: Phase, limit: Duration) {
     .unwrap_or_else(|_| panic!("speed test never reached {phase:?}"));
 }
 
-/// The summary's power is the mean of the per-second powers, each the
-/// second's rate (Mbit/s) over its request ping (ms).
-fn check_power(snap: &Snapshot) {
-    for (phase, power) in [
-        (Phase::Download, snap.summary.down_power),
-        (Phase::Upload, snap.summary.up_power),
-    ] {
-        let mut per_second = Vec::new();
-        for s in snap.samples.iter().filter(|s| s.phase == phase) {
-            let Some(p) = s.power else { continue };
-            let rate = if phase == Phase::Download {
-                s.down_bps
-            } else {
-                s.up_bps
-            };
-            let ping = s.rtt_ms.expect("power without a ping");
-            // P_t = rate (Mbit/s) / ping (ms). rtt_ms is rounded to 1 µs,
-            // which is a few percent of a loopback ping.
-            let expected = rate as f64 / 1e6 / ping;
-            assert!(
-                (p - expected).abs() <= 0.05 * expected,
-                "{phase:?}: {p} vs {expected}"
-            );
-            per_second.push(p);
-        }
-        assert!(
-            !per_second.is_empty(),
-            "no per-second power during {phase:?}"
-        );
-        let mean = per_second.iter().sum::<f64>() / per_second.len() as f64;
-        let power = power.unwrap_or_else(|| panic!("{phase:?}: no power"));
-        assert!(
-            (power - mean).abs() <= 0.01 * mean,
-            "{phase:?}: {power} vs mean {mean}"
-        );
-    }
-    assert!(snap.summary.down_loaded_rtt_ms.is_some());
-    assert!(snap.summary.up_loaded_rtt_ms.is_some());
-    assert_eq!(snap.summary.up_counting, Some(UpCounting::Acked));
-}
-
 fn request(mode: Mode, direction: Direction, phase_secs: u64) -> SpeedTestRequest {
     let mut req = SpeedTestRequest::new("trojan_out");
     req.mode = mode;
@@ -196,15 +155,27 @@ async fn test_speedtest_through_trojan() {
     assert!(down.avg_bps > 10_000_000, "download too slow: {down:?}");
     assert!(up.avg_bps > 10_000_000, "upload too slow: {up:?}");
     assert!(snap.summary.idle_rtt_ms.is_some());
-    assert!(snap.summary.loaded_rtt_ms.is_some());
     assert!(snap.summary.jitter_ms.is_some());
-    // Power comes from the request ping, so trojan has it too; only the QUIC
-    // data RTT is missing.
-    check_power(&snap);
+    // Trojan is not QUIC: no loaded latency, so no power; throughput and the
+    // idle ping are unaffected.
     assert!(snap.samples.iter().all(|s| s.data_rtt_ms.is_none()));
     assert!(snap.samples.iter().all(|s| s.data_rtt_samples == 0));
+    assert!(snap.samples.iter().all(|s| s.power.is_none()));
     assert_eq!(snap.data_rtt_source, None);
-    assert_eq!(snap.summary.down_data_rtt_ms, None);
+    assert_eq!(snap.summary.loaded_rtt_ms, None);
+    assert_eq!(snap.summary.down_loaded_rtt_ms, None);
+    assert_eq!(snap.summary.up_loaded_rtt_ms, None);
+    assert_eq!(snap.summary.down_power, None);
+    assert_eq!(snap.summary.up_power, None);
+    assert_eq!(snap.summary.up_counting, Some(UpCounting::Acked));
+    // No ping runs during transfers.
+    assert!(
+        snap.samples
+            .iter()
+            .filter(|s| matches!(s.phase, Phase::Download | Phase::Upload))
+            .all(|s| s.rtt_ms.is_none()),
+        "ping during a transfer"
+    );
     // Per-second loss: UDP echo for every node, QUIC never for trojan.
     assert!(snap.samples.iter().all(|s| s.quic_loss_pct.is_none()));
     assert!(
