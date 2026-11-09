@@ -43,7 +43,7 @@ pub struct Summary {
     pub down_data_rtt_ms: Option<f64>,
     pub up_data_rtt_ms: Option<f64>,
     /// Mean over the clean transfer seconds of the per-second power
-    /// [`second_power`], in Mbit/s.
+    /// [`second_power`], in Mbit/s per ms.
     pub down_power: Option<f64>,
     pub up_power: Option<f64>,
     /// How upload bytes were counted: confirmed by the server, or written
@@ -61,15 +61,12 @@ pub enum UpCounting {
     Written,
 }
 
-/// Delay that normalises power.
-pub const POWER_REFERENCE_RTT_MS: f64 = 50.0;
-
-/// Power of one second: P_t = rate_t / (ping_t / 50 ms), in Mbit/s, where
-/// ping_t is the mean request-ping RTT completed in that second. None
-/// without a ping.
+/// Power of one second, after Kleinrock: P_t = rate_t / ping_t in Mbit/s
+/// per ms, where ping_t is the mean request-ping RTT completed in that
+/// second (the loaded request latency). None without a ping.
 pub(super) fn second_power(rate_bps: u64, ping_ms: Option<f64>) -> Option<f64> {
     let ping = ping_ms.filter(|p| *p > 0.0)?;
-    Some(rate_bps as f64 / 1e6 / (ping / POWER_REFERENCE_RTT_MS))
+    Some(rate_bps as f64 / 1e6 / ping)
 }
 
 /// One clean (post-warm-up) transfer phase of one direction.
@@ -332,10 +329,10 @@ mod tests {
     }
 
     #[test]
-    fn second_power_is_rate_over_normalised_ping() {
-        // 80 Mbit/s with a 100 ms request ping → 80 / 2 = 40.
-        assert_eq!(second_power(80_000_000, Some(100.0)), Some(40.0));
-        assert_eq!(second_power(80_000_000, Some(25.0)), Some(160.0));
+    fn second_power_is_rate_over_ping() {
+        // 80 Mbit/s with a 40 ms request ping → 2 Mbit/s per ms.
+        assert_eq!(second_power(80_000_000, Some(40.0)), Some(2.0));
+        assert_eq!(second_power(80_000_000, Some(160.0)), Some(0.5));
         assert_eq!(second_power(80_000_000, None), None);
         assert_eq!(second_power(80_000_000, Some(0.0)), None);
     }

@@ -167,8 +167,8 @@ pub struct Sample {
     pub rtt_ms: Option<f64>,
     /// Number of pings behind `rtt_ms`.
     pub rtt_samples: u32,
-    /// Power of this second, rate / (rtt_ms / 50 ms) in Mbit/s; only for
-    /// transfer samples after the warm-up.
+    /// Power of this second, rate / rtt_ms in Mbit/s per ms; only for
+    /// transfer samples after the warm-up that had a ping.
     pub power: Option<f64>,
     /// Mean over this interval of the QUIC connection's smoothed RTT, polled
     /// every 100 ms on the side sending the data; absent for non-QUIC
@@ -503,9 +503,10 @@ impl SpeedTestTask {
             phase: inner.phase,
             down_bps,
             up_bps,
-            rtt_ms: ping.map(|(p, _)| (p * 100.0).round() / 100.0),
+            // Microsecond precision: power divides by it.
+            rtt_ms: ping.map(|(p, _)| (p * 1000.0).round() / 1000.0),
             rtt_samples: ping.map_or(0, |(_, n)| n),
-            power: power.map(|p| (p * 10_000.0).round() / 10_000.0),
+            power: power.map(|p| (p * 1e6).round() / 1e6),
             data_rtt_ms: data_rtt.map(|(mean, _)| (mean * 100.0).round() / 100.0),
             data_rtt_samples: data_rtt.map_or(0, |(_, n)| n),
             udp_loss_pct,

@@ -32,7 +32,7 @@ async fn wait_phase(task: &Arc<SpeedTestTask>, phase: Phase, limit: Duration) {
 }
 
 /// The summary's power is the mean of the per-second powers, each the
-/// second's rate over its request ping normalised to 50 ms.
+/// second's rate (Mbit/s) over its request ping (ms).
 fn check_power(snap: &Snapshot) {
     for (phase, power) in [
         (Phase::Download, snap.summary.down_power),
@@ -47,8 +47,9 @@ fn check_power(snap: &Snapshot) {
                 s.up_bps
             };
             let ping = s.rtt_ms.expect("power without a ping");
-            let expected = rate as f64 / 1e6 / (ping / 50.0);
-            // rtt_ms is rounded to 0.01 ms, a few percent on loopback.
+            // P_t = rate (Mbit/s) / ping (ms). rtt_ms is rounded to 1 µs,
+            // which is a few percent of a loopback ping.
+            let expected = rate as f64 / 1e6 / ping;
             assert!(
                 (p - expected).abs() <= 0.05 * expected,
                 "{phase:?}: {p} vs {expected}"
