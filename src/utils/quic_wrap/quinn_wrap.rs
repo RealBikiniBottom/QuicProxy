@@ -135,19 +135,33 @@ fn make_transport_config(
     let cc_name = congestion_controller.unwrap_or("bbr").to_ascii_lowercase();
     let cc_factory: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
         match cc_name.as_str() {
-            "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
+            // "bbr" is BBRv1, the most mature of the three versions
+            "bbr" | "bbr1" => Arc::new(quinn::congestion::Bbr1Config::default()),
+            "bbr2" => Arc::new(quinn::congestion::Bbr2Config::default()),
+            "bbr3" => Arc::new(quinn::congestion::Bbr3Config::default()),
             "cubic" => Arc::new(quinn::congestion::CubicConfig::default()),
             "newreno" => Arc::new(quinn::congestion::NewRenoConfig::default()),
             "copa" => Arc::new(quinn::congestion::CopaConfig::default()),
             "copa-nc" => Arc::new(quinn::congestion::CopaConfig::copa_nc()),
-            "copa-auto" => Arc::new(quinn::congestion::CopaConfig::copa_auto()),
-            "copa-auto-nc" => Arc::new(quinn::congestion::CopaConfig::copa_auto_nc()),
+            "copa-auto" | "copa-auto-nc" => {
+                let mut auto = quinn::congestion::CopaAutoConfig::default();
+                auto.jitter_floor_ms(0.0) // < 0 开启探测；0 固定为 0 ms；> 0 固定为对应 ms（如 10.0）
+                    .drain_enabled(true); // true 开启按需 drain；false 暂停 drain
+
+                let mut cfg = if cc_name == "copa-auto" {
+                    quinn::congestion::CopaConfig::default()
+                } else {
+                    quinn::congestion::CopaConfig::copa_nc()
+                };
+                cfg.adaptive(Some(auto));
+                Arc::new(cfg)
+            }
             other => {
                 warn!(
-                    "unknown congestion controller '{}', falling back to bbr",
+                    "unknown congestion controller '{}', falling back to bbrv1",
                     other
                 );
-                Arc::new(quinn::congestion::BbrConfig::default())
+                Arc::new(quinn::congestion::Bbr1Config::default())
             }
         };
     transport_config.congestion_controller_factory(cc_factory);
