@@ -145,7 +145,7 @@ fn make_transport_config(
             "copa-nc" => Arc::new(quinn::congestion::CopaConfig::copa_nc()),
             "copa-auto" | "copa-auto-nc" => {
                 let mut auto = quinn::congestion::CopaAutoConfig::default();
-                auto.jitter_floor_ms(0.0) // < 0 开启探测；0 固定为 0 ms；> 0 固定为对应 ms（如 10.0）
+                auto.jitter_floor_ms(-1.0) // < 0 开启探测；0 固定为 0 ms；> 0 固定为对应 ms（如 10.0）
                     .drain_enabled(true); // true 开启按需 drain；false 暂停 drain
 
                 let mut cfg = if cc_name == "copa-auto" {
