@@ -459,9 +459,9 @@ dependencies = [
 
 [[package]]
 name = "bumpalo"
-version = "3.20.3"
+version = "3.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
 name = "byte_string"
@@ -2073,9 +2073,9 @@ dependencies = [
 
 [[package]]
 name = "libloading"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
 dependencies = [
  "cfg-if",
  "windows-link 0.2.1",
@@ -3028,7 +3028,7 @@ dependencies = [
 [[package]]
 name = "quinn"
 version = "0.12.0"
-source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#4bad313d2b35da965d439e8c787202d215ef7792"
+source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#39c1351d2b12d298c329a39a398ecf306229c2ab"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3069,7 +3069,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.12.0"
-source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#4bad313d2b35da965d439e8c787202d215ef7792"
+source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#39c1351d2b12d298c329a39a398ecf306229c2ab"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -3104,7 +3104,7 @@ dependencies = [
 [[package]]
 name = "quinn-udp"
 version = "0.6.3"
-source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#4bad313d2b35da965d439e8c787202d215ef7792"
+source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#39c1351d2b12d298c329a39a398ecf306229c2ab"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -3235,9 +3235,9 @@ dependencies = [
 
 [[package]]
 name = "redb"
-version = "4.5.0"
+version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b317ef681e18f6091efbfab532eaf924a135c492d9d0299d0fbfae07e92a39b"
+checksum = "096b1dd5ec053c9c2a5a26a93aafeadf73ebcb710ea54dc3151f17a8e20535ef"
 dependencies = [
  "libc",
 ]
@@ -4302,7 +4302,7 @@ dependencies = [
  "getifaddrs",
  "ipnet",
  "libc",
- "libloading 0.9.0",
+ "libloading 0.9.1",
  "log",
  "netconfig-rs",
  "nix 0.31.3",
