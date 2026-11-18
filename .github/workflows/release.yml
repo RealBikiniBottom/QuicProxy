@@ -686,7 +686,56 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: android-release
+          shared-key: android-release-v2
+
+      - name: Configure Android NDK and libclang
+        run: |
+          # Prefer NDK < 30: netstack-lwip passes an unversioned --target to bindgen,
+          # which NDK r30+ sys/cdefs.h rejects.
+          NDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}/ndk"
+          if [ -d "$NDK_ROOT" ]; then
+            SELECTED_NDK=$(ls -1 "$NDK_ROOT" | grep -E '^2[0-9]\.' | sort -V | tail -n 1 || true)
+            if [ -n "$SELECTED_NDK" ]; then
+              ANDROID_NDK_HOME="$NDK_ROOT/$SELECTED_NDK"
+            fi
+          fi
+          ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
+          if [ -n "$ANDROID_NDK_HOME" ]; then
+            echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+            echo "Using ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          fi
+
+          # bindgen 0.70.1 in netstack-lwip emits opaque _address structs with LLVM/Clang 22+.
+          # Pin LIBCLANG_PATH to an older libclang (< 22) instead of the runner's default LLVM.
+          LIBCLANG_DIR=""
+          for ver in 18 19 20 21; do
+            if [ -e "/usr/lib/llvm-${ver}/lib/libclang.so" ] || [ -e "/usr/lib/llvm-${ver}/lib/libclang.so.1" ]; then
+              LIBCLANG_DIR="/usr/lib/llvm-${ver}/lib"
+              break
+            fi
+          done
+          if [ -z "$LIBCLANG_DIR" ] && [ -n "$ANDROID_NDK_HOME" ]; then
+            NDK_LIBCLANG="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib"
+            if [ -e "$NDK_LIBCLANG/libclang.so" ]; then
+              LIBCLANG_DIR="$NDK_LIBCLANG"
+            fi
+          fi
+          if [ -z "$LIBCLANG_DIR" ]; then
+            sudo apt-get update
+            sudo apt-get install -y libclang-18-dev || sudo apt-get install -y libclang-19-dev || sudo apt-get install -y libclang-20-dev
+            for ver in 18 19 20; do
+              if [ -e "/usr/lib/llvm-${ver}/lib/libclang.so" ] || [ -e "/usr/lib/llvm-${ver}/lib/libclang.so.1" ]; then
+                LIBCLANG_DIR="/usr/lib/llvm-${ver}/lib"
+                break
+              fi
+            done
+          fi
+          if [ -z "$LIBCLANG_DIR" ]; then
+            echo "::error::Could not locate a compatible libclang (< 22)"
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$LIBCLANG_DIR" >> $GITHUB_ENV
+          echo "Using LIBCLANG_PATH=$LIBCLANG_DIR"
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk

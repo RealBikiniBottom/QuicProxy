@@ -147,7 +147,7 @@ fn make_transport_config(
                 let mut auto = quinn::congestion::CopaAutoConfig::default();
                 auto.jitter_floor_ms(-1.0) // < 0 开启探测；0 固定为 0 ms；> 0 固定为对应 ms（如 10.0）
                     .drain_enabled(true) // true 开启按需 drain；false 暂停 drain
-                    .tradeoff(0.8); // 0.5 功率最优；越小越看重时延，越大越看重吞吐；范围 [0.05, 0.95]
+                    .tradeoff(0.9); // 0.5 功率最优；越小越看重时延，越大越看重吞吐；范围 [0.05, 0.95]
 
                 let mut cfg = if cc_name == "copa-auto" {
                     quinn::congestion::CopaConfig::default()
