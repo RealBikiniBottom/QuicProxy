@@ -15,7 +15,7 @@ pub(crate) use kdf::{
     KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY, vmess_kdf_1_one_shot,
     vmess_kdf_3_one_shot,
 };
-pub(crate) use user::{ID, new_id};
+pub(crate) use user::{ID, new_id, parse_uuid};
 
 pub(crate) const VERSION: u8 = 1;
 

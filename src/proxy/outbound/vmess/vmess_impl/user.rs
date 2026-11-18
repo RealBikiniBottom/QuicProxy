@@ -24,6 +24,12 @@ pub fn new_alter_id_list(primary: &ID, alter_id_count: u16) -> Vec<ID> {
     alter_id_list
 }
 
+pub fn parse_uuid(user_id: &str) -> uuid::Uuid {
+    // Match sing-vmess: derive a deterministic UUIDv5 when user_id is not a UUID.
+    uuid::Uuid::parse_str(user_id)
+        .unwrap_or_else(|_| uuid::Uuid::new_v5(&uuid::Uuid::nil(), user_id.as_bytes()))
+}
+
 pub fn new_id(uuid: &uuid::Uuid) -> ID {
     let uuid = uuid.to_owned();
     let mut hasher = md5::Context::new();
@@ -43,6 +49,22 @@ fn next_id(i: &uuid::Uuid) -> uuid::Uuid {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_parse_uuid() {
+        assert_eq!(
+            super::parse_uuid("b831381d-6324-4d53-ad4f-8cda48b30811").to_string(),
+            "b831381d-6324-4d53-ad4f-8cda48b30811"
+        );
+        assert_eq!(
+            super::parse_uuid("alice").to_string(),
+            "ec61d669-fc85-586b-a097-822a49b51e7e"
+        );
+        assert_eq!(
+            super::parse_uuid("not-a-valid-uuid").to_string(),
+            "58070d6e-216d-511b-86cf-43a1d0f54a0a"
+        );
+    }
+
     #[test]
     fn test_new_id() {
         let id =

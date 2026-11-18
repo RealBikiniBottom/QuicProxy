@@ -28,7 +28,7 @@ use crate::proxy::outbound::vmess::vmess_impl::{
     KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_AEAD_IV, KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_AEAD_KEY,
     KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV,
     KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY, MAX_CHUNK_SIZE, OPTION_CHUNK_STREAM,
-    SECURITY_AES_128_GCM, SECURITY_CHACHA20_POLY1305, VERSION, VmessSecurity, new_id,
+    SECURITY_AES_128_GCM, SECURITY_CHACHA20_POLY1305, VERSION, VmessSecurity, new_id, parse_uuid,
     vmess_kdf_1_one_shot, vmess_kdf_3_one_shot,
 };
 use crate::proxy::outbound::{AnyPacket, PacketInfo};
@@ -45,15 +45,11 @@ pub struct VmessInbound {
 impl VmessInbound {
     pub fn new(tag: String, cfg: &InboundConfig, users: Vec<AuthUser>) -> anyhow::Result<Self> {
         if users.is_empty() {
-            bail!("vmess inbound '{}' requires at least one uuid", tag);
+            bail!("vmess inbound '{}' requires at least one user", tag);
         }
         for user in &users {
-            if uuid::Uuid::parse_str(&user.username).is_err() {
-                bail!(
-                    "vmess inbound '{}' user '{}' is not a valid uuid",
-                    tag,
-                    user.username
-                );
+            if user.username.is_empty() {
+                bail!("vmess inbound '{}' user cannot be empty", tag);
             }
         }
 
@@ -112,8 +108,8 @@ impl AnyInbound for VmessInbound {
     }
 
     async fn add_user(&self, user: &AuthUser) -> anyhow::Result<()> {
-        if uuid::Uuid::parse_str(&user.username).is_err() {
-            bail!("vmess user must be a valid uuid: '{}'", user.username);
+        if user.username.is_empty() {
+            bail!("vmess user cannot be empty");
         }
         let mut users = self.users.load().as_ref().clone();
         match users.iter_mut().find(|u| u.username == user.username) {
@@ -161,10 +157,10 @@ where
 
     let mut authenticated: Option<(ID, u16)> = None;
     for user in users {
-        let Ok(uuid) = uuid::Uuid::parse_str(&user.username) else {
+        if user.username.is_empty() {
             continue;
-        };
-        let id = new_id(&uuid);
+        }
+        let id = new_id(&parse_uuid(&user.username));
         let len_key = &vmess_kdf_3_one_shot(
             &id.cmd_key,
             KDF_SALT_CONST_VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY,
@@ -841,6 +837,55 @@ mod tests {
     #[tokio::test]
     async fn none_security_round_trip() {
         round_trip(UUID, "none", b"hello vmess").await;
+    }
+
+    #[tokio::test]
+    async fn non_uuid_round_trip() {
+        round_trip("alice", "aes-128-gcm", b"hello non-uuid vmess").await;
+    }
+
+    #[tokio::test]
+    async fn non_uuid_matches_derived_uuid_v5() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_rd, client_wr) = tokio::io::split(client_io);
+        let (server_rd, server_wr) = tokio::io::split(server_io);
+
+        let users = vec![user("alice")];
+
+        let client = async {
+            let stream: crate::proxy::outbound::AnyStream = Box::new(DuplexHalf {
+                rd: client_rd,
+                wr: client_wr,
+            });
+            let opt = VmessOption {
+                uuid: "ec61d669-fc85-586b-a097-822a49b51e7e".to_string(),
+                alter_id: 0,
+                security: "aes-128-gcm".to_string(),
+                udp: false,
+                dst: TargetAddr::Domain("example.com".to_string(), 443),
+            };
+            let builder = Builder::new(&opt).unwrap();
+            let mut vmess = builder.proxy_stream(stream).await.unwrap();
+            vmess.write_all(b"ok").await.unwrap();
+            vmess.flush().await.unwrap();
+            let mut echo = [0u8; 2];
+            vmess.read_exact(&mut echo).await.unwrap();
+            assert_eq!(&echo, b"ok");
+        };
+
+        let server = async {
+            let stream = DuplexHalf {
+                rd: server_rd,
+                wr: server_wr,
+            };
+            let (mut server_stream, _) = accept(stream, "vmess-in", &users).await.unwrap();
+            let mut b = [0u8; 2];
+            server_stream.read_exact(&mut b).await.unwrap();
+            server_stream.write_all(&b).await.unwrap();
+            server_stream.flush().await.unwrap();
+        };
+
+        tokio::join!(client, server);
     }
 
     #[tokio::test]

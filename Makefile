@@ -32,7 +32,7 @@ run_server: build
 	./target/release/quicproxy -c ./assets/example_config/server.json5
 
 run_client: build
-	./target/release/quicproxy --elevate -c ./src/premium/test/client.json5
+	./target/release/quicproxy --elevate -c /Users/qwe/Library/Group\ Containers/group.com.github.quicproxyFlutter/WorkSpace/config.json
 
 run_web_manager: build
 	./target/release/quicproxy --manage --port 8081 --web-dir ./src/premium/quicproxy_flutter/build/web

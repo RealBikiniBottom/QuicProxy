@@ -25,9 +25,10 @@ pub struct Builder {
 
 impl Builder {
     pub fn new(opt: &VmessOption) -> anyhow::Result<Self> {
-        let uuid = uuid::Uuid::parse_str(&opt.uuid).map_err(|_| {
-            anyhow::anyhow!("invalid uuid format, should be xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
-        })?;
+        if opt.uuid.is_empty() {
+            anyhow::bail!("vmess uuid cannot be empty");
+        }
+        let uuid = user::parse_uuid(&opt.uuid);
 
         let security = match opt.security.to_lowercase().as_str() {
             "chacha20-poly1305" => SECURITY_CHACHA20_POLY1305,

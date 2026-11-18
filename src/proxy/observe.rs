@@ -384,7 +384,7 @@ pub struct TrafficSnapshot {
 /// trojan: lowercase hex of SHA224(password) (56 ASCII bytes)
 /// anytls: SHA256(password) (32 bytes)
 /// shadowquic: SHA256("username:password") (64 bytes)
-/// vmess: the uuid's 16-byte cmd_key (the username is the uuid)
+/// vmess: the derived uuid's 16-byte cmd_key (the username is the user id)
 pub fn credential_hash(protocol: &str, username: &str, password: &str) -> anyhow::Result<Vec<u8>> {
     match protocol {
         "trojan" => {
@@ -399,8 +399,10 @@ pub fn credential_hash(protocol: &str, username: &str, password: &str) -> anyhow
         }
         "shadowquic" => Ok(gen_sunny_auth_hash(username, password).to_vec()),
         "vmess" => {
-            let uuid = uuid::Uuid::parse_str(username)
-                .map_err(|e| anyhow::anyhow!("invalid vmess uuid '{username}': {e}"))?;
+            if username.is_empty() {
+                anyhow::bail!("vmess username cannot be empty");
+            }
+            let uuid = crate::proxy::outbound::vmess::vmess_impl::parse_uuid(username);
             Ok(crate::proxy::outbound::vmess::vmess_impl::new_id(&uuid)
                 .cmd_key
                 .to_vec())
@@ -1459,6 +1461,17 @@ mod tests {
                 .len(),
             64
         );
+        assert_eq!(
+            credential_hash("vmess", "b831381d-6324-4d53-ad4f-8cda48b30811", "")
+                .unwrap()
+                .len(),
+            16
+        );
+        assert_eq!(
+            credential_hash("vmess", "alice", "").unwrap(),
+            credential_hash("vmess", "ec61d669-fc85-586b-a097-822a49b51e7e", "").unwrap()
+        );
+        assert!(credential_hash("vmess", "", "").is_err());
         assert!(credential_hash("socks5", "a", "b").is_err());
     }
 

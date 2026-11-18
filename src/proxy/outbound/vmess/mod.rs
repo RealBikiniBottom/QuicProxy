@@ -40,7 +40,10 @@ impl VmessOutbound {
 
         let uuid = cfg
             .uuid
-            .clone()
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| cfg.password.as_deref().filter(|s| !s.is_empty()))
+            .map(str::to_owned)
             .context(format!("vmess outbound '{}' requires uuid", tag))?;
 
         let alter_id = cfg
@@ -222,6 +225,25 @@ mod tests {
         cfg.uuid = None;
         let result = VmessOutbound::new("test-vmess".to_string(), &cfg);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vmess_outbound_non_uuid_and_password_fallback() {
+        let mut cfg = make_config();
+        cfg.uuid = Some("alice".to_string());
+        assert!(VmessOutbound::new("test-vmess".to_string(), &cfg).is_ok());
+
+        cfg.uuid = None;
+        cfg.password = Some("secret".to_string());
+        let outbound = VmessOutbound::new("test-vmess".to_string(), &cfg).unwrap();
+        let handler = unsafe { &*(&*outbound as *const dyn AnyOutbound as *const VmessOutbound) };
+        let target = TargetAddr::from_str2("example.com", 443).unwrap();
+        let opt = handler.build_vmess_option(&target, false).unwrap();
+        assert_eq!(opt.uuid, "secret");
+
+        cfg.uuid = Some(String::new());
+        cfg.password = None;
+        assert!(VmessOutbound::new("test-vmess".to_string(), &cfg).is_err());
     }
 
     #[test]

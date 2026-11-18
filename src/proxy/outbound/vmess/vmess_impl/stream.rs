@@ -675,9 +675,25 @@ mod tests {
     }
 
     #[test]
-    fn test_vmess_builder_invalid_uuid() {
+    fn test_vmess_builder_non_uuid() {
         let opt = VmessOption {
             uuid: "not-a-valid-uuid".to_string(),
+            alter_id: 0,
+            security: "auto".to_string(),
+            udp: false,
+            dst: TargetAddr::from_str2("example.com", 443).unwrap(),
+        };
+        let builder = Builder::new(&opt).unwrap();
+        assert_eq!(
+            builder.user[0].uuid.to_string(),
+            "58070d6e-216d-511b-86cf-43a1d0f54a0a"
+        );
+    }
+
+    #[test]
+    fn test_vmess_builder_empty_uuid() {
+        let opt = VmessOption {
+            uuid: String::new(),
             alter_id: 0,
             security: "auto".to_string(),
             udp: false,
