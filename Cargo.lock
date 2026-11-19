@@ -2415,9 +2415,9 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.31.4"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bc81ce8148d3b4f3274da811f11cdd824ae661ee4ef732cdb229825cf5be7f7"
+checksum = "77730ed34f01f4990cb2ea67fec715ecebc6fab9a6396cf83c5529b13f581bdc"
 dependencies = [
  "bitflags 2.13.2",
  "cfg-if",
@@ -3003,7 +3003,7 @@ dependencies = [
 [[package]]
 name = "quinn"
 version = "0.12.0"
-source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#b66cc003586362d4a66e3a3774e50ab4d3a53306"
+source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#88793df089824b333fca4ce2d8606b9e9e6a0889"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3044,7 +3044,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.12.0"
-source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#b66cc003586362d4a66e3a3774e50ab4d3a53306"
+source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#88793df089824b333fca4ce2d8606b9e9e6a0889"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -3079,7 +3079,7 @@ dependencies = [
 [[package]]
 name = "quinn-udp"
 version = "0.6.3"
-source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#b66cc003586362d4a66e3a3774e50ab4d3a53306"
+source = "git+https://github.com/JimmyHuang454/quinn-jls?branch=jls-main#88793df089824b333fca4ce2d8606b9e9e6a0889"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -3187,9 +3187,9 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rand_pcg"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+checksum = "eb95882a1e14462c69aea9984bb261293ccfe6022ef8de0eda18bd5afb0052df"
 dependencies = [
  "rand_core 0.10.1",
 ]
@@ -3725,9 +3725,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.5"
+version = "1.16.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
+checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
 
 [[package]]
 name = "smoltcp"
@@ -4272,7 +4272,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tun-rs"
 version = "2.8.18"
-source = "git+https://github.com/tun-rs/tun-rs?branch=main#5bf46b3e69e23c0b6551ae7b7bd246f61418eb56"
+source = "git+https://github.com/tun-rs/tun-rs?branch=main#0173258bf2ba012a56cfaa0f9d01dc5dab11de6b"
 dependencies = [
  "ahash",
  "blocking",
@@ -4286,7 +4286,7 @@ dependencies = [
  "libloading 0.9.1",
  "log",
  "netconfig-rs",
- "nix 0.31.4",
+ "nix 0.32.0",
  "route_manager",
  "scopeguard",
  "tokio",
@@ -4320,9 +4320,9 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "ucd-trie"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
+checksum = "8f20bdbfc9915686faa18fb5bbe8b4552778505defbf9f12289beefbc44092a6"
 
 [[package]]
 name = "unicase"
